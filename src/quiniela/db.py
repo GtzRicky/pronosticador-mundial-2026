@@ -9,7 +9,7 @@ import pandas as pd
 
 from quiniela.cache import canonical_json, hash_params
 from quiniela.config import get_settings
-from quiniela.name_maps import normalize_team_name
+from quiniela.name_maps import normalize_team_name, normalize_text
 
 
 SCHEMA_STATEMENTS = [
@@ -33,6 +33,12 @@ SCHEMA_STATEMENTS = [
         position_group TEXT NOT NULL,
         club TEXT,
         coach TEXT,
+        api_player_id INTEGER,
+        api_player_name TEXT,
+        api_position TEXT,
+        height_cm REAL,
+        nationality TEXT,
+        last_resolved_at TEXT,
         is_active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -130,6 +136,92 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS fixture_player_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id TEXT NOT NULL,
+        api_player_id INTEGER NOT NULL,
+        team_norm TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        player_norm TEXT,
+        minutes INTEGER,
+        number INTEGER,
+        position TEXT,
+        rating REAL,
+        shots_total REAL,
+        shots_on REAL,
+        goals_total REAL,
+        goals_conceded REAL,
+        goals_assists REAL,
+        goals_saves REAL,
+        passes_total REAL,
+        passes_key REAL,
+        passes_accuracy REAL,
+        tackles_total REAL,
+        tackles_blocks REAL,
+        tackles_interceptions REAL,
+        duels_total REAL,
+        duels_won REAL,
+        dribbles_attempts REAL,
+        dribbles_success REAL,
+        dribbles_past REAL,
+        fouls_drawn REAL,
+        fouls_committed REAL,
+        cards_yellow REAL,
+        cards_red REAL,
+        penalty_won REAL,
+        penalty_commited REAL,
+        penalty_scored REAL,
+        penalty_missed REAL,
+        penalty_saved REAL,
+        source_json TEXT NOT NULL,
+        fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(fixture_id, api_player_id, team_norm)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS player_season_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        api_player_id INTEGER NOT NULL,
+        team_norm TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        player_norm TEXT,
+        season INTEGER NOT NULL,
+        league_id INTEGER,
+        league_name TEXT,
+        appearences REAL,
+        lineups REAL,
+        minutes REAL,
+        rating REAL,
+        shots_total REAL,
+        shots_on REAL,
+        goals_total REAL,
+        goals_assists REAL,
+        passes_total REAL,
+        passes_key REAL,
+        tackles_total REAL,
+        tackles_interceptions REAL,
+        duels_total REAL,
+        duels_won REAL,
+        dribbles_attempts REAL,
+        dribbles_success REAL,
+        fouls_drawn REAL,
+        fouls_committed REAL,
+        cards_yellow REAL,
+        cards_red REAL,
+        penalty_won REAL,
+        penalty_commited REAL,
+        penalty_scored REAL,
+        penalty_missed REAL,
+        penalty_saved REAL,
+        height_cm REAL,
+        nationality TEXT,
+        position TEXT,
+        source_json TEXT NOT NULL,
+        fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(api_player_id, team_norm, season, league_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS odds_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fixture_id TEXT NOT NULL,
@@ -163,6 +255,23 @@ SCHEMA_STATEMENTS = [
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS prediction_player_impacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id TEXT NOT NULL,
+        team_norm TEXT NOT NULL,
+        api_player_id INTEGER,
+        player_name TEXT NOT NULL,
+        role_bucket TEXT NOT NULL,
+        attack_impact REAL NOT NULL DEFAULT 0,
+        defense_impact REAL NOT NULL DEFAULT 0,
+        discipline_impact REAL NOT NULL DEFAULT 0,
+        availability_impact REAL NOT NULL DEFAULT 0,
+        net_impact REAL NOT NULL DEFAULT 0,
+        source_json TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
 ]
 
 
@@ -172,6 +281,7 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    create_schema(connection)
     return connection
 
 
@@ -179,6 +289,32 @@ def create_schema(connection: sqlite3.Connection) -> None:
     with connection:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+    _migrate_schema(connection)
+
+
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_def: str) -> None:
+    if column_name in _table_columns(connection, table_name):
+        return
+    with connection:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
+
+
+def _migrate_schema(connection: sqlite3.Connection) -> None:
+    player_columns = {
+        "api_player_id": "api_player_id INTEGER",
+        "api_player_name": "api_player_name TEXT",
+        "api_position": "api_position TEXT",
+        "height_cm": "height_cm REAL",
+        "nationality": "nationality TEXT",
+        "last_resolved_at": "last_resolved_at TEXT",
+    }
+    for column_name, column_def in player_columns.items():
+        _ensure_column(connection, "players", column_name, column_def)
 
 
 def _executemany(connection: sqlite3.Connection, query: str, rows: Iterable[tuple[Any, ...]]) -> None:
@@ -233,6 +369,12 @@ def load_players(connection: sqlite3.Connection, rosters_df: pd.DataFrame) -> in
             row["position_group"],
             row.get("club"),
             row.get("coach"),
+            row.get("api_player_id"),
+            row.get("api_player_name"),
+            row.get("api_position"),
+            row.get("height_cm"),
+            row.get("nationality"),
+            row.get("last_resolved_at"),
             int(row.get("is_active", 1)),
         )
         for row in rosters_df.to_dict(orient="records")
@@ -241,8 +383,9 @@ def load_players(connection: sqlite3.Connection, rosters_df: pd.DataFrame) -> in
         connection,
         """
         INSERT OR REPLACE INTO players (
-            team, team_norm, player, player_norm, position_group, club, coach, is_active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            team, team_norm, player, player_norm, position_group, club, coach,
+            api_player_id, api_player_name, api_position, height_cm, nationality, last_resolved_at, is_active
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -402,6 +545,70 @@ def upsert_team_api_id(connection: sqlite3.Connection, team_name: str, api_team_
         )
 
 
+def upsert_player_api_profile(
+    connection: sqlite3.Connection,
+    team_norm: str,
+    player_name: str,
+    player_norm: str,
+    position_group: str | None = None,
+    api_player_id: int | None = None,
+    api_player_name: str | None = None,
+    api_position: str | None = None,
+    height_cm: float | None = None,
+    nationality: str | None = None,
+    team_name: str | None = None,
+) -> None:
+    current = connection.execute(
+        """
+        SELECT id, team, position_group, club, coach, is_active
+        FROM players
+        WHERE team_norm = ? AND player_norm = ?
+        LIMIT 1
+        """,
+        (team_norm, player_norm),
+    ).fetchone()
+    team_value = team_name or (current["team"] if current else team_norm)
+    position_value = position_group or (current["position_group"] if current else "unknown")
+    club_value = current["club"] if current else None
+    coach_value = current["coach"] if current else None
+    is_active = int(current["is_active"]) if current else 1
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO players (
+                team, team_norm, player, player_norm, position_group, club, coach,
+                api_player_id, api_player_name, api_position, height_cm, nationality, last_resolved_at, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(team_norm, player_norm) DO UPDATE SET
+                team = excluded.team,
+                player = excluded.player,
+                position_group = excluded.position_group,
+                api_player_id = COALESCE(excluded.api_player_id, players.api_player_id),
+                api_player_name = COALESCE(excluded.api_player_name, players.api_player_name),
+                api_position = COALESCE(excluded.api_position, players.api_position),
+                height_cm = COALESCE(excluded.height_cm, players.height_cm),
+                nationality = COALESCE(excluded.nationality, players.nationality),
+                last_resolved_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                team_value,
+                team_norm,
+                player_name,
+                player_norm,
+                position_value,
+                club_value,
+                coach_value,
+                api_player_id,
+                api_player_name,
+                api_position,
+                height_cm,
+                nationality,
+                is_active,
+            ),
+        )
+
+
 def get_team_api_id(connection: sqlite3.Connection, team_name_or_norm: str) -> int | None:
     team_norm = normalize_team_name(team_name_or_norm)
     row = connection.execute(
@@ -509,6 +716,272 @@ def store_json_row(
                 VALUES (?, ?, ?, ?)
                 """,
                 (fixture_id, bookmaker, market, serialized),
+            )
+
+
+def upsert_fixture_player_stats(
+    connection: sqlite3.Connection,
+    fixture_id: str,
+    team_norm: str,
+    player_payload: dict[str, Any],
+) -> None:
+    player_info = player_payload.get("player", {})
+    stat_list = player_payload.get("statistics") or []
+    stats = stat_list[0] if stat_list else {}
+    games = stats.get("games", {})
+    shots = stats.get("shots", {})
+    goals = stats.get("goals", {})
+    passes = stats.get("passes", {})
+    tackles = stats.get("tackles", {})
+    duels = stats.get("duels", {})
+    dribbles = stats.get("dribbles", {})
+    fouls = stats.get("fouls", {})
+    cards = stats.get("cards", {})
+    penalty = stats.get("penalty", {})
+    api_player_id = player_info.get("id")
+    if api_player_id is None:
+        return
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO fixture_player_stats (
+                fixture_id, api_player_id, team_norm, player_name, player_norm,
+                minutes, number, position, rating,
+                shots_total, shots_on,
+                goals_total, goals_conceded, goals_assists, goals_saves,
+                passes_total, passes_key, passes_accuracy,
+                tackles_total, tackles_blocks, tackles_interceptions,
+                duels_total, duels_won,
+                dribbles_attempts, dribbles_success, dribbles_past,
+                fouls_drawn, fouls_committed,
+                cards_yellow, cards_red,
+                penalty_won, penalty_commited, penalty_scored, penalty_missed, penalty_saved,
+                source_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(fixture_id, api_player_id, team_norm) DO UPDATE SET
+                player_name = excluded.player_name,
+                player_norm = excluded.player_norm,
+                minutes = excluded.minutes,
+                number = excluded.number,
+                position = excluded.position,
+                rating = excluded.rating,
+                shots_total = excluded.shots_total,
+                shots_on = excluded.shots_on,
+                goals_total = excluded.goals_total,
+                goals_conceded = excluded.goals_conceded,
+                goals_assists = excluded.goals_assists,
+                goals_saves = excluded.goals_saves,
+                passes_total = excluded.passes_total,
+                passes_key = excluded.passes_key,
+                passes_accuracy = excluded.passes_accuracy,
+                tackles_total = excluded.tackles_total,
+                tackles_blocks = excluded.tackles_blocks,
+                tackles_interceptions = excluded.tackles_interceptions,
+                duels_total = excluded.duels_total,
+                duels_won = excluded.duels_won,
+                dribbles_attempts = excluded.dribbles_attempts,
+                dribbles_success = excluded.dribbles_success,
+                dribbles_past = excluded.dribbles_past,
+                fouls_drawn = excluded.fouls_drawn,
+                fouls_committed = excluded.fouls_committed,
+                cards_yellow = excluded.cards_yellow,
+                cards_red = excluded.cards_red,
+                penalty_won = excluded.penalty_won,
+                penalty_commited = excluded.penalty_commited,
+                penalty_scored = excluded.penalty_scored,
+                penalty_missed = excluded.penalty_missed,
+                penalty_saved = excluded.penalty_saved,
+                source_json = excluded.source_json,
+                fetched_at = CURRENT_TIMESTAMP
+            """,
+            (
+                str(fixture_id),
+                int(api_player_id),
+                team_norm,
+                str(player_info.get("name") or "Unknown"),
+                normalize_text(str(player_info.get("name") or "")),
+                games.get("minutes"),
+                games.get("number"),
+                games.get("position"),
+                float(games["rating"]) if games.get("rating") not in (None, "") else None,
+                shots.get("total"),
+                shots.get("on"),
+                goals.get("total"),
+                goals.get("conceded"),
+                goals.get("assists"),
+                goals.get("saves"),
+                passes.get("total"),
+                passes.get("key"),
+                float(passes["accuracy"]) if passes.get("accuracy") not in (None, "") else None,
+                tackles.get("total"),
+                tackles.get("blocks"),
+                tackles.get("interceptions"),
+                duels.get("total"),
+                duels.get("won"),
+                dribbles.get("attempts"),
+                dribbles.get("success"),
+                dribbles.get("past"),
+                fouls.get("drawn"),
+                fouls.get("committed"),
+                cards.get("yellow"),
+                cards.get("red"),
+                penalty.get("won"),
+                penalty.get("commited"),
+                penalty.get("scored"),
+                penalty.get("missed"),
+                penalty.get("saved"),
+                json.dumps(player_payload, ensure_ascii=False),
+            ),
+        )
+
+
+def upsert_player_season_stats(
+    connection: sqlite3.Connection,
+    team_norm: str,
+    player_response: dict[str, Any],
+) -> None:
+    player_info = player_response.get("player", {})
+    api_player_id = player_info.get("id")
+    if api_player_id is None:
+        return
+    player_name = str(player_info.get("name") or "Unknown")
+    player_norm = normalize_text(player_name)
+    try:
+        height_cm = float(str(player_info.get("height") or "").replace("cm", "").strip())
+    except ValueError:
+        height_cm = None
+    for stat in player_response.get("statistics") or []:
+        league = stat.get("league", {})
+        games = stat.get("games", {})
+        shots = stat.get("shots", {})
+        goals = stat.get("goals", {})
+        passes = stat.get("passes", {})
+        tackles = stat.get("tackles", {})
+        duels = stat.get("duels", {})
+        dribbles = stat.get("dribbles", {})
+        fouls = stat.get("fouls", {})
+        cards = stat.get("cards", {})
+        penalty = stat.get("penalty", {})
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO player_season_stats (
+                    api_player_id, team_norm, player_name, player_norm, season, league_id, league_name,
+                    appearences, lineups, minutes, rating,
+                    shots_total, shots_on, goals_total, goals_assists,
+                    passes_total, passes_key,
+                    tackles_total, tackles_interceptions,
+                    duels_total, duels_won,
+                    dribbles_attempts, dribbles_success,
+                    fouls_drawn, fouls_committed,
+                    cards_yellow, cards_red,
+                    penalty_won, penalty_commited, penalty_scored, penalty_missed, penalty_saved,
+                    height_cm, nationality, position, source_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(api_player_id, team_norm, season, league_id) DO UPDATE SET
+                    player_name = excluded.player_name,
+                    player_norm = excluded.player_norm,
+                    appearences = excluded.appearences,
+                    lineups = excluded.lineups,
+                    minutes = excluded.minutes,
+                    rating = excluded.rating,
+                    shots_total = excluded.shots_total,
+                    shots_on = excluded.shots_on,
+                    goals_total = excluded.goals_total,
+                    goals_assists = excluded.goals_assists,
+                    passes_total = excluded.passes_total,
+                    passes_key = excluded.passes_key,
+                    tackles_total = excluded.tackles_total,
+                    tackles_interceptions = excluded.tackles_interceptions,
+                    duels_total = excluded.duels_total,
+                    duels_won = excluded.duels_won,
+                    dribbles_attempts = excluded.dribbles_attempts,
+                    dribbles_success = excluded.dribbles_success,
+                    fouls_drawn = excluded.fouls_drawn,
+                    fouls_committed = excluded.fouls_committed,
+                    cards_yellow = excluded.cards_yellow,
+                    cards_red = excluded.cards_red,
+                    penalty_won = excluded.penalty_won,
+                    penalty_commited = excluded.penalty_commited,
+                    penalty_scored = excluded.penalty_scored,
+                    penalty_missed = excluded.penalty_missed,
+                    penalty_saved = excluded.penalty_saved,
+                    height_cm = COALESCE(excluded.height_cm, player_season_stats.height_cm),
+                    nationality = COALESCE(excluded.nationality, player_season_stats.nationality),
+                    position = COALESCE(excluded.position, player_season_stats.position),
+                    source_json = excluded.source_json,
+                    fetched_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    int(api_player_id),
+                    team_norm,
+                    player_name,
+                    player_norm,
+                    league.get("season"),
+                    league.get("id"),
+                    league.get("name"),
+                    games.get("appearences"),
+                    games.get("lineups"),
+                    games.get("minutes"),
+                    float(games["rating"]) if games.get("rating") not in (None, "") else None,
+                    shots.get("total"),
+                    shots.get("on"),
+                    goals.get("total"),
+                    goals.get("assists"),
+                    passes.get("total"),
+                    passes.get("key"),
+                    tackles.get("total"),
+                    tackles.get("interceptions"),
+                    duels.get("total"),
+                    duels.get("won"),
+                    dribbles.get("attempts"),
+                    dribbles.get("success"),
+                    fouls.get("drawn"),
+                    fouls.get("committed"),
+                    cards.get("yellow"),
+                    cards.get("red"),
+                    penalty.get("won"),
+                    penalty.get("commited"),
+                    penalty.get("scored"),
+                    penalty.get("missed"),
+                    penalty.get("saved"),
+                    height_cm,
+                    player_info.get("nationality"),
+                    games.get("position"),
+                    json.dumps(player_response, ensure_ascii=False),
+                ),
+            )
+
+
+def replace_prediction_player_impacts(
+    connection: sqlite3.Connection,
+    match_id: str,
+    impact_rows: list[dict[str, Any]],
+) -> None:
+    with connection:
+        connection.execute("DELETE FROM prediction_player_impacts WHERE match_id = ?", (match_id,))
+        for row in impact_rows:
+            connection.execute(
+                """
+                INSERT INTO prediction_player_impacts (
+                    match_id, team_norm, api_player_id, player_name, role_bucket,
+                    attack_impact, defense_impact, discipline_impact, availability_impact,
+                    net_impact, source_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    match_id,
+                    row.get("team_norm"),
+                    row.get("api_player_id"),
+                    row.get("player_name"),
+                    row.get("role_bucket", "unknown"),
+                    float(row.get("attack_impact", 0.0)),
+                    float(row.get("defense_impact", 0.0)),
+                    float(row.get("discipline_impact", 0.0)),
+                    float(row.get("availability_impact", 0.0)),
+                    float(row.get("net_impact", 0.0)),
+                    json.dumps(row, ensure_ascii=False),
+                ),
             )
 
 

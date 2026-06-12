@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from quiniela.db import fetch_dataframe, get_connection, insert_prediction_rows
 from quiniela.features import build_features_for_matches
 from quiniela.logging_utils import get_logger
 from quiniela.name_maps import normalize_team_name
+from quiniela.player_model import load_player_model_artifact, persist_prediction_impacts
 from quiniela.poisson_model import PoissonScoreModel
 from quiniela.ratings import apply_ratings
 
@@ -22,7 +24,8 @@ class Predictor:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.connection = get_connection(self.settings.db_path)
-        self.model = PoissonScoreModel()
+        trained_bundle = load_player_model_artifact()
+        self.model = PoissonScoreModel(trained_bundle=trained_bundle)
 
     def _matches_for_date(self, date_str: str) -> pd.DataFrame:
         return fetch_dataframe(
@@ -78,6 +81,9 @@ class Predictor:
 
         for row in rated_df.to_dict(orient="records"):
             score = self.model.predict_score(row)
+            home_impacts = row.get("home_player_impacts") or []
+            away_impacts = row.get("away_player_impacts") or []
+            persist_prediction_impacts(self.connection, row["match_id"], home_impacts, away_impacts)
             rows.append(
                 {
                     "match_id": row["match_id"],
@@ -93,6 +99,16 @@ class Predictor:
                     "away_goals": score.away_goals,
                     "lambda_home": score.lambda_home,
                     "lambda_away": score.lambda_away,
+                    "home_lineup_source": row.get("home_lineup_source"),
+                    "away_lineup_source": row.get("away_lineup_source"),
+                    "home_top_impacts_json": json.dumps(
+                        sorted(home_impacts, key=lambda impact: float(impact.get("net_impact", 0.0)), reverse=True)[:3],
+                        ensure_ascii=False,
+                    ),
+                    "away_top_impacts_json": json.dumps(
+                        sorted(away_impacts, key=lambda impact: float(impact.get("net_impact", 0.0)), reverse=True)[:3],
+                        ensure_ascii=False,
+                    ),
                 }
             )
         predictions_df = pd.DataFrame(rows)
@@ -103,6 +119,11 @@ class Predictor:
     def save_predictions_csv(self, predictions_df: pd.DataFrame, file_name: str) -> Path:
         path = self.settings.predictions_dir / file_name
         predictions_df.to_csv(path, index=False, encoding="utf-8")
+        json_path = path.with_suffix(".json")
+        json_path.write_text(
+            predictions_df.to_json(orient="records", force_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         return path
 
     def predict_by_date(self, date_str: str) -> tuple[pd.DataFrame, Path]:

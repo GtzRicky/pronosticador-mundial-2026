@@ -1,88 +1,227 @@
-# quiniela-mundial-2026
+# pronosticador-mundial-2026
 
-Scaffold local-first en Python para predecir marcadores exactos del Mundial 2026. El proyecto combina una base SQLite, parsers de datos manuales, cache local para API-Football y un modelo Poisson simple para producir predicciones reproducibles, auditables y fáciles de extender.
+Pronosticador local-first en Python para estimar marcadores exactos del Mundial 2026. El proyecto combina una base SQLite, fuentes manuales, cache local de API-Football, señales colectivas por selección y señales individuales por jugador para producir predicciones reproducibles, auditables y actualizables el mismo día del partido.
 
-No incluye dashboard. La prioridad es tener un pipeline funcional, simple y testeable.
+## Resumen Corporativo
 
-## Qué resuelve
+Esta solución toma el calendario oficial y las convocatorias iniciales, crea una base de datos local y la enriquece con información en vivo e histórica de API-Football. Con esos datos calcula la fortaleza reciente de cada selección, la calidad esperada de su alineación titular, el impacto colectivo del banco y la influencia de cada jugador en ataque, defensa, disciplina y disponibilidad. Después estima los goles esperados de local y visitante y genera un marcador exacto probable.
 
-- Ingesta de calendario y convocados desde archivos Markdown locales.
-- Normalización de nombres de selecciones y jugadores.
-- Base de datos SQLite lista para operar offline.
-- Cache local de respuestas API-Football.
-- Backfill histórico por selección.
-- Fetch del día de partido para metadata, alineaciones, estadísticas, eventos y odds.
-- Features mínimas, rating interpretable y predicción de marcador exacto.
-- Modo “publicable” para compartir el proyecto sin exponer API keys ni telemetría de consumo.
+En términos no técnicos, el sistema responde tres preguntas:
 
-## Principios de diseño
+1. Qué tan bien llega cada selección.
+2. Qué tanto cambia el partido por los jugadores que sí estarán disponibles ese día.
+3. Qué marcador es más consistente con ese balance total.
 
-- `local-first`: SQLite es la fuente operativa del proyecto.
-- `live-on-miss`: primero se busca en cache; si falta, se consulta la API.
-- `degraded-by-default`: si no hay API key o faltan datos, el pipeline sigue funcionando con defaults razonables.
-- `inspectable`: todo lo importante queda en CSV, SQLite o logs Markdown.
-- `publicable`: el repo puede compartirse sin secretos y con un bundle offline opcional.
+La solución está pensada para operar localmente:
 
-## Arquitectura
+- la base principal vive en SQLite
+- la API se consulta sólo cuando hace falta
+- cada respuesta útil queda cacheada
+- las predicciones y reportes se exportan a archivos simples (`CSV`, `JSON`, `HTML`)
+
+### Costos y requerimientos operativos
+
+Requisitos mínimos:
+
+- Python `3.11+`
+- una API key de API-Football
+- espacio local para SQLite y artefactos
+- conectividad a internet para backfill y refresh del día
+
+Costos de API-Football verificados el `11 de junio de 2026`:
+
+- `Free`: `100` requests/día, `US$0/mes`
+- `Pro`: `7,500` requests/día, `US$19/mes`
+- `Ultra`: `75,000` requests/día, `US$29/mes`
+- `Mega`: `150,000` requests/día, `US$39/mes`
+
+Para un uso serio del proyecto, el plan recomendado es `Pro` o superior, porque:
+
+- el backfill histórico con datos por jugador consume bastante más cuota que el modelo básico
+- el plan free puede servir para pruebas ligeras y algunas alineaciones del día, pero no para poblar una base histórica rica
+
+### Cómo influye la alineación del día
+
+La alineación ya no se usa sólo como una confirmación binaria de “hay once confirmado”. Ahora influye así:
+
+- titulares confirmados pesan al `100%`
+- suplentes confirmados pesan al `25%`
+- si no existe alineación oficial, el sistema infiere un once probable desde alineaciones recientes
+- si tampoco hay alineaciones recientes, usa los jugadores con más minutos y titularidades acumuladas
+
+Eso significa que el modelo cambia si:
+
+- falta un delantero con alto volumen de tiro y gol
+- un mediocampista clave mejora el control y progresión
+- el portero titular ofrece mejor prevención de gol
+- una defensa acumula mala disciplina o riesgo de roja/penal
+
+## Qué hace el proyecto
+
+- Ingiera calendario y convocados desde archivos Markdown.
+- Normaliza selecciones y jugadores.
+- Construye y mantiene una base SQLite local.
+- Consulta API-Football con estrategia `cache-first`.
+- Hace backfill histórico por selección.
+- Descarga lineups, stats por fixture, stats por jugador y odds.
+- Entrena un modelo estadístico local con señales colectivas e individuales.
+- Predice marcador exacto por fecha o por partido.
+- Genera `CSV`, `JSON` y `HTML` listos para inspección.
+
+## Cómo funciona
 
 ```mermaid
 flowchart LR
-    A[calendario_mundial.md] --> B[calendar_parser.py]
-    C[seleccionados_mundialistas.md] --> D[roster_parser.py]
-    B --> E[data/processed/calendar.csv]
-    D --> F[data/processed/rosters.csv]
-    E --> G[SQLite]
-    F --> G
-    H[API-Football] --> I[api_football_client.py]
-    I --> J[api_cache + api_usage]
-    I --> G
-    G --> K[features.py]
-    K --> L[ratings.py]
-    L --> M[poisson_model.py]
-    M --> N[predictor.py]
-    N --> O[outputs/predictions/*.csv]
+    A[calendario_mundial.md] --> B[Parser de calendario]
+    C[seleccionados_mundialistas.md] --> D[Parser de convocados]
+    B --> E[SQLite local]
+    D --> E
+    F[API-Football] --> G[Cliente con cache local]
+    G --> E
+    E --> H[Features por selección]
+    E --> I[Features por jugador]
+    H --> J[Agregación colectiva]
+    I --> J
+    J --> K[PoissonRegressor local]
+    K --> L[Lambdas de gol]
+    L --> M[Matriz Poisson de marcador exacto]
+    M --> N[CSV / JSON / HTML]
 ```
 
-## Flujo de predicción
+## Cómo se calcula el resultado
+
+### 1. Señales por selección
+
+Para cada equipo se calcula una ventana reciente con indicadores como:
+
+- goles a favor promedio
+- goles en contra promedio
+- diferencia de gol
+- tasa de victoria
+- porterías a cero
+- forma reciente
+- localía
+- ajuste de mercado vía odds
+
+Estas señales siguen siendo importantes porque describen el comportamiento colectivo reciente de una selección.
+
+### 2. Señales por jugador
+
+El sistema consulta y consolida dos tipos de datos individuales:
+
+- `season prior`: lo acumulado por jugador en la temporada o competencia
+- `recent form`: lo hecho por ese jugador en sus últimos partidos disponibles
+
+Se construyen sub-scores individuales a partir de métricas reales disponibles en API-Football:
+
+- `attack_score`
+  - goles por 90
+  - tiros a puerta por 90
+  - asistencias por 90
+  - pases clave por 90
+  - regates exitosos por 90
+- `defense_score`
+  - tackles por 90
+  - intercepciones por 90
+  - porcentaje de duelos ganados
+  - duelos ganados por 90
+- `discipline_risk`
+  - faltas cometidas por 90
+  - amarillas por 90
+  - rojas por 90
+  - penales cometidos
+- `availability_score`
+  - minutos recientes
+  - titularidades recientes
+  - apariciones acumuladas
+- `goalkeeper_score`
+  - atajadas
+  - goles concedidos
+  - rating
+  - minutos
+
+Cuando una métrica no existe literalmente en la API, se usa un proxy explícito. Por ejemplo:
+
+- juego aéreo: `altura + duelos ganados + posición`
+- recuperación de balón: `tackles + intercepciones + duelos`
+
+### 3. Cómo se convierten esos datos en fuerza colectiva
+
+Los sub-scores de jugador se agregan a nivel equipo para producir:
+
+- `starter_attack_strength`
+- `starter_defense_strength`
+- `starter_midfield_control`
+- `goalkeeper_strength`
+- `bench_impact`
+- `discipline_risk_penalty`
+
+Estos agregados se combinan con las señales tradicionales del equipo. Así, la predicción final ya no depende sólo del histórico de la selección, sino también de qué jugadores concretos llegan, juegan y con qué perfil.
 
 ```mermaid
 flowchart TD
-    A[Partidos objetivo] --> B[Construcción de features por selección]
-    B --> C[gf_avg ga_avg gd_avg win_rate clean_sheet_rate]
-    B --> D[lineup_strength odds_adjustment host_adjustment]
-    C --> E[team_strength]
+    A[Datos por jugador] --> B[Sub-scores individuales]
+    B --> C[Titulares]
+    B --> D[Banca]
+    C --> E[Fuerza ofensiva del once]
+    C --> F[Fuerza defensiva del once]
+    C --> G[Control del mediocampo]
+    C --> H[Fuerza del portero]
+    D --> I[Impacto del banco]
+    B --> J[Riesgo disciplinario]
+    E --> K[Features finales del equipo]
+    F --> K
+    G --> K
+    H --> K
+    I --> K
+    J --> K
+```
+
+### 4. Modelo estadístico
+
+Con esas features se entrena un modelo local con dos `PoissonRegressor`:
+
+- uno para estimar goles del local
+- uno para estimar goles del visitante
+
+El modelo aprende a transformar la combinación de señales colectivas e individuales en:
+
+- `lambda_home`
+- `lambda_away`
+
+Luego esas lambdas alimentan una matriz Poisson `0..5 x 0..5`. Finalmente se aplica un prior ligero a marcadores muy comunes en torneos cortos y se elige el score exacto más probable.
+
+```mermaid
+flowchart TD
+    A[Features de equipo y jugador] --> B[PoissonRegressor local]
+    B --> C[lambda_home]
+    B --> D[lambda_away]
+    C --> E[Matriz Poisson]
     D --> E
-    E --> F[Estimación de lambda_home y lambda_away]
-    F --> G[Matriz Poisson 0-5 x 0-5]
-    G --> H[Prior suave para marcadores frecuentes]
-    H --> I[Score exacto más probable]
+    E --> F[Marcador exacto más probable]
+    E --> G[Probabilidad del score]
 ```
 
-## Estructura del repo
+## Arquitectura operativa
 
-```text
-.
-├── data/
-│   ├── raw/                  # fuentes manuales originales
-│   ├── processed/            # calendar.csv y rosters.csv
-│   ├── db/                   # SQLite operativa local
-│   └── public/               # documentación del modo publicable
-├── outputs/
-│   ├── predictions/          # predicciones exportadas a CSV
-│   ├── logs/                 # reportes de calidad y uso API
-│   └── bundles/              # bundles offline para compartir
-├── scripts/                  # wrappers 01..11
-├── src/quiniela/             # librería principal
-└── tests/                    # suite offline
-```
+Principios del sistema:
 
-## Requisitos
+- `local-first`: SQLite es la fuente operativa
+- `cache-first`: primero se busca en `api_cache`
+- `live-on-miss`: sólo se consulta red si falta cache
+- `degraded-but-functional`: sin API key o sin ciertos datos, el pipeline sigue corriendo con fallback controlado
 
-- Python `3.11+`
-- Windows, macOS o Linux con `sqlite3` disponible
-- API key de API-Football opcional
+Endpoints usados actualmente:
 
-El proyecto no asume compatibilidad con Python `3.9.x`.
+- `/teams`
+- `/fixtures`
+- `/fixtures/lineups`
+- `/fixtures/statistics`
+- `/fixtures/events`
+- `/fixtures/players`
+- `/players`
+- `/players/seasons`
+- `/odds`
 
 ## Instalación
 
@@ -96,175 +235,129 @@ copy .env.example .env
 
 Variables de entorno:
 
-- `API_FOOTBALL_KEY`: opcional; habilita llamadas en vivo.
-- `API_FOOTBALL_HOST`: por defecto `v3.football.api-sports.io`.
-- `API_DAILY_LIMIT`: por defecto `100`; para plan Pro ajústalo a `7500`.
-- `DB_PATH`: por defecto `data/db/quiniela.db`.
-- `LOCAL_TIMEZONE`: por defecto `America/Mexico_City`.
+- `API_FOOTBALL_KEY`
+- `API_FOOTBALL_HOST`
+- `API_DAILY_LIMIT`
+- `DB_PATH`
+- `LOCAL_TIMEZONE`
 
-## Inicio rápido
+Valores sugeridos:
 
-1. Parsear fuentes manuales:
+```env
+API_FOOTBALL_HOST=v3.football.api-sports.io
+API_DAILY_LIMIT=7500
+DB_PATH=data/db/quiniela.db
+LOCAL_TIMEZONE=America/Mexico_City
+```
+
+## Uso rápido
+
+### 1. Crear la base inicial
 
 ```bash
 python scripts/01_ingest_calendar.py
 python scripts/02_ingest_rosters.py
-```
-
-2. Inicializar base:
-
-```bash
 python scripts/03_init_db.py
 ```
 
-3. Backfill histórico:
+### 2. Cargar histórico
 
 ```bash
 python scripts/04_fetch_priority_history.py --teams "México,Sudáfrica,República de Corea,República Checa"
 ```
 
-4. Traer datos del día:
+### 3. Refrescar datos del día
 
 ```bash
 python scripts/05_fetch_today_data.py --date 2026-06-11
 python scripts/05_fetch_today_data.py --date 2026-06-11 --lineups-only
 ```
 
-5. Generar predicciones:
+### 4. Entrenar el modelo por jugador
+
+```bash
+python scripts/13_train_player_model.py --min-matches 20
+```
+
+### 5. Generar predicciones
 
 ```bash
 python scripts/06_predict_match.py --date 2026-06-11
 python scripts/06_predict_match.py --home "México" --away "Sudáfrica"
 ```
 
-6. Ver uso API:
+### 6. Actualizar resultado oficial
 
 ```bash
-python scripts/08_report_api_usage.py
+python scripts/07_update_after_match.py --home "México" --away "Sudáfrica" --force-refresh
 ```
 
-## Cómo usa API-Football
+### 7. Generar reporte HTML
 
-El cliente `src/quiniela/api_football_client.py` encapsula un patrón `cache-first`:
-
-1. Busca `endpoint + params` en `api_cache`.
-2. Si existe cache, devuelve la respuesta y registra `cache_hit=1` en `api_usage`.
-3. Si no existe cache, valida que haya API key y cuota diaria disponible.
-4. Hace la request real, registra el consumo y persiste el payload JSON en SQLite.
-
-Endpoints usados por el scaffold:
-
-- `/teams`
-- `/fixtures`
-- `/fixtures/lineups`
-- `/fixtures/statistics`
-- `/fixtures/events`
-- `/odds`
-
-### Free vs Pro
-
-Al 11 de junio de 2026, la página de pricing de API-Football indica:
-
-- `Free`: `100` requests por día.
-- `Pro`: `7,500` requests por día.
-- Ambos planes incluyen los mismos endpoints; la diferencia importante es que el plan free está limitado por temporadas disponibles.
-
-Eso cambia mucho el comportamiento práctico:
-
-- `Free` suele servir para pruebas, fixtures del día, lineups y validaciones ligeras.
-- `Pro` es el modo adecuado para hacer backfill histórico amplio sin pelear con la disponibilidad de temporadas.
-
-Limitación importante de publicación:
-
-- API-Football prohíbe revender directamente sus datos.
-- Su ToS también dice que la licencia o permiso para publicar esos datos debe gestionarla el usuario.
-
-Por eso este repo separa dos cosas:
-
-- el código abierto del pipeline
-- los bundles offline con datos derivados, que debes redistribuir sólo si tienes claro que tu uso cumple con las licencias aplicables
-
-## Modo sin API key
-
-Si `API_FOOTBALL_KEY` está vacía, el proyecto sigue funcionando para:
-
-- parsear calendario y convocados
-- crear SQLite
-- construir features con defaults
-- calcular ratings
-- generar predicciones Poisson
-
-Lo que queda degradado:
-
-- backfill histórico en vivo
-- alineaciones del día
-- estadísticas, eventos y odds del día
-
-## Algoritmo de predicción
-
-El pipeline actual es deliberadamente simple.
-
-### 1. Features por selección
-
-Para cada partido se calcula una ventana reciente `N=5` con:
-
-- `gf_avg`: goles a favor promedio
-- `ga_avg`: goles en contra promedio
-- `gd_avg`: diferencia promedio
-- `win_rate`
-- `clean_sheet_rate`
-- `recent_form_score`
-- `host_adjustment`
-- `lineup_strength`
-- `odds_adjustment`
-
-Si falta histórico, se usan defaults neutros:
-
-- `gf_avg=1.0`
-- `ga_avg=1.0`
-- `win_rate=0.33`
-- `gd_avg=0.0`
-- `recent_form_score=0.0`
-
-Además se marca `used_fallback=1` para que la predicción siga siendo auditable.
-
-### 2. Rating interpretable
-
-`ratings.py` construye:
-
-```text
-team_strength =
-    goal_difference_component
-  + form_component
-  + lineup_component
-  + odds_component
-  + host_component
+```bash
+python scripts/12_render_html_report.py --date 2026-06-11
+python scripts/12_render_html_report.py --date 2026-06-11 --date 2026-06-12 --date 2026-06-13
 ```
 
-Cada componente se recorta a bandas pequeñas para mantener estabilidad y evitar explosiones numéricas.
+## Archivos de salida
 
-### 3. Lambdas de gol
+El proyecto genera principalmente:
 
-`poisson_model.py` convierte features y strengths en dos intensidades:
+- `data/db/quiniela.db`
+- `outputs/predictions/predicciones_YYYY-MM-DD.csv`
+- `outputs/predictions/predicciones_YYYY-MM-DD.json`
+- `outputs/predictions/predicciones_YYYY-MM-DD.html`
+- `outputs/logs/data_quality_report.md`
+- `outputs/logs/player_resolution_report.md`
 
-```text
-lambda_home = 1.10 + 0.35 * (home_gf - away_ga) + 0.30 * (home_strength - away_strength)
-lambda_away = 1.00 + 0.35 * (away_gf - home_ga) + 0.30 * (away_strength - home_strength)
-```
+El HTML muestra:
 
-Luego ambas se recortan a `[0.2, 2.8]`.
+- horario en Ciudad de México
+- estadio
+- marcador pronosticado
+- resultado real
+- alineaciones confirmadas o inferidas
+- top impactos por jugador/equipo
 
-### 4. Matriz de score exacto
+## Cómo usarlo con agentes de IA
 
-Se calcula una matriz Poisson `0..5 x 0..5`, se aplica un prior ligero a marcadores frecuentes de Mundial:
+Este proyecto está pensado para trabajar bien con agentes de código como:
 
-- `0-0`
-- `1-0`
-- `1-1`
-- `2-0`
-- `2-1`
+- Codex
+- GitHub Copilot
+- Claude Code
 
-Finalmente se normaliza la matriz y se elige el score con mayor probabilidad.
+### Patrón recomendado de trabajo
+
+1. Pídele al agente que inspeccione la base y los archivos procesados.
+2. Pídele que refresque partidos o selecciones concretas.
+3. Pídele que entrene el modelo y compare predicciones contra resultados reales.
+4. Pídele que explique por qué un jugador o una alineación movió la predicción.
+5. Pídele que genere HTML, CSV o JSON para revisión humana.
+
+### Ejemplos de tareas útiles para un agente
+
+- “Actualiza los datos del 12 de junio y regenera el HTML”
+- “Entrena de nuevo el modelo por jugador si ya hay más partidos con lineups confirmadas”
+- “Explícame por qué cambió la predicción de Brasil vs Marruecos”
+- “Dime qué selecciones no tienen alineación confirmada”
+- “Muéstrame los tres jugadores con mayor impacto ofensivo por equipo”
+
+### Qué necesita el agente
+
+Para ser útil, el agente debe tener acceso a:
+
+- el repo local
+- `.env` con tu API key
+- la base SQLite local
+- permiso para ejecutar scripts Python y, cuando aplique, consultar la API
+
+### Buenas prácticas con IA
+
+- usa prompts concretos con fecha, selección o partido
+- pide siempre trazabilidad, no sólo el score final
+- si el agente hace llamadas live, revisa el consumo del plan API
+- mantén `.env` fuera de Git
 
 ## Base de datos
 
@@ -277,91 +370,40 @@ Tablas principales:
 - `historical_lineups`
 - `historical_team_stats`
 - `historical_player_stats`
+- `fixture_player_stats`
+- `player_season_stats`
 - `odds_snapshots`
 - `predictions`
+- `prediction_player_impacts`
 - `actual_results`
 - `api_cache`
 - `api_usage`
 
-### Cómo inspeccionarla
+Herramientas recomendadas para inspección:
 
-Opciones recomendadas:
+- `DB Browser for SQLite`
+- `SQLiteStudio`
+- `VS Code` con extensión SQLite
 
-- `DB Browser for SQLite`: la opción más simple para explorar tablas y correr queries.
-- `SQLiteStudio`: muy cómoda para filtros, índices y exportaciones.
-- `VS Code + SQLite extension`: útil si ya trabajas dentro del editor.
-
-Ejemplos rápidos:
+Ejemplos:
 
 ```bash
 sqlite3 data/db/quiniela.db ".tables"
 sqlite3 data/db/quiniela.db "select home_team, away_team, api_fixture_id from matches where date_cdmx='2026-06-11';"
-sqlite3 data/db/quiniela.db "select endpoint, count(*) from api_usage group by endpoint order by count(*) desc;"
+sqlite3 data/db/quiniela.db "select match_id, home_goals, away_goals from actual_results;"
 ```
 
-## Modo publicable
+## Límites, licencias y consideraciones
 
-El repo ya incluye un flujo para generar un bundle offline compartible sin secretos.
+- La data deportiva puede variar por competencia y cobertura.
+- El proyecto depende de la calidad y disponibilidad de API-Football.
+- El proveedor indica que no se debe revender la data directamente.
+- El proveedor también indica que cualquier licencia o permiso de publicación de los datos debe ser gestionado por el usuario con los titulares correspondientes.
 
-### Exportar bundle
+Antes de publicar una base enriquecida o artefactos derivados, revisa:
 
-```bash
-python scripts/09_export_public_bundle.py
-```
-
-Eso crea:
-
-- `outputs/bundles/public_bundle/quiniela_public.sqlite`
-- `outputs/bundles/public_bundle/manifest.json`
-- `outputs/bundles/public_bundle/processed/calendar.csv`
-- `outputs/bundles/public_bundle/processed/rosters.csv`
-- `outputs/bundles/quiniela_public_bundle.zip`
-
-El bundle:
-
-- conserva datos operativos para predicción
-- elimina datos de `api_cache`
-- elimina datos de `api_usage`
-- no incluye API key
-
-### Importar bundle
-
-```bash
-python scripts/10_import_public_bundle.py --bundle-path outputs/bundles/quiniela_public_bundle.zip
-```
-
-### Ver estado del bundle/base
-
-```bash
-python scripts/11_public_bundle_status.py
-```
-
-### Estrategia recomendada para publicar
-
-Para un repo público seguro:
-
-1. Publica el código, tests y documentación.
-2. No publiques `.env`.
-3. No publiques `api_cache` ni `api_usage`.
-4. Evalúa con cuidado si puedes redistribuir un bundle con datos derivados de API-Football.
-5. Si quieres compartir el bundle, hazlo como release asset o distribución privada sólo si tu uso/licencia lo permite.
-
-## Qué sí puede hacer un usuario del plan free
-
-En general:
-
-- correr el pipeline offline con los datos manuales
-- usar la API para comprobaciones ligeras
-- traer algunos fixtures del día
-- intentar traer lineups del día
-
-En la práctica, la disponibilidad exacta depende de:
-
-- la cobertura del partido en API-Football
-- la temporada habilitada en el plan free
-- la cuota diaria restante
-
-Así que sí, el plan free puede servir para lineups del día en algunos escenarios, pero no es una base confiable para backfill histórico masivo.
+- https://www.api-football.com/pricing
+- https://www.api-football.com/terms
 
 ## Pruebas
 
@@ -369,47 +411,4 @@ Así que sí, el plan free puede servir para lineups del día en algunos escenar
 pytest -q
 ```
 
-La suite base es offline y no consume cuota real.
-
-## Publicación en GitHub sin exponer secretos
-
-Checklist mínima:
-
-1. Mantén `.env` fuera del repo.
-2. Revisa `.gitignore` antes de hacer el primer push.
-3. Usa `.env.example` como plantilla pública.
-4. No subas dumps con credenciales, cache o logs sensibles.
-5. Si haces un release con datos, documenta su origen, fecha de corte y limitaciones legales.
-
-Comandos locales típicos:
-
-```bash
-git init -b main
-git add .
-git commit -m "Initial public scaffold"
-git remote add origin https://github.com/TU_USUARIO/quiniela-mundial-2026.git
-git push -u origin main
-```
-
-## Estado actual del scaffold
-
-Incluye:
-
-- parsers de calendario y convocados
-- normalización de nombres
-- SQLite + schema idempotente
-- cache local de API-Football
-- backfill histórico por selección
-- fetch del día
-- features mínimas
-- rating interpretable
-- modelo Poisson
-- CLI con wrappers `01..11`
-- bundle offline para modo publicable
-
-No incluye:
-
-- dashboard
-- entrenamiento ML complejo
-- scheduler de producción
-- integración CI/CD todavía
+La suite base es offline y valida parsers, reportes HTML, persistencia de bundle, componentes del modelo Poisson y partes del flujo del modelo por jugador.

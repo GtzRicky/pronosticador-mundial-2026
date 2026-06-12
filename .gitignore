@@ -9,7 +9,10 @@ __pycache__/
 *.db
 .env
 data/processed/*.csv
+data/processed/model_artifacts/
 outputs/predictions/*.csv
+outputs/predictions/*.json
+outputs/predictions/*.html
 outputs/logs/*.csv
 outputs/logs/*.md
 outputs/bundles/

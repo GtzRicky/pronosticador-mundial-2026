@@ -27,6 +27,11 @@ from quiniela.name_maps import (
     normalize_text,
     preferred_team_search_name,
 )
+from quiniela.player_model import (
+    store_fixture_players_payload,
+    store_player_season_payload,
+    write_player_resolution_report,
+)
 
 
 logger = get_logger(__name__)
@@ -237,9 +242,10 @@ def _store_fixture_children(
     client: APIFootballClient,
     fixture_id: str,
     collect_odds: bool,
+    resolution_entries: list[dict[str, Any]] | None = None,
     include_stats_events: bool = True,
 ) -> dict[str, int]:
-    counts = {"lineups": 0, "statistics": 0, "events": 0, "odds": 0}
+    counts = {"lineups": 0, "fixture_player_stats": 0, "statistics": 0, "events": 0, "odds": 0}
 
     try:
         lineups_payload = client.get_fixture_lineups(fixture_id)
@@ -258,6 +264,22 @@ def _store_fixture_children(
         return counts
 
     if include_stats_events:
+        try:
+            players_payload = client.get_fixture_players(fixture_id)
+            for team_payload in players_payload.get("response", []):
+                team_name = team_payload.get("team", {}).get("name") or ""
+                counts["fixture_player_stats"] += store_fixture_players_payload(
+                    client.connection,
+                    fixture_id=fixture_id,
+                    team_norm=normalize_team_name(team_name),
+                    team_name=team_name,
+                    team_payload=team_payload,
+                    resolution_entries=resolution_entries,
+                )
+        except APILimitReachedError:
+            logger.warning("LÃ­mite/rate limit alcanzado al pedir stats de jugadores para fixture %s", fixture_id)
+            return counts
+
         try:
             stats_payload = client.get_fixture_statistics(fixture_id)
             for stat_row in stats_payload.get("response", []):
@@ -318,6 +340,37 @@ def _store_fixture_children(
     return counts
 
 
+def _fetch_team_player_season_stats(
+    client: APIFootballClient,
+    api_team_id: int,
+    team_norm: str,
+    team_name: str,
+    seasons: list[int],
+    resolution_entries: list[dict[str, Any]] | None = None,
+) -> int:
+    stored_rows = 0
+    for season in seasons:
+        page = 1
+        while True:
+            payload = client.get_players(team=api_team_id, season=season, page=page)
+            response_rows = payload.get("response", [])
+            if not response_rows:
+                break
+            stored_rows += store_player_season_payload(
+                client.connection,
+                team_norm=team_norm,
+                team_name=team_name,
+                payload=payload,
+                resolution_entries=resolution_entries,
+            )
+            if len(response_rows) < 20:
+                break
+            page += 1
+            if page > 25:
+                break
+    return stored_rows
+
+
 def write_backfill_report(report: dict[str, Any], output_path: Path | None = None) -> Path:
     settings = get_settings()
     path = output_path or settings.logs_dir / "data_quality_report.md"
@@ -329,6 +382,8 @@ def write_backfill_report(report: dict[str, Any], output_path: Path | None = Non
         f"- Teams missing: {', '.join(report['teams_missing']) if report['teams_missing'] else 'none'}",
         f"- Fixtures stored: {report['fixtures_stored']}",
         f"- Lineups stored: {report['lineups_stored']}",
+        f"- Fixture player stats stored: {report.get('fixture_player_stats_stored', 0)}",
+        f"- Player season stats stored: {report.get('season_player_stats_stored', 0)}",
         f"- Statistics rows stored: {report['statistics_stored']}",
         f"- Event rows stored: {report['events_stored']}",
         f"- Odds rows stored: {report['odds_stored']}",
@@ -376,12 +431,15 @@ def backfill_team_history(
         "teams_missing": [],
         "fixtures_stored": 0,
         "lineups_stored": 0,
+        "fixture_player_stats_stored": 0,
+        "season_player_stats_stored": 0,
         "statistics_stored": 0,
         "events_stored": 0,
         "odds_stored": 0,
         "missing_fixture_counts": {},
         "team_history_strategy": {},
     }
+    resolution_entries: list[dict[str, Any]] = []
 
     selected_fixture_ids: set[str] = set()
     fixture_payloads: dict[str, dict[str, Any]] = {}
@@ -396,6 +454,14 @@ def backfill_team_history(
             continue
 
         report["teams_resolved"].append(display_name)
+        report["season_player_stats_stored"] += _fetch_team_player_season_stats(
+            client=client,
+            api_team_id=api_team_id,
+            team_norm=normalize_team_name(team_name),
+            team_name=display_name,
+            seasons=_season_candidates(date_from, date_to),
+            resolution_entries=resolution_entries,
+        )
         selected, strategy = _fetch_team_history_candidates(
             client=client,
             team_name=team_name,
@@ -422,14 +488,17 @@ def backfill_team_history(
             client,
             fixture_id,
             collect_odds=collect_odds,
+            resolution_entries=resolution_entries,
             include_stats_events=True,
         )
         report["lineups_stored"] += counts["lineups"]
+        report["fixture_player_stats_stored"] += counts["fixture_player_stats"]
         report["statistics_stored"] += counts["statistics"]
         report["events_stored"] += counts["events"]
         report["odds_stored"] += counts["odds"]
 
     write_backfill_report(report, settings.logs_dir / "data_quality_report.md")
+    write_player_resolution_report(resolution_entries, settings.logs_dir / "player_resolution_report.md")
     return report
 
 
@@ -483,6 +552,7 @@ def fetch_today_data(
         in scheduled_pairs
     ]
     updated = defaultdict(int)
+    resolution_entries: list[dict[str, Any]] = []
 
     with client.connection:
         for fixture in fixtures:
@@ -508,14 +578,31 @@ def fetch_today_data(
                 client,
                 fixture_id,
                 collect_odds=not lineups_only and client.requests_remaining() >= 15,
+                resolution_entries=resolution_entries,
                 include_stats_events=not lineups_only,
             )
             updated["lineups"] += counts["lineups"]
+            updated["fixture_player_stats"] += counts["fixture_player_stats"]
             if not lineups_only:
                 updated["statistics"] += counts["statistics"]
                 updated["events"] += counts["events"]
                 updated["odds"] += counts["odds"]
+                for team_name, team_norm in (
+                    (home_team, normalize_team_name(home_team)),
+                    (away_team, normalize_team_name(away_team)),
+                ):
+                    api_team_id = get_team_api_id(client.connection, team_norm)
+                    if api_team_id is not None:
+                        updated["season_player_stats"] += _fetch_team_player_season_stats(
+                            client=client,
+                            api_team_id=api_team_id,
+                            team_norm=team_norm,
+                            team_name=team_name,
+                            seasons=[pd.Timestamp(date_str).year],
+                            resolution_entries=resolution_entries,
+                        )
 
+    write_player_resolution_report(resolution_entries, settings.logs_dir / "player_resolution_report.md")
     return dict(updated)
 
 

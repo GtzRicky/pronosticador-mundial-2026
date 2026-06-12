@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from scipy.stats import poisson
+
+from quiniela.player_model import PLAYER_MODEL_FEATURE_COLUMNS
 
 
 SCORE_PRIOR = {
@@ -27,11 +30,34 @@ class ScorePrediction:
 
 
 class PoissonScoreModel:
-    def __init__(self, max_goals: int = 5, model_version: str = "poisson_v1") -> None:
+    def __init__(
+        self,
+        max_goals: int = 5,
+        model_version: str = "poisson_v1",
+        trained_bundle: dict[str, Any] | None = None,
+    ) -> None:
         self.max_goals = max_goals
-        self.model_version = model_version
+        self.model_version = trained_bundle.get("model_version", model_version) if trained_bundle else model_version
+        self.trained_bundle = trained_bundle
 
     def estimate_lambdas(self, row: dict[str, Any]) -> tuple[float, float]:
+        if self.trained_bundle is not None:
+            feature_columns = self.trained_bundle.get("feature_columns", PLAYER_MODEL_FEATURE_COLUMNS)
+            feature_frame = pd.DataFrame(
+                [
+                    {
+                        column: float(row.get(column, 0.0) if row.get(column) is not None else 0.0)
+                        for column in feature_columns
+                    }
+                ]
+            )
+            home_regressor = self.trained_bundle.get("home_regressor")
+            away_regressor = self.trained_bundle.get("away_regressor")
+            if home_regressor is not None and away_regressor is not None:
+                lambda_home = float(home_regressor.predict(feature_frame)[0])
+                lambda_away = float(away_regressor.predict(feature_frame)[0])
+                return max(min(lambda_home, 2.8), 0.2), max(min(lambda_away, 2.8), 0.2)
+
         home_strength = float(row.get("home_team_strength", 0.0))
         away_strength = float(row.get("away_team_strength", 0.0))
         home_gf = float(row.get("home_gf_avg", 1.0))

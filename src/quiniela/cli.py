@@ -12,6 +12,8 @@ from quiniela.calendar_parser import ingest_calendar
 from quiniela.config import get_settings
 from quiniela.db import create_schema, fetch_dataframe, get_connection, seed_from_processed
 from quiniela.historical_loader import backfill_team_history, fetch_today_data, update_after_match
+from quiniela.html_report import build_predictions_html_report
+from quiniela.player_model import train_player_model
 from quiniela.predictor import Predictor, format_prediction_lines
 from quiniela.public_bundle import export_public_bundle, import_public_bundle, public_bundle_status
 from quiniela.roster_parser import ingest_rosters
@@ -112,6 +114,23 @@ def update_after_match_command(
 ) -> None:
     result = update_after_match(home, away, dry_run=dry_run, force_refresh=force_refresh)
     console.print(result)
+    if result.get("updated"):
+        settings = get_settings()
+        connection = get_connection(settings.db_path)
+        match_df = fetch_dataframe(
+            connection,
+            """
+            SELECT date_cdmx
+            FROM matches
+            WHERE match_id = ?
+            LIMIT 1
+            """,
+            (result["match_id"],),
+        )
+        if not match_df.empty:
+            date_value = str(match_df.iloc[0]["date_cdmx"])
+            html_path = build_predictions_html_report([date_value])
+            console.print(f"HTML actualizado en {html_path}")
 
 
 @app.command("report-api-usage")
@@ -185,3 +204,22 @@ def import_public_bundle_command(
 @app.command("public-bundle-status")
 def public_bundle_status_command() -> None:
     console.print(public_bundle_status())
+
+
+@app.command("render-html-report")
+def render_html_report_command(
+    date: list[str] = typer.Option(..., help="Fecha YYYY-MM-DD. Repite la opción para múltiples fechas."),
+    output: Optional[str] = typer.Option(None, help="Ruta opcional del archivo HTML de salida"),
+) -> None:
+    output_path = build_predictions_html_report(date, Path(output) if output else None)
+    console.print(f"HTML guardado en {output_path}")
+
+
+@app.command("train-player-model")
+def train_player_model_command(
+    min_matches: int = typer.Option(30, min=5, help="Mínimo de partidos con cobertura suficiente"),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    summary = train_player_model(connection, settings.model_artifacts_dir / "poisson_player_v1.pkl", min_matches=min_matches)
+    console.print(summary)

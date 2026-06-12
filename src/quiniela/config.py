@@ -23,6 +23,7 @@ class Settings:
     predictions_dir: Path
     logs_dir: Path
     public_dir: Path
+    model_artifacts_dir: Path
     api_football_key: str
     api_football_host: str
     api_daily_limit: int
@@ -40,6 +41,7 @@ class Settings:
             self.predictions_dir,
             self.logs_dir,
             self.public_dir,
+            self.model_artifacts_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -57,6 +59,7 @@ def get_settings() -> Settings:
     predictions_dir = outputs_dir / "predictions"
     logs_dir = outputs_dir / "logs"
     public_dir = data_dir / "public"
+    model_artifacts_dir = processed_dir / "model_artifacts"
 
     db_path_value = os.getenv("DB_PATH", "data/db/quiniela.db")
     db_path = ROOT_DIR / db_path_value
@@ -72,6 +75,7 @@ def get_settings() -> Settings:
         predictions_dir=predictions_dir,
         logs_dir=logs_dir,
         public_dir=public_dir,
+        model_artifacts_dir=model_artifacts_dir,
         api_football_key=os.getenv("API_FOOTBALL_KEY", "").strip(),
         api_football_host=os.getenv("API_FOOTBALL_HOST", "v3.football.api-sports.io").strip(),
         api_daily_limit=int(os.getenv("API_DAILY_LIMIT", "100")),

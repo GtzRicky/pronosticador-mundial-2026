@@ -105,8 +105,17 @@ class APIFootballClient:
     def get_fixture_events(self, fixture_id: int | str) -> dict[str, Any]:
         return self._request("/fixtures/events", {"fixture": fixture_id})
 
+    def get_fixture_players(self, fixture_id: int | str) -> dict[str, Any]:
+        return self._request("/fixtures/players", {"fixture": fixture_id})
+
     def get_odds(self, fixture_id: int | str) -> dict[str, Any]:
         return self._request("/odds", {"fixture": fixture_id})
 
     def get_team_fixtures(self, team_id: int | str, from_date: str, to_date: str) -> dict[str, Any]:
         return self.get_fixtures(team=team_id, **{"from": from_date, "to": to_date})
+
+    def get_players(self, **params: Any) -> dict[str, Any]:
+        return self._request("/players", params)
+
+    def get_player_seasons(self, player_id: int | str) -> dict[str, Any]:
+        return self._request("/players/seasons", {"player": player_id})

@@ -7,6 +7,7 @@ import pandas as pd
 
 from quiniela.db import fetch_dataframe
 from quiniela.name_maps import normalize_team_name
+from quiniela.player_model import aggregate_team_player_features
 
 
 DEFAULT_TEAM_FEATURES = {
@@ -19,6 +20,14 @@ DEFAULT_TEAM_FEATURES = {
     "host_adjustment": 0.0,
     "lineup_strength": 0.0,
     "odds_adjustment": 0.0,
+    "starter_attack_strength": 0.0,
+    "starter_defense_strength": 0.0,
+    "starter_midfield_control": 0.0,
+    "goalkeeper_strength": 0.0,
+    "bench_impact": 0.0,
+    "discipline_risk_penalty": 0.0,
+    "lineup_source": "fallback",
+    "player_impacts": [],
     "matches_used": 0,
     "used_fallback": 1,
 }
@@ -137,11 +146,23 @@ def compute_team_features(
     is_home: bool = False,
 ) -> dict[str, Any]:
     matches_df = _load_recent_matches(connection, team_norm, as_of_datetime, window)
+    player_features, player_impacts = aggregate_team_player_features(
+        connection,
+        team_norm=team_norm,
+        team_name=team_name,
+        as_of_datetime=as_of_datetime,
+        fixture_id=fixture_id,
+    )
     if matches_df.empty:
         fallback = DEFAULT_TEAM_FEATURES.copy()
-        fallback["lineup_strength"] = _lineup_strength_from_db(connection, fixture_id, team_norm)
+        fallback.update(player_features)
+        fallback["lineup_strength"] = max(
+            _lineup_strength_from_db(connection, fixture_id, team_norm),
+            _safe_float(player_features.get("lineup_strength"), 0.0),
+        )
         fallback["odds_adjustment"] = _odds_adjustment_from_db(connection, fixture_id, team_name, is_home)
         fallback["host_adjustment"] = 0.08 if is_home else 0.0
+        fallback["player_impacts"] = player_impacts
         return fallback
 
     gf: list[float] = []
@@ -180,8 +201,19 @@ def compute_team_features(
         "clean_sheet_rate": clean_sheets / matches_used,
         "recent_form_score": recent_form_score,
         "host_adjustment": host_adjustment,
-        "lineup_strength": _lineup_strength_from_db(connection, fixture_id, team_norm),
+        "lineup_strength": max(
+            _lineup_strength_from_db(connection, fixture_id, team_norm),
+            _safe_float(player_features.get("lineup_strength"), 0.0),
+        ),
         "odds_adjustment": _odds_adjustment_from_db(connection, fixture_id, team_name, is_home),
+        "starter_attack_strength": _safe_float(player_features.get("starter_attack_strength"), 0.0),
+        "starter_defense_strength": _safe_float(player_features.get("starter_defense_strength"), 0.0),
+        "starter_midfield_control": _safe_float(player_features.get("starter_midfield_control"), 0.0),
+        "goalkeeper_strength": _safe_float(player_features.get("goalkeeper_strength"), 0.0),
+        "bench_impact": _safe_float(player_features.get("bench_impact"), 0.0),
+        "discipline_risk_penalty": _safe_float(player_features.get("discipline_risk_penalty"), 0.0),
+        "lineup_source": player_features.get("lineup_source", "fallback"),
+        "player_impacts": player_impacts,
         "matches_used": matches_used,
         "used_fallback": 0,
     }
@@ -223,6 +255,24 @@ def build_match_feature_row(connection, match_row: dict[str, Any], window: int =
     for prefix, features in (("home", home_features), ("away", away_features)):
         for key, value in features.items():
             row[f"{prefix}_{key}"] = value
+    row["delta_attack_strength"] = _safe_float(home_features.get("starter_attack_strength")) - _safe_float(
+        away_features.get("starter_attack_strength")
+    )
+    row["delta_defense_strength"] = _safe_float(home_features.get("starter_defense_strength")) - _safe_float(
+        away_features.get("starter_defense_strength")
+    )
+    row["delta_midfield_control"] = _safe_float(home_features.get("starter_midfield_control")) - _safe_float(
+        away_features.get("starter_midfield_control")
+    )
+    row["delta_goalkeeper_strength"] = _safe_float(home_features.get("goalkeeper_strength")) - _safe_float(
+        away_features.get("goalkeeper_strength")
+    )
+    row["delta_bench_impact"] = _safe_float(home_features.get("bench_impact")) - _safe_float(
+        away_features.get("bench_impact")
+    )
+    row["delta_discipline_risk_penalty"] = _safe_float(home_features.get("discipline_risk_penalty")) - _safe_float(
+        away_features.get("discipline_risk_penalty")
+    )
     return row
 
 
