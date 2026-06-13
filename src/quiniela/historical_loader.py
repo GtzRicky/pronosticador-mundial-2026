@@ -314,7 +314,7 @@ def _store_fixture_children(
             logger.warning("Límite/rate limit alcanzado al pedir eventos para fixture %s", fixture_id)
             return counts
 
-    if collect_odds and include_stats_events:
+    if collect_odds:
         try:
             odds_payload = client.get_odds(fixture_id)
             for odd_row in odds_payload.get("response", []):
@@ -507,11 +507,21 @@ def fetch_today_data(
     lineups_only: bool = False,
     dry_run: bool = False,
     force_refresh: bool = False,
+    fetch_mode: str = "full",
 ) -> dict[str, Any]:
+    valid_modes = {"full", "hourly", "pre_match", "post_status", "lineups"}
+    if lineups_only:
+        fetch_mode = "lineups"
+    if fetch_mode not in valid_modes:
+        raise ValueError(f"fetch_mode debe ser uno de: {', '.join(sorted(valid_modes))}")
+
     settings = get_settings()
     client = APIFootballClient(settings=settings, dry_run=dry_run, force_refresh=force_refresh)
     target_date = pd.Timestamp(date_str).date()
-    api_dates = [target_date.isoformat(), (target_date + timedelta(days=1)).isoformat()]
+    api_dates = [
+        (target_date + timedelta(days=offset)).isoformat()
+        for offset in range(3)
+    ]
     fixtures: list[dict[str, Any]] = []
     seen_fixture_ids: set[str] = set()
     cdmx_tz = ZoneInfo(settings.local_timezone)
@@ -525,31 +535,31 @@ def fetch_today_data(
             if kickoff.tzinfo is None:
                 kickoff = kickoff.tz_localize("UTC")
             kickoff_cdmx = kickoff.tz_convert(cdmx_tz)
-            if kickoff_cdmx.date().isoformat() != date_str:
-                continue
             seen_fixture_ids.add(fixture_id)
             fixtures.append(fixture)
     scheduled_df = fetch_dataframe(
         client.connection,
         """
-        SELECT home_team_norm, away_team_norm
+        SELECT match_id, home_team, away_team
         FROM matches
         WHERE date_cdmx = ?
         """,
         (date_str,),
     )
-    scheduled_pairs = {
-        (row["home_team_norm"], row["away_team_norm"])
-        for row in scheduled_df.to_dict(orient="records")
-    }
+    scheduled_pairs: dict[tuple[str, str], str] = {}
+    for row in scheduled_df.to_dict(orient="records"):
+        pair = (
+            normalize_team_name(row.get("home_team") or ""),
+            normalize_team_name(row.get("away_team") or ""),
+        )
+        scheduled_pairs[pair] = str(row["match_id"])
     fixtures = [
         fixture
         for fixture in fixtures
         if (
             normalize_team_name(fixture.get("teams", {}).get("home", {}).get("name") or ""),
             normalize_team_name(fixture.get("teams", {}).get("away", {}).get("name") or ""),
-        )
-        in scheduled_pairs
+        ) in scheduled_pairs
     ]
     updated = defaultdict(int)
     resolution_entries: list[dict[str, Any]] = []
@@ -561,32 +571,57 @@ def fetch_today_data(
             fixture_id = str(fixture.get("fixture", {}).get("id"))
             home_team = fixture.get("teams", {}).get("home", {}).get("name") or ""
             away_team = fixture.get("teams", {}).get("away", {}).get("name") or ""
+            kickoff = pd.Timestamp(fixture.get("fixture", {}).get("date"))
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.tz_localize("UTC")
+            kickoff_cdmx = kickoff.tz_convert(cdmx_tz)
+            match_id = scheduled_pairs.get(
+                (
+                    normalize_team_name(home_team),
+                    normalize_team_name(away_team),
+                )
+            )
+            if not match_id:
+                continue
             client.connection.execute(
                 """
                 UPDATE matches
-                SET api_fixture_id = ?
-                WHERE home_team_norm = ? AND away_team_norm = ? AND date_cdmx = ?
+                SET api_fixture_id = ?,
+                    status = ?,
+                    date_cdmx = ?,
+                    time_cdmx = ?,
+                    datetime_cdmx = ?
+                WHERE match_id = ?
                 """,
                 (
                     fixture.get("fixture", {}).get("id"),
-                    normalize_team_name(home_team),
-                    normalize_team_name(away_team),
-                    date_str,
+                    fixture.get("fixture", {}).get("status", {}).get("short") or "scheduled",
+                    kickoff_cdmx.date().isoformat(),
+                    kickoff_cdmx.strftime("%H:%M"),
+                    kickoff_cdmx.isoformat(),
+                    match_id,
                 ),
             )
+            if fetch_mode == "post_status":
+                continue
+            include_stats_events = (
+                fetch_mode == "full"
+                and client.requests_remaining() > settings.api_critical_reserve
+            )
+            collect_odds = fetch_mode in {"full", "hourly", "pre_match"}
             counts = _store_fixture_children(
                 client,
                 fixture_id,
-                collect_odds=not lineups_only and client.requests_remaining() >= 15,
+                collect_odds=collect_odds,
                 resolution_entries=resolution_entries,
-                include_stats_events=not lineups_only,
+                include_stats_events=include_stats_events,
             )
             updated["lineups"] += counts["lineups"]
             updated["fixture_player_stats"] += counts["fixture_player_stats"]
-            if not lineups_only:
+            updated["odds"] += counts["odds"]
+            if include_stats_events:
                 updated["statistics"] += counts["statistics"]
                 updated["events"] += counts["events"]
-                updated["odds"] += counts["odds"]
                 for team_name, team_norm in (
                     (home_team, normalize_team_name(home_team)),
                     (away_team, normalize_team_name(away_team)),
@@ -606,6 +641,72 @@ def fetch_today_data(
     return dict(updated)
 
 
+def sync_finished_results_for_date(
+    date_str: str,
+    connection=None,
+) -> dict[str, Any]:
+    if connection is None:
+        settings = get_settings()
+        connection = get_connection(settings.db_path)
+    finished_df = fetch_dataframe(
+        connection,
+        """
+        SELECT
+            m.match_id,
+            hm.home_goals,
+            hm.away_goals,
+            hm.source_json,
+            CASE WHEN ar.match_id IS NULL THEN 1 ELSE 0 END AS is_new_result
+        FROM matches m
+        INNER JOIN historical_matches hm
+            ON hm.fixture_id = CAST(m.api_fixture_id AS TEXT)
+        LEFT JOIN actual_results ar
+            ON ar.match_id = m.match_id
+        WHERE m.date_cdmx = ?
+          AND hm.status IN ('FT', 'AET', 'PEN')
+          AND hm.home_goals IS NOT NULL
+          AND hm.away_goals IS NOT NULL
+        """,
+        (date_str,),
+    )
+    if finished_df.empty:
+        return {"updated": 0, "match_ids": [], "new_match_ids": []}
+
+    finished_records = finished_df.to_dict(orient="records")
+    rows = [
+        (
+            row["match_id"],
+            int(row["home_goals"]),
+            int(row["away_goals"]),
+            row["source_json"],
+        )
+        for row in finished_records
+    ]
+    new_match_ids = [
+        str(row["match_id"])
+        for row in finished_records
+        if int(row["is_new_result"]) == 1
+    ]
+    with connection:
+        connection.executemany(
+            """
+            INSERT INTO actual_results (match_id, home_goals, away_goals, result_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(match_id) DO UPDATE SET
+                home_goals = excluded.home_goals,
+                away_goals = excluded.away_goals,
+                result_json = excluded.result_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            rows,
+        )
+    return {
+        "updated": len(rows),
+        "match_ids": [row[0] for row in rows],
+        "new_match_ids": new_match_ids,
+    }
+
+
 def update_after_match(
     home_team: str,
     away_team: str,
@@ -620,11 +721,17 @@ def update_after_match(
         """
         SELECT match_id, api_fixture_id, home_team, away_team, home_team_norm, away_team_norm
         FROM matches
-        WHERE home_team_norm = ? AND away_team_norm = ?
+        WHERE (home_team_norm = ? AND away_team_norm = ?)
+           OR (home_team = ? AND away_team = ?)
         ORDER BY datetime_cdmx DESC
         LIMIT 1
         """,
-        (normalize_team_name(home_team), normalize_team_name(away_team)),
+        (
+            normalize_team_name(home_team),
+            normalize_team_name(away_team),
+            home_team,
+            away_team,
+        ),
     )
     if match_df.empty:
         return {"updated": False, "reason": "match_not_found"}

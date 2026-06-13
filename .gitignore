@@ -20,3 +20,4 @@ data/db/*.db
 scripts/__pycache__/
 src/quiniela/__pycache__/
 tests/__pycache__/
+build/

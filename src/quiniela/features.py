@@ -74,9 +74,26 @@ def _lineup_strength_from_db(connection, fixture_id: Any, team_norm: str) -> flo
         """,
         (str(int(fixture_id)), team_norm),
     )
-    if lineup_df.empty:
-        return 0.0
-    payload = json.loads(lineup_df.iloc[0]["source_json"])
+    payload = None
+    if not lineup_df.empty:
+        candidate = json.loads(lineup_df.iloc[0]["source_json"])
+        if len(candidate.get("startXI") or []) >= 11:
+            payload = candidate
+    if payload is None:
+        estimate_df = fetch_dataframe(
+            connection,
+            """
+            SELECT source_json
+            FROM lineup_estimates
+            WHERE fixture_id = ? AND team_norm = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(int(fixture_id)), team_norm),
+        )
+        if estimate_df.empty:
+            return 0.0
+        payload = json.loads(estimate_df.iloc[0]["source_json"])
     starters = payload.get("startXI") or []
     if starters:
         return min(len(starters) / 11.0, 1.0) * 0.2
@@ -115,20 +132,27 @@ def _extract_implied_probability(source_json: str, team_name: str, is_home: bool
     return None
 
 
-def _odds_adjustment_from_db(connection, fixture_id: Any, team_name: str, is_home: bool) -> float:
+def _odds_adjustment_from_db(
+    connection,
+    fixture_id: Any,
+    team_name: str,
+    is_home: bool,
+    as_of_datetime: str | None = None,
+    enforce_as_of: bool = False,
+) -> float:
     if fixture_id is None or pd.isna(fixture_id):
         return 0.0
-    odds_df = fetch_dataframe(
-        connection,
-        """
+    query = """
         SELECT source_json
         FROM odds_snapshots
         WHERE fixture_id = ?
-        ORDER BY id DESC
-        LIMIT 5
-        """,
-        (str(int(fixture_id)),),
-    )
+    """
+    params: list[Any] = [str(int(fixture_id))]
+    if enforce_as_of and as_of_datetime:
+        query += " AND fetched_at < ?"
+        params.append(as_of_datetime)
+    query += " ORDER BY id DESC LIMIT 5"
+    odds_df = fetch_dataframe(connection, query, params)
     for _, row in odds_df.iterrows():
         implied = _extract_implied_probability(row["source_json"], team_name, is_home)
         if implied is not None:
@@ -144,7 +168,9 @@ def compute_team_features(
     window: int = 5,
     fixture_id: Any = None,
     is_home: bool = False,
+    allow_season_stats: bool = True,
 ) -> dict[str, Any]:
+    team_norm = normalize_team_name(team_name) or team_norm
     matches_df = _load_recent_matches(connection, team_norm, as_of_datetime, window)
     player_features, player_impacts = aggregate_team_player_features(
         connection,
@@ -152,6 +178,7 @@ def compute_team_features(
         team_name=team_name,
         as_of_datetime=as_of_datetime,
         fixture_id=fixture_id,
+        allow_season_stats=allow_season_stats,
     )
     if matches_df.empty:
         fallback = DEFAULT_TEAM_FEATURES.copy()
@@ -160,7 +187,14 @@ def compute_team_features(
             _lineup_strength_from_db(connection, fixture_id, team_norm),
             _safe_float(player_features.get("lineup_strength"), 0.0),
         )
-        fallback["odds_adjustment"] = _odds_adjustment_from_db(connection, fixture_id, team_name, is_home)
+        fallback["odds_adjustment"] = _odds_adjustment_from_db(
+            connection,
+            fixture_id,
+            team_name,
+            is_home,
+            as_of_datetime=as_of_datetime,
+            enforce_as_of=not allow_season_stats,
+        )
         fallback["host_adjustment"] = 0.08 if is_home else 0.0
         fallback["player_impacts"] = player_impacts
         return fallback
@@ -205,7 +239,14 @@ def compute_team_features(
             _lineup_strength_from_db(connection, fixture_id, team_norm),
             _safe_float(player_features.get("lineup_strength"), 0.0),
         ),
-        "odds_adjustment": _odds_adjustment_from_db(connection, fixture_id, team_name, is_home),
+        "odds_adjustment": _odds_adjustment_from_db(
+            connection,
+            fixture_id,
+            team_name,
+            is_home,
+            as_of_datetime=as_of_datetime,
+            enforce_as_of=not allow_season_stats,
+        ),
         "starter_attack_strength": _safe_float(player_features.get("starter_attack_strength"), 0.0),
         "starter_defense_strength": _safe_float(player_features.get("starter_defense_strength"), 0.0),
         "starter_midfield_control": _safe_float(player_features.get("starter_midfield_control"), 0.0),
@@ -219,7 +260,12 @@ def compute_team_features(
     }
 
 
-def build_match_feature_row(connection, match_row: dict[str, Any], window: int = 5) -> dict[str, Any]:
+def build_match_feature_row(
+    connection,
+    match_row: dict[str, Any],
+    window: int = 5,
+    allow_season_stats: bool = True,
+) -> dict[str, Any]:
     home_features = compute_team_features(
         connection,
         team_norm=match_row["home_team_norm"],
@@ -228,6 +274,7 @@ def build_match_feature_row(connection, match_row: dict[str, Any], window: int =
         window=window,
         fixture_id=match_row.get("api_fixture_id"),
         is_home=True,
+        allow_season_stats=allow_season_stats,
     )
     away_features = compute_team_features(
         connection,
@@ -237,6 +284,7 @@ def build_match_feature_row(connection, match_row: dict[str, Any], window: int =
         window=window,
         fixture_id=match_row.get("api_fixture_id"),
         is_home=False,
+        allow_season_stats=allow_season_stats,
     )
 
     row = {

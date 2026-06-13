@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,10 +14,21 @@ from quiniela.config import get_settings
 from quiniela.db import create_schema, fetch_dataframe, get_connection, seed_from_processed
 from quiniela.historical_loader import backfill_team_history, fetch_today_data, update_after_match
 from quiniela.html_report import build_predictions_html_report
+from quiniela.matchday import MatchdayRunner
+from quiniela.outcome_model import train_outcome_model
 from quiniela.player_model import train_player_model
+from quiniela.player_evidence import (
+    activate_model_release,
+    build_player_targets,
+    capture_pre_match_snapshot,
+    evaluate_model_release,
+    reconstruct_historical_snapshots,
+    train_player_evidence,
+)
 from quiniela.predictor import Predictor, format_prediction_lines
 from quiniela.public_bundle import export_public_bundle, import_public_bundle, public_bundle_status
 from quiniela.roster_parser import ingest_rosters
+from quiniela.web_lineup_fallback import refresh_web_lineup_fallback
 
 
 app = typer.Typer(no_args_is_help=True)
@@ -75,10 +87,20 @@ def fetch_history_command(
 def fetch_today_command(
     date: str = typer.Option(..., help="Fecha YYYY-MM-DD"),
     lineups_only: bool = typer.Option(False, "--lineups-only"),
+    mode: str = typer.Option(
+        "full",
+        help="Modo: full, hourly, pre_match o lineups.",
+    ),
     dry_run: bool = typer.Option(False),
     force_refresh: bool = typer.Option(False, help="Ignora cache local y consulta API en vivo"),
 ) -> None:
-    result = fetch_today_data(date, lineups_only=lineups_only, dry_run=dry_run, force_refresh=force_refresh)
+    result = fetch_today_data(
+        date,
+        lineups_only=lineups_only,
+        dry_run=dry_run,
+        force_refresh=force_refresh,
+        fetch_mode=mode,
+    )
     console.print(result)
 
 
@@ -223,3 +245,121 @@ def train_player_model_command(
     connection = get_connection(settings.db_path)
     summary = train_player_model(connection, settings.model_artifacts_dir / "poisson_player_v1.pkl", min_matches=min_matches)
     console.print(summary)
+
+
+@app.command("train-outcome-model")
+def train_outcome_model_command(
+    min_matches: int = typer.Option(40, min=20),
+    min_per_class: int = typer.Option(8, min=3),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    summary = train_outcome_model(
+        connection,
+        settings.model_artifacts_dir / "logit_outcome_v1.pkl",
+        min_matches=min_matches,
+        min_per_class=min_per_class,
+    )
+    console.print(summary)
+
+
+@app.command("capture-pre-match-snapshot")
+def capture_pre_match_snapshot_command(
+    match_id: str = typer.Option(...),
+    window: str = typer.Option("manual"),
+    source_kind: str = typer.Option("live"),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    console.print(
+        capture_pre_match_snapshot(
+            match_id,
+            window_label=window,
+            connection=connection,
+            source_kind=source_kind,
+        )
+    )
+
+
+@app.command("build-player-targets")
+def build_player_targets_command(
+    match_id: Optional[list[str]] = typer.Option(None),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    console.print(build_player_targets(connection, match_id or None))
+
+
+@app.command("train-player-evidence")
+def train_player_evidence_command(
+    min_matches: int = typer.Option(30, min=10),
+    min_new_matches: int = typer.Option(5, min=1),
+    reconstruct_history: bool = typer.Option(
+        False,
+        "--reconstruct-history/--no-reconstruct-history",
+    ),
+    auto_promote: bool = typer.Option(
+        True,
+        "--auto-promote/--no-auto-promote",
+    ),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    reconstruction = None
+    if reconstruct_history:
+        reconstruction = reconstruct_historical_snapshots(connection)
+        build_player_targets(connection)
+    summary = train_player_evidence(
+        connection,
+        min_matches=min_matches,
+        min_new_matches=min_new_matches,
+        auto_promote=auto_promote,
+    )
+    console.print({"reconstruction": reconstruction, "training": summary})
+
+
+@app.command("evaluate-model-release")
+def evaluate_model_release_command(
+    release_id: str = typer.Option(...),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    console.print(evaluate_model_release(connection, release_id))
+
+
+@app.command("activate-model-release")
+def activate_model_release_command(
+    release_id: str = typer.Option(...),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    console.print(activate_model_release(connection, release_id))
+
+
+@app.command("run-matchday")
+def run_matchday_command(
+    now: Optional[str] = typer.Option(
+        None,
+        help="Fecha/hora ISO opcional para pruebas reproducibles.",
+    ),
+) -> None:
+    parsed_now = datetime.fromisoformat(now) if now else None
+    console.print(MatchdayRunner().run(parsed_now))
+
+
+@app.command("fetch-web-lineup-fallback")
+def fetch_web_lineup_fallback_command(
+    match_id: str = typer.Option(...),
+    window: str = typer.Option("manual"),
+    force: bool = typer.Option(False),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    console.print(
+        refresh_web_lineup_fallback(
+            match_id,
+            window_label=window,
+            connection=connection,
+            force=force,
+        )
+    )

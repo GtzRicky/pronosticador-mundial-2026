@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from html import escape
 import json
 from pathlib import Path
 import sqlite3
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from quiniela.config import get_settings
 from quiniela.db import fetch_dataframe, get_connection
+from quiniela.name_maps import normalize_team_name
 
 
 POSITION_MAP = {
@@ -74,9 +77,30 @@ def _render_team_lineup(team_name: str, lineup_payload: dict[str, Any] | None) -
     substitutes = extract_lineup_players(lineup_payload, "substitutes")
     formation = lineup_payload.get("formation") or "Pendiente"
     coach = lineup_payload.get("coach", {}).get("name") or "Pendiente"
+    source_kind = lineup_payload.get("_lineup_source") or "official"
+    source_html = ""
+    if source_kind == "web_estimated":
+        confidence = float(lineup_payload.get("_confidence") or 0.0)
+        source_links = []
+        for index, source in enumerate((lineup_payload.get("_sources") or [])[:3], start=1):
+            url = str(source.get("url") or "")
+            if not url.startswith(("http://", "https://")):
+                continue
+            source_links.append(
+                f'<a href="{escape(url, quote=True)}" target="_blank" rel="noreferrer">'
+                f"Fuente {index}</a>"
+            )
+        links_html = " · ".join(source_links) if source_links else "Sin enlaces conservados"
+        source_html = (
+            '<div class="lineup-estimate-note">'
+            f"<strong>Alineación estimada por noticias · confianza {confidence * 100:.0f}%</strong>"
+            f"<span>{links_html}</span>"
+            "</div>"
+        )
     return (
         '<section class="lineup-team">'
         f"<h4>{escape(team_name)}</h4>"
+        f"{source_html}"
         '<div class="lineup-meta">'
         f"<span>Formación: {escape(str(formation))}</span>"
         f"<span>DT: {escape(str(coach))}</span>"
@@ -110,6 +134,22 @@ def _load_lineups_by_fixture(connection: sqlite3.Connection, fixture_ids: list[s
     ).fetchall()
     lineups: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
+        key = (str(row["fixture_id"]), str(row["team_norm"]))
+        if key not in lineups:
+            payload = json.loads(row["source_json"])
+            if len(payload.get("startXI") or []) >= 11:
+                payload["_lineup_source"] = "official"
+                lineups[key] = payload
+    estimate_rows = connection.execute(
+        f"""
+        SELECT fixture_id, team_norm, source_json
+        FROM lineup_estimates
+        WHERE fixture_id IN ({placeholders})
+        ORDER BY id DESC
+        """,
+        fixture_ids,
+    ).fetchall()
+    for row in estimate_rows:
         key = (str(row["fixture_id"]), str(row["team_norm"]))
         if key not in lineups:
             lineups[key] = json.loads(row["source_json"])
@@ -195,7 +235,26 @@ def _load_match_rows(connection: sqlite3.Connection, dates: list[str]) -> list[d
             lp.predicted_score,
             lp.probability,
             lp.model_version,
+            lp.hybrid_predicted_score,
+            lp.hybrid_probability,
+            lp.home_win_probability,
+            lp.draw_probability,
+            lp.away_win_probability,
+            lp.outcome_model_version,
+            lp.data_freshness_at,
             lp.generated_at,
+            (
+                SELECT release_id FROM model_releases
+                WHERE status = 'active'
+                ORDER BY activated_at DESC, id DESC
+                LIMIT 1
+            ) AS evidence_release_id,
+            (
+                SELECT preliminary FROM model_releases
+                WHERE status = 'active'
+                ORDER BY activated_at DESC, id DESC
+                LIMIT 1
+            ) AS evidence_release_preliminary,
             ar.home_goals AS actual_home_goals,
             ar.away_goals AS actual_away_goals
         FROM matches m
@@ -225,18 +284,70 @@ def _match_card_html(
 ) -> str:
     fixture_id = match.get("api_fixture_id")
     fixture_key = str(int(fixture_id)) if fixture_id not in (None, "") and str(fixture_id) != "nan" else None
-    home_lineup = lineups_by_fixture.get((fixture_key, match["home_team_norm"])) if fixture_key else None
-    away_lineup = lineups_by_fixture.get((fixture_key, match["away_team_norm"])) if fixture_key else None
-    home_impacts = impacts_by_match_team.get((str(match["match_id"]), str(match["home_team_norm"])), [])
-    away_impacts = impacts_by_match_team.get((str(match["match_id"]), str(match["away_team_norm"])), [])
+    home_norm = normalize_team_name(str(match["home_team"])) or str(match["home_team_norm"])
+    away_norm = normalize_team_name(str(match["away_team"])) or str(match["away_team_norm"])
+    home_lineup = lineups_by_fixture.get((fixture_key, home_norm)) if fixture_key else None
+    away_lineup = lineups_by_fixture.get((fixture_key, away_norm)) if fixture_key else None
+    home_impacts = impacts_by_match_team.get(
+        (str(match["match_id"]), home_norm),
+        impacts_by_match_team.get(
+            (str(match["match_id"]), str(match["home_team_norm"])),
+            [],
+        ),
+    )
+    away_impacts = impacts_by_match_team.get(
+        (str(match["match_id"]), away_norm),
+        impacts_by_match_team.get(
+            (str(match["match_id"]), str(match["away_team_norm"])),
+            [],
+        ),
+    )
     predicted_score = match.get("predicted_score") or "Pendiente"
+    hybrid_score = match.get("hybrid_predicted_score") or "No disponible"
     actual_score = _score_comparison(match.get("actual_home_goals"), match.get("actual_away_goals"))
     probability = float(match.get("probability") or 0.0)
     probability_text = f"{probability * 100:.1f}%" if probability else "n/d"
+    hybrid_probability = float(match.get("hybrid_probability") or 0.0)
+    hybrid_probability_text = f"{hybrid_probability * 100:.1f}%" if hybrid_probability else "n/d"
+    home_win_probability = float(match.get("home_win_probability") or 0.0)
+    draw_probability = float(match.get("draw_probability") or 0.0)
+    away_win_probability = float(match.get("away_win_probability") or 0.0)
+    outcome_probabilities_available = (
+        home_win_probability + draw_probability + away_win_probability
+    ) > 0.0
+    freshness = match.get("data_freshness_at") or match.get("generated_at") or "n/d"
     fixture_badge = "Fixture API confirmado" if fixture_key else "Fixture API pendiente"
-    lineup_confirmed = home_lineup is not None and away_lineup is not None
-    lineup_badge = "Alineaciones confirmadas" if lineup_confirmed else "Alineaciones pendientes"
-    summary_text = "Ver alineaciones confirmadas" if lineup_confirmed else "Ver estado de alineaciones"
+    lineup_available = home_lineup is not None and away_lineup is not None
+    lineup_estimated = any(
+        lineup and lineup.get("_lineup_source") == "web_estimated"
+        for lineup in (home_lineup, away_lineup)
+    )
+    lineup_confirmed = lineup_available and not lineup_estimated
+    if lineup_confirmed:
+        lineup_badge = "Alineaciones confirmadas"
+        summary_text = "Ver alineaciones confirmadas"
+    elif lineup_estimated:
+        lineup_badge = "Alineación web estimada"
+        summary_text = "Ver alineaciones y fuentes"
+    else:
+        lineup_badge = "Alineaciones pendientes"
+        summary_text = "Ver estado de alineaciones"
+    evidence_release = match.get("evidence_release_id")
+    evidence_label = "v1 fallback"
+    if evidence_release:
+        evidence_label = str(evidence_release)
+        if int(match.get("evidence_release_preliminary") or 0):
+            evidence_label += " (preliminar)"
+    if outcome_probabilities_available:
+        outcome_html = (
+            '<div class="outcome-probabilities">'
+            f'<span><b>1</b>{home_win_probability * 100:.1f}%</span>'
+            f'<span><b>X</b>{draw_probability * 100:.1f}%</span>'
+            f'<span><b>2</b>{away_win_probability * 100:.1f}%</span>'
+            "</div>"
+        )
+    else:
+        outcome_html = '<p class="outcome-empty">Logit pendiente: se conserva el pronóstico Poisson.</p>'
 
     return (
         '<article class="match-card">'
@@ -252,9 +363,14 @@ def _match_card_html(
         "</div>"
         '<div class="score-grid">'
         '<div class="score-box predicted">'
-        "<label>Pronóstico</label>"
+        "<label>Poisson base</label>"
         f"<strong>{escape(str(predicted_score))}</strong>"
         f"<small>Probabilidad: {escape(probability_text)}</small>"
+        "</div>"
+        '<div class="score-box hybrid">'
+        "<label>Híbrido Logit + Poisson</label>"
+        f"<strong>{escape(str(hybrid_score))}</strong>"
+        f"<small>Probabilidad: {escape(hybrid_probability_text)}</small>"
         "</div>"
         '<div class="score-box actual">'
         "<label>Resultado real</label>"
@@ -262,6 +378,7 @@ def _match_card_html(
         '<small>Se actualiza al cargar `actual_results`.</small>'
         "</div>"
         "</div>"
+        f"{outcome_html}"
         '<div class="impact-grid">'
         '<section class="impact-team">'
         f"<h4>{escape(str(match['home_team']))}</h4>"
@@ -281,6 +398,9 @@ def _match_card_html(
         "</details>"
         '<div class="match-footer">'
         f"<span>Modelo: {escape(str(match.get('model_version') or 'n/d'))}</span>"
+        f"<span>Logit: {escape(str(match.get('outcome_model_version') or 'n/d'))}</span>"
+        f"<span>Evidencia: {escape(evidence_label)}</span>"
+        f"<span>Datos: {escape(str(freshness))}</span>"
         f"<span>Generado: {escape(str(match.get('generated_at') or 'n/d'))}</span>"
         "</div>"
         "</article>"
@@ -408,7 +528,7 @@ def render_predictions_html(
     }}
     .score-grid {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 14px;
       margin: 18px 0 14px;
     }}
@@ -423,6 +543,9 @@ def render_predictions_html(
     }}
     .score-box.actual {{
       background: linear-gradient(135deg, rgba(31,106,82,0.12), rgba(255,255,255,0.82));
+    }}
+    .score-box.hybrid {{
+      background: linear-gradient(135deg, rgba(20,87,122,0.14), rgba(255,255,255,0.82));
     }}
     .score-box label {{
       display: block;
@@ -440,6 +563,30 @@ def render_predictions_html(
     .score-box small {{
       display: block;
       margin-top: 6px;
+      color: var(--muted);
+    }}
+    .outcome-probabilities {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin: 0 0 14px;
+    }}
+    .outcome-probabilities span {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 11px 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.66);
+      color: var(--muted);
+    }}
+    .outcome-probabilities b {{
+      color: var(--ink);
+      font-size: 1.05rem;
+    }}
+    .outcome-empty {{
+      margin: 0 0 14px;
       color: var(--muted);
     }}
     .lineup-accordion {{
@@ -539,6 +686,24 @@ def render_predictions_html(
       color: var(--muted);
       font-size: 0.9rem;
     }}
+    .lineup-estimate-note {{
+      display: grid;
+      gap: 6px;
+      margin-bottom: 12px;
+      padding: 11px 12px;
+      border-radius: 12px;
+      background: rgba(182,70,42,0.10);
+      border: 1px solid rgba(182,70,42,0.20);
+      color: var(--muted);
+      font-size: 0.86rem;
+    }}
+    .lineup-estimate-note strong {{
+      color: var(--accent);
+    }}
+    .lineup-estimate-note a {{
+      color: var(--success);
+      font-weight: 700;
+    }}
     .player-list {{
       list-style: none;
       margin: 0;
@@ -583,7 +748,7 @@ def render_predictions_html(
       justify-content: flex-start;
     }}
     @media (max-width: 820px) {{
-      .score-grid, .lineup-grid, .impact-grid {{
+      .score-grid, .lineup-grid, .impact-grid, .outcome-probabilities {{
         grid-template-columns: 1fr;
       }}
       .page {{
@@ -601,7 +766,7 @@ def render_predictions_html(
       <h1>Predicciones Mundial 2026</h1>
       <p>
         Reporte estático para comparar el marcador pronosticado contra el resultado real de cada partido.
-        Incluye horario en Ciudad de México, estadio y el estado más reciente de las alineaciones confirmadas.
+        Incluye horario en Ciudad de México, estadio y el estado más reciente de las alineaciones oficiales o estimadas.
       </p>
       <div class="hero-stats">
         <span>Fechas: {escape(date_label)}</span>
@@ -634,4 +799,10 @@ def build_predictions_html_report(dates: list[str], output_path: Path | None = N
         date_label = dates[0] if len(dates) == 1 else f"{dates[0]}_a_{dates[-1]}"
         output_path = settings.predictions_dir / f"predicciones_{date_label}.html"
     output_path.write_text(html, encoding="utf-8")
+    today = datetime.now(ZoneInfo(settings.local_timezone)).date().isoformat()
+    if (
+        output_path.parent.resolve() == settings.predictions_dir.resolve()
+        and today in dates
+    ):
+        (settings.predictions_dir / "index.html").write_text(html, encoding="utf-8")
     return output_path

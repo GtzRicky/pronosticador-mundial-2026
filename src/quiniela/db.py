@@ -116,6 +116,22 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS lineup_estimates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id TEXT NOT NULL,
+        match_id TEXT NOT NULL,
+        team_norm TEXT NOT NULL,
+        window_label TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        query_json TEXT NOT NULL,
+        sources_json TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        generated_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(fixture_id, team_norm, window_label)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS historical_team_stats (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fixture_id TEXT NOT NULL,
@@ -242,6 +258,13 @@ SCHEMA_STATEMENTS = [
         predicted_score TEXT NOT NULL,
         probability REAL NOT NULL,
         model_version TEXT NOT NULL,
+        hybrid_predicted_score TEXT,
+        hybrid_probability REAL,
+        home_win_probability REAL,
+        draw_probability REAL,
+        away_win_probability REAL,
+        outcome_model_version TEXT,
+        data_freshness_at TEXT,
         source_json TEXT,
         generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -270,6 +293,151 @@ SCHEMA_STATEMENTS = [
         net_impact REAL NOT NULL DEFAULT 0,
         source_json TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS automation_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_key TEXT NOT NULL UNIQUE,
+        action TEXT NOT NULL,
+        match_id TEXT,
+        scheduled_for TEXT NOT NULL,
+        status TEXT NOT NULL,
+        details_json TEXT,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pre_match_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id TEXT NOT NULL,
+        fixture_id TEXT,
+        window_label TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        kickoff_at TEXT NOT NULL,
+        captured_at TEXT NOT NULL,
+        features_json TEXT NOT NULL,
+        prediction_json TEXT NOT NULL,
+        home_lineup_source TEXT,
+        away_lineup_source TEXT,
+        model_version TEXT,
+        outcome_model_version TEXT,
+        data_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(match_id, window_label, source_kind)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pre_match_player_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id INTEGER NOT NULL,
+        team_norm TEXT NOT NULL,
+        api_player_id INTEGER,
+        player_name TEXT NOT NULL,
+        player_norm TEXT,
+        lineup_role TEXT NOT NULL,
+        role_bucket TEXT NOT NULL,
+        attack_impact REAL NOT NULL DEFAULT 0,
+        defense_impact REAL NOT NULL DEFAULT 0,
+        discipline_impact REAL NOT NULL DEFAULT 0,
+        availability_impact REAL NOT NULL DEFAULT 0,
+        net_impact REAL NOT NULL DEFAULT 0,
+        features_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(snapshot_id, team_norm, player_name),
+        FOREIGN KEY(snapshot_id) REFERENCES pre_match_snapshots(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS player_match_targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id TEXT NOT NULL,
+        fixture_id TEXT NOT NULL,
+        snapshot_id INTEGER NOT NULL,
+        team_norm TEXT NOT NULL,
+        api_player_id INTEGER,
+        player_name TEXT NOT NULL,
+        player_norm TEXT,
+        participated INTEGER NOT NULL,
+        minutes REAL NOT NULL DEFAULT 0,
+        rating REAL,
+        shots_total REAL NOT NULL DEFAULT 0,
+        shots_on REAL NOT NULL DEFAULT 0,
+        goals_total REAL NOT NULL DEFAULT 0,
+        goals_assists REAL NOT NULL DEFAULT 0,
+        dribbles_attempts REAL NOT NULL DEFAULT 0,
+        dribbles_success REAL NOT NULL DEFAULT 0,
+        passes_total REAL NOT NULL DEFAULT 0,
+        passes_key REAL NOT NULL DEFAULT 0,
+        passes_accuracy REAL,
+        tackles_total REAL NOT NULL DEFAULT 0,
+        tackles_blocks REAL NOT NULL DEFAULT 0,
+        tackles_interceptions REAL NOT NULL DEFAULT 0,
+        duels_total REAL NOT NULL DEFAULT 0,
+        duels_won REAL NOT NULL DEFAULT 0,
+        goals_saves REAL NOT NULL DEFAULT 0,
+        goals_conceded REAL NOT NULL DEFAULT 0,
+        fouls_committed REAL NOT NULL DEFAULT 0,
+        cards_yellow REAL NOT NULL DEFAULT 0,
+        cards_red REAL NOT NULL DEFAULT 0,
+        penalty_won REAL NOT NULL DEFAULT 0,
+        penalty_commited REAL NOT NULL DEFAULT 0,
+        penalty_scored REAL NOT NULL DEFAULT 0,
+        penalty_missed REAL NOT NULL DEFAULT 0,
+        penalty_saved REAL NOT NULL DEFAULT 0,
+        target_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(snapshot_id, team_norm, player_name),
+        FOREIGN KEY(snapshot_id) REFERENCES pre_match_snapshots(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS player_evidence_evaluations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        release_id TEXT NOT NULL,
+        snapshot_id INTEGER NOT NULL,
+        match_id TEXT NOT NULL,
+        team_norm TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        metrics_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(release_id, snapshot_id, team_norm, player_name)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_training_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset_hash TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        cutoff_at TEXT NOT NULL,
+        match_count INTEGER NOT NULL DEFAULT 0,
+        new_match_count INTEGER NOT NULL DEFAULT 0,
+        source_counts_json TEXT,
+        metrics_json TEXT,
+        release_id TEXT,
+        reason TEXT,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_releases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        release_id TEXT NOT NULL UNIQUE,
+        release_path TEXT NOT NULL,
+        status TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        dataset_hash TEXT NOT NULL,
+        cutoff_at TEXT NOT NULL,
+        training_matches INTEGER NOT NULL,
+        live_matches INTEGER NOT NULL DEFAULT 0,
+        metrics_json TEXT NOT NULL,
+        preliminary INTEGER NOT NULL DEFAULT 1,
+        previous_release_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        activated_at TEXT
     )
     """,
 ]
@@ -315,6 +483,18 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
     }
     for column_name, column_def in player_columns.items():
         _ensure_column(connection, "players", column_name, column_def)
+
+    prediction_columns = {
+        "hybrid_predicted_score": "hybrid_predicted_score TEXT",
+        "hybrid_probability": "hybrid_probability REAL",
+        "home_win_probability": "home_win_probability REAL",
+        "draw_probability": "draw_probability REAL",
+        "away_win_probability": "away_win_probability REAL",
+        "outcome_model_version": "outcome_model_version TEXT",
+        "data_freshness_at": "data_freshness_at TEXT",
+    }
+    for column_name, column_def in prediction_columns.items():
+        _ensure_column(connection, "predictions", column_name, column_def)
 
 
 def _executemany(connection: sqlite3.Connection, query: str, rows: Iterable[tuple[Any, ...]]) -> None:
@@ -719,6 +899,42 @@ def store_json_row(
             )
 
 
+def insert_lineup_estimate(
+    connection: sqlite3.Connection,
+    *,
+    fixture_id: str,
+    match_id: str,
+    team_norm: str,
+    window_label: str,
+    confidence: float,
+    queries: list[str],
+    sources: list[dict[str, Any]],
+    payload: dict[str, Any],
+    generated_at: str,
+) -> bool:
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO lineup_estimates (
+                fixture_id, match_id, team_norm, window_label, confidence,
+                query_json, sources_json, source_json, generated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fixture_id,
+                match_id,
+                team_norm,
+                window_label,
+                confidence,
+                json.dumps(queries, ensure_ascii=False),
+                json.dumps(sources, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
+                generated_at,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
 def upsert_fixture_player_stats(
     connection: sqlite3.Connection,
     fixture_id: str,
@@ -996,6 +1212,13 @@ def insert_prediction_rows(connection: sqlite3.Connection, predictions_df: pd.Da
             row.get("predicted_score"),
             float(row.get("probability", 0.0)),
             row.get("model_version"),
+            row.get("hybrid_predicted_score"),
+            float(row.get("hybrid_probability", 0.0)) if row.get("hybrid_probability") is not None else None,
+            float(row.get("home_win_probability", 0.0)) if row.get("home_win_probability") is not None else None,
+            float(row.get("draw_probability", 0.0)) if row.get("draw_probability") is not None else None,
+            float(row.get("away_win_probability", 0.0)) if row.get("away_win_probability") is not None else None,
+            row.get("outcome_model_version"),
+            row.get("data_freshness_at"),
             json.dumps(row, ensure_ascii=False),
         )
         for row in predictions_df.to_dict(orient="records")
@@ -1005,12 +1228,279 @@ def insert_prediction_rows(connection: sqlite3.Connection, predictions_df: pd.Da
         """
         INSERT INTO predictions (
             match_id, datetime_cdmx, group_name, home_team, away_team,
-            predicted_score, probability, model_version, source_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            predicted_score, probability, model_version,
+            hybrid_predicted_score, hybrid_probability,
+            home_win_probability, draw_probability, away_win_probability,
+            outcome_model_version, data_freshness_at, source_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     return len(rows)
+
+
+def claim_automation_run(
+    connection: sqlite3.Connection,
+    run_key: str,
+    action: str,
+    scheduled_for: str,
+    match_id: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> bool:
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO automation_runs (
+                    run_key, action, match_id, scheduled_for, status, details_json
+                ) VALUES (?, ?, ?, ?, 'running', ?)
+                """,
+                (
+                    run_key,
+                    action,
+                    match_id,
+                    scheduled_for,
+                    json.dumps(details or {}, ensure_ascii=False),
+                ),
+            )
+    except sqlite3.IntegrityError:
+        return False
+    return True
+
+
+def finish_automation_run(
+    connection: sqlite3.Connection,
+    run_key: str,
+    status: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    with connection:
+        connection.execute(
+            """
+            UPDATE automation_runs
+            SET status = ?,
+                details_json = ?,
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE run_key = ?
+            """,
+            (
+                status,
+                json.dumps(details or {}, ensure_ascii=False),
+                run_key,
+            ),
+        )
+
+
+def insert_pre_match_snapshot(
+    connection: sqlite3.Connection,
+    snapshot: dict[str, Any],
+    player_rows: list[dict[str, Any]],
+) -> tuple[int, bool]:
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO pre_match_snapshots (
+                match_id, fixture_id, window_label, source_kind,
+                kickoff_at, captured_at, features_json, prediction_json,
+                home_lineup_source, away_lineup_source,
+                model_version, outcome_model_version, data_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot["match_id"],
+                snapshot.get("fixture_id"),
+                snapshot["window_label"],
+                snapshot["source_kind"],
+                snapshot["kickoff_at"],
+                snapshot["captured_at"],
+                snapshot["features_json"],
+                snapshot["prediction_json"],
+                snapshot.get("home_lineup_source"),
+                snapshot.get("away_lineup_source"),
+                snapshot.get("model_version"),
+                snapshot.get("outcome_model_version"),
+                snapshot["data_hash"],
+            ),
+        )
+        created = cursor.rowcount == 1
+        row = connection.execute(
+            """
+            SELECT id FROM pre_match_snapshots
+            WHERE match_id = ? AND window_label = ? AND source_kind = ?
+            """,
+            (
+                snapshot["match_id"],
+                snapshot["window_label"],
+                snapshot["source_kind"],
+            ),
+        ).fetchone()
+        snapshot_id = int(row["id"])
+        if created:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO pre_match_player_snapshots (
+                    snapshot_id, team_norm, api_player_id, player_name, player_norm,
+                    lineup_role, role_bucket, attack_impact, defense_impact,
+                    discipline_impact, availability_impact, net_impact, features_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        snapshot_id,
+                        player["team_norm"],
+                        player.get("api_player_id"),
+                        player["player_name"],
+                        player.get("player_norm"),
+                        player.get("lineup_role", "unknown"),
+                        player.get("role_bucket", "unknown"),
+                        float(player.get("attack_impact", 0.0)),
+                        float(player.get("defense_impact", 0.0)),
+                        float(player.get("discipline_impact", 0.0)),
+                        float(player.get("availability_impact", 0.0)),
+                        float(player.get("net_impact", 0.0)),
+                        json.dumps(player, ensure_ascii=False, default=str),
+                    )
+                    for player in player_rows
+                ],
+            )
+    return snapshot_id, created
+
+
+def get_latest_pre_match_snapshot(
+    connection: sqlite3.Connection,
+    match_id: str,
+    before_kickoff: str | None = None,
+) -> sqlite3.Row | None:
+    query = "SELECT * FROM pre_match_snapshots WHERE match_id = ?"
+    params: list[Any] = [match_id]
+    if before_kickoff:
+        query += " AND captured_at < ?"
+        params.append(before_kickoff)
+    query += " ORDER BY captured_at DESC, id DESC LIMIT 1"
+    return connection.execute(query, params).fetchone()
+
+
+def insert_player_targets(
+    connection: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> int:
+    if not rows:
+        return 0
+    columns = [
+        "match_id", "fixture_id", "snapshot_id", "team_norm", "api_player_id",
+        "player_name", "player_norm", "participated", "minutes", "rating",
+        "shots_total", "shots_on", "goals_total", "goals_assists",
+        "dribbles_attempts", "dribbles_success", "passes_total", "passes_key",
+        "passes_accuracy", "tackles_total", "tackles_blocks",
+        "tackles_interceptions", "duels_total", "duels_won", "goals_saves",
+        "goals_conceded", "fouls_committed", "cards_yellow", "cards_red",
+        "penalty_won", "penalty_commited", "penalty_scored", "penalty_missed",
+        "penalty_saved", "target_json",
+    ]
+    placeholders = ",".join("?" for _ in columns)
+    before = connection.total_changes
+    with connection:
+        connection.executemany(
+            f"""
+            INSERT OR IGNORE INTO player_match_targets ({",".join(columns)})
+            VALUES ({placeholders})
+            """,
+            [
+                tuple(
+                    json.dumps(
+                        {
+                            key: value
+                            for key, value in row.items()
+                            if key != "target_json"
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    if column == "target_json"
+                    else row.get(column)
+                    for column in columns
+                )
+                for row in rows
+            ],
+        )
+    return connection.total_changes - before
+
+
+def register_model_release(
+    connection: sqlite3.Connection,
+    release: dict[str, Any],
+) -> None:
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO model_releases (
+                release_id, release_path, status, model_version, dataset_hash,
+                cutoff_at, training_matches, live_matches, metrics_json, preliminary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(release_id) DO UPDATE SET
+                release_path = excluded.release_path,
+                status = excluded.status,
+                metrics_json = excluded.metrics_json,
+                preliminary = excluded.preliminary
+            """,
+            (
+                release["release_id"],
+                release["release_path"],
+                release.get("status", "candidate"),
+                release["model_version"],
+                release["dataset_hash"],
+                release["cutoff_at"],
+                int(release["training_matches"]),
+                int(release.get("live_matches", 0)),
+                json.dumps(release.get("metrics", {}), ensure_ascii=False, default=str),
+                int(bool(release.get("preliminary", True))),
+            ),
+        )
+
+
+def activate_model_release(connection: sqlite3.Connection, release_id: str) -> bool:
+    candidate = connection.execute(
+        "SELECT release_id FROM model_releases WHERE release_id = ?",
+        (release_id,),
+    ).fetchone()
+    if candidate is None:
+        return False
+    with connection:
+        active = connection.execute(
+            "SELECT release_id FROM model_releases WHERE status = 'active' LIMIT 1"
+        ).fetchone()
+        previous_id = str(active["release_id"]) if active else None
+        connection.execute(
+            """
+            UPDATE model_releases
+            SET status = 'archived'
+            WHERE status = 'active' AND release_id <> ?
+            """,
+            (release_id,),
+        )
+        connection.execute(
+            """
+            UPDATE model_releases
+            SET status = 'active',
+                previous_release_id = ?,
+                activated_at = CURRENT_TIMESTAMP
+            WHERE release_id = ?
+            """,
+            (previous_id, release_id),
+        )
+    return True
+
+
+def get_active_model_release(connection: sqlite3.Connection) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT * FROM model_releases
+        WHERE status = 'active'
+        ORDER BY activated_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
 
 
 def fetch_dataframe(connection: sqlite3.Connection, query: str, params: Iterable[Any] | None = None) -> pd.DataFrame:

@@ -37,6 +37,13 @@ def test_render_predictions_html_shows_predicted_and_pending_actual() -> None:
             "predicted_score": "1-0",
             "probability": 0.21,
             "model_version": "poisson_v1",
+            "hybrid_predicted_score": "2-0",
+            "hybrid_probability": 0.18,
+            "home_win_probability": 0.62,
+            "draw_probability": 0.23,
+            "away_win_probability": 0.15,
+            "outcome_model_version": "logit_outcome_v1",
+            "data_freshness_at": "2026-06-11T12:59:00-06:00",
             "generated_at": "2026-06-11T10:00:00",
             "actual_home_goals": None,
             "actual_away_goals": None,
@@ -71,7 +78,57 @@ def test_render_predictions_html_shows_predicted_and_pending_actual() -> None:
     assert "México" in html
     assert "Estadio Azteca" in html
     assert "1-0" in html
+    assert "2-0" in html
+    assert "Poisson base" in html
+    assert "Híbrido Logit + Poisson" in html
+    assert "62.0%" in html
+    assert "logit_outcome_v1" in html
     assert "Pendiente" in html
     assert "Jugador 1" in html
     assert "Player 12" in html
     assert "Top impactos" in html
+
+
+def test_render_predictions_html_labels_web_estimated_lineup() -> None:
+    match_rows = [
+        {
+            "match_id": "match-estimated",
+            "date_cdmx": "2026-06-13",
+            "time_cdmx": "13:00",
+            "datetime_cdmx": "2026-06-13T13:00:00-06:00",
+            "home_team": "Catar",
+            "away_team": "Suiza",
+            "home_team_norm": "qatar",
+            "away_team_norm": "suiza",
+            "group_name": "B",
+            "stadium": "Estadio",
+            "stage": "group",
+            "status": "NS",
+            "api_fixture_id": 1489373,
+            "predicted_score": "0-2",
+            "probability": 0.2,
+            "generated_at": "2026-06-13T12:30:00-06:00",
+            "actual_home_goals": None,
+            "actual_away_goals": None,
+        }
+    ]
+    starter = {"player": {"name": "Jugador", "number": None, "pos": "M"}}
+    lineups = {
+        ("1489373", "qatar"): {
+            "_lineup_source": "official",
+            "startXI": [starter] * 11,
+        },
+        ("1489373", "switzerland"): {
+            "_lineup_source": "web_estimated",
+            "_confidence": 0.64,
+            "_sources": [{"url": "https://example.com/lineup"}],
+            "formation": "Estimada",
+            "startXI": [starter] * 11,
+        },
+    }
+
+    html = render_predictions_html(match_rows, lineups, {})
+
+    assert "Alineación web estimada" in html
+    assert "confianza 64%" in html
+    assert 'href="https://example.com/lineup"' in html

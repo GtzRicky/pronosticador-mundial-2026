@@ -27,8 +27,14 @@ class Settings:
     api_football_key: str
     api_football_host: str
     api_daily_limit: int
+    api_critical_reserve: int
     db_path: Path
     local_timezone: str
+    web_lineup_fallback_enabled: bool
+    web_lineup_fallback_minutes: int
+    web_lineup_max_articles: int
+    web_lineup_timeout_seconds: float
+    web_lineup_min_direct_players: int
 
     def ensure_directories(self) -> None:
         for path in (
@@ -79,8 +85,22 @@ def get_settings() -> Settings:
         api_football_key=os.getenv("API_FOOTBALL_KEY", "").strip(),
         api_football_host=os.getenv("API_FOOTBALL_HOST", "v3.football.api-sports.io").strip(),
         api_daily_limit=int(os.getenv("API_DAILY_LIMIT", "100")),
+        api_critical_reserve=int(os.getenv("API_CRITICAL_RESERVE", "25")),
         db_path=db_path,
         local_timezone=os.getenv("LOCAL_TIMEZONE", "America/Mexico_City").strip(),
+        web_lineup_fallback_enabled=os.getenv(
+            "WEB_LINEUP_FALLBACK_ENABLED", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"},
+        web_lineup_fallback_minutes=int(
+            os.getenv("WEB_LINEUP_FALLBACK_MINUTES", "30")
+        ),
+        web_lineup_max_articles=int(os.getenv("WEB_LINEUP_MAX_ARTICLES", "6")),
+        web_lineup_timeout_seconds=float(
+            os.getenv("WEB_LINEUP_TIMEOUT_SECONDS", "8")
+        ),
+        web_lineup_min_direct_players=int(
+            os.getenv("WEB_LINEUP_MIN_DIRECT_PLAYERS", "4")
+        ),
     )
     settings.ensure_directories()
     return settings

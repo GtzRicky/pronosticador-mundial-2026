@@ -238,14 +238,21 @@ Variables de entorno:
 - `API_FOOTBALL_KEY`
 - `API_FOOTBALL_HOST`
 - `API_DAILY_LIMIT`
+- `API_CRITICAL_RESERVE`
 - `DB_PATH`
 - `LOCAL_TIMEZONE`
+- `WEB_LINEUP_FALLBACK_ENABLED`
+- `WEB_LINEUP_FALLBACK_MINUTES`
+- `WEB_LINEUP_MAX_ARTICLES`
+- `WEB_LINEUP_TIMEOUT_SECONDS`
+- `WEB_LINEUP_MIN_DIRECT_PLAYERS`
 
 Valores sugeridos:
 
 ```env
 API_FOOTBALL_HOST=v3.football.api-sports.io
 API_DAILY_LIMIT=7500
+API_CRITICAL_RESERVE=25
 DB_PATH=data/db/quiniela.db
 LOCAL_TIMEZONE=America/Mexico_City
 ```
@@ -279,6 +286,45 @@ python scripts/05_fetch_today_data.py --date 2026-06-11 --lineups-only
 python scripts/13_train_player_model.py --min-matches 20
 ```
 
+### 4.1 Entrenar el modelo Logit de resultado
+
+```bash
+python scripts/14_train_outcome_model.py --min-matches 40 --min-per-class 8
+```
+
+El artefacto `logit_outcome_v1.pkl` estima probabilidades de victoria local,
+empate y victoria visitante. Esas probabilidades recalibran la matriz de
+marcadores Poisson, pero el reporte conserva ambos pronósticos para permitir
+comparación. Con muestras menores a `120` partidos el modelo se marca como
+preliminar.
+
+### 4.2 Evidencia individual v2
+
+Las ventanas `T-60`, `T-30`, `T-15`, `T-5` y `T-1` guardan snapshots
+inmutables de features, probabilidades, alineaciones e impactos por jugador.
+Al finalizar el partido, el pipeline vincula esas inferencias con las
+estadísticas reales y comprueba si existen cinco partidos completos nuevos.
+
+```bash
+python scripts/16_capture_pre_match_snapshot.py --match-id MATCH_ID --window t-1
+python scripts/17_build_player_targets.py --match-id MATCH_ID
+python scripts/18_train_player_evidence.py --reconstruct-history
+python scripts/19_evaluate_model_release.py --release-id RELEASE_ID
+python scripts/20_activate_model_release.py --release-id RELEASE_ID
+```
+
+Un partido es elegible cuando tiene resultado, snapshot anterior al kickoff,
+alineaciones de ambos equipos y al menos once participantes con estadísticas
+finales por equipo. El entrenamiento requiere 30 partidos elegibles y cinco
+nuevos desde el último intento completado.
+
+Cada release conserva modelos, metadata, hash del dataset y reporte en
+`data/processed/model_artifacts/releases/<release_id>/`. Sólo se activa cuando
+el candidato con jugadores no empeora MAE, devianza, log-loss, Brier ni
+calibración frente al baseline sin jugadores, y además mejora al menos 2% la
+devianza de goles o el log-loss. Si no supera el gate, los artefactos v1
+continúan activos.
+
 ### 5. Generar predicciones
 
 ```bash
@@ -299,6 +345,97 @@ python scripts/12_render_html_report.py --date 2026-06-11
 python scripts/12_render_html_report.py --date 2026-06-11 --date 2026-06-12 --date 2026-06-13
 ```
 
+El reporte diario también actualiza `outputs/predictions/index.html` y muestra
+el marcador Poisson, el marcador híbrido, probabilidades `1-X-2`, fuente de
+alineación y frescura de datos.
+
+### 8. Automatizar la jornada en Windows
+
+```powershell
+# Revisar sin instalar
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1 -DryRun
+
+# Instalar
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1
+
+# Eliminar
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall_matchday_task.ps1
+```
+
+La tarea despierta cada minuto, pero sólo ejecuta acciones vencidas y las
+reclama de forma idempotente en `automation_runs`: actualización diaria,
+revisión horaria, ventanas `T-60/T-30/T-15/T-5/T-1` y sondeo postpartido cada
+15 minutos desde `T+105`. La descarga completa de eventos y estadísticas se
+realiza al detectar el resultado final.
+
+```bash
+python scripts/15_run_matchday.py --now 2026-06-13T12:59:00-06:00
+```
+
+### Fallback web de alineaciones
+
+Si API-Football no entrega once titulares completos, desde `T-30` las
+ventanas prepartido consultan noticias recientes mediante RSS, buscan
+coincidencias contra la convocatoria local y completan los huecos con el
+ultimo once y el uso historico de los jugadores.
+
+- La alineacion oficial siempre tiene prioridad.
+- La estimacion se guarda aparte en `lineup_estimates`, con confianza,
+  consultas, enlaces y ventana de captura.
+- El HTML la etiqueta como estimada y muestra sus fuentes.
+- Los entrenamientos que exigen alineaciones confirmadas no usan estas filas.
+- El proceso es determinista y local; no llama modelos de IA en produccion.
+- Estas consultas web no consumen la cuota diaria de API-Football.
+
+Ejecucion manual:
+
+```bash
+python scripts/21_fetch_web_lineup_fallback.py --match-id MATCH_ID --force
+```
+
+Configuracion disponible en `.env`:
+
+```dotenv
+WEB_LINEUP_FALLBACK_ENABLED=true
+WEB_LINEUP_FALLBACK_MINUTES=30
+WEB_LINEUP_MAX_ARTICLES=6
+WEB_LINEUP_TIMEOUT_SECONDS=8
+WEB_LINEUP_MIN_DIRECT_PLAYERS=4
+```
+
+### Como funcionan Google News y Bing RSS en este proyecto
+
+No usamos una API paga de noticias ni scraping abierto del buscador completo.
+El flujo es acotado y auditable:
+
+1. Construimos consultas como `Qatar Switzerland predicted lineup 2026-06-13`.
+2. Consultamos el RSS de Google News y el RSS de Bing News.
+3. Tomamos pocos articulos recientes y deduplicamos por URL.
+4. Descargamos el HTML de cada articulo y extraemos texto visible.
+5. Buscamos nombres de jugadores junto con frases como `predicted lineup`,
+   `starting XI`, `team news` u `once inicial`.
+6. Armamos un once estimado con esos nombres y completamos huecos con el ultimo
+   once conocido y con los jugadores de mayor uso historico.
+7. Guardamos el resultado en `lineup_estimates` con confianza, enlaces,
+   consulta usada y ventana de captura.
+
+Este fallback no reemplaza a la alineacion oficial. Solo evita que nos
+quedemos sin senal util cuando la API publica tarde los titulares.
+
+### Relacion con Task Scheduler y la corrida horaria
+
+No hace falta agregar una tarea nueva ni ejecutar RSS en cada corrida horaria.
+
+- La corrida horaria sigue enfocada en fixtures, estados, odds y refresh general.
+- El fallback web corre solo en ventanas prepartido tardias: `T-30`, `T-15`,
+  `T-5` y `T-1`.
+- Si la PC despierta tarde, `run-matchday` ejecuta solo la ventana pendiente
+  mas cercana al kickoff para no repetir la misma busqueda varias veces.
+- Si la API ya tiene 11 titulares oficiales, no se consulta RSS.
+
+Con la tarea por minuto que ya instalamos, esto ya queda cubierto dentro del
+pipeline actual.
+
 ## Archivos de salida
 
 El proyecto genera principalmente:
@@ -317,6 +454,7 @@ El HTML muestra:
 - marcador pronosticado
 - resultado real
 - alineaciones confirmadas o inferidas
+- alineaciones oficiales o estimadas con fuentes cuando aplica
 - top impactos por jugador/equipo
 
 ## Cómo usarlo con agentes de IA
@@ -368,6 +506,7 @@ Tablas principales:
 - `matches`
 - `historical_matches`
 - `historical_lineups`
+- `lineup_estimates`
 - `historical_team_stats`
 - `historical_player_stats`
 - `fixture_player_stats`
@@ -404,6 +543,18 @@ Antes de publicar una base enriquecida o artefactos derivados, revisa:
 
 - https://www.api-football.com/pricing
 - https://www.api-football.com/terms
+
+## Publicacion segura del repo
+
+Antes de subir cambios a un repositorio externo:
+
+- no subas `.env`, API keys, tokens ni credenciales locales
+- no subas `data/db/*.db`, `api_cache`, `api_usage` ni dumps operativos
+- no subas outputs diarios ni bundles redistribuibles sin revisar antes licencia
+  y acuerdo de servicio
+- revisa `git status --short` y confirma que solo viajan codigo, tests y docs
+- si compartes una base portable, usa el flujo de `public bundle` y valida otra
+  vez la politica de redistribucion
 
 ## Pruebas
 

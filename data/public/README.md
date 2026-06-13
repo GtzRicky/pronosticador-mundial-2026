@@ -23,4 +23,14 @@ El bundle exportado:
 - elimina `api_usage`
 - no incluye ninguna API key
 
+- puede incluir predicciones, alineaciones oficiales y alineaciones estimadas
+  guardadas en `lineup_estimates`
+
+Antes de compartir un bundle:
+
+- confirma que no expones secretos locales
+- confirma que no incluyes telemetria de uso
+- revisa si la redistribucion de datos derivados o enriquecidos cumple el
+  acuerdo aplicable de API-Football y cualquier licencia adicional de origen
+
 Por defecto, los bundles se generan en `outputs/bundles/` y no se versionan.

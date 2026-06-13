@@ -404,6 +404,7 @@ def infer_team_sheet(
     team_norm: str,
     as_of_datetime: str | None,
     fixture_id: Any = None,
+    allow_season_stats: bool = True,
 ) -> dict[str, Any]:
     lineup_payload: dict[str, Any] | None = None
     source = "season_stats"
@@ -420,8 +421,28 @@ def infer_team_sheet(
             (str(int(fixture_id)), team_norm),
         )
         if not df.empty:
-            lineup_payload = json.loads(df.iloc[0]["source_json"])
-            source = "confirmed_lineup"
+            official_payload = json.loads(df.iloc[0]["source_json"])
+            if len(official_payload.get("startXI") or []) >= 11:
+                lineup_payload = official_payload
+                source = "confirmed_lineup"
+
+        if lineup_payload is None:
+            estimate_df = fetch_dataframe(
+                connection,
+                """
+                SELECT source_json
+                FROM lineup_estimates
+                WHERE fixture_id = ? AND team_norm = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(int(fixture_id)), team_norm),
+            )
+            if not estimate_df.empty:
+                estimated_payload = json.loads(estimate_df.iloc[0]["source_json"])
+                if len(estimated_payload.get("startXI") or []) >= 11:
+                    lineup_payload = estimated_payload
+                    source = "web_estimated_lineup"
 
     if lineup_payload is None:
         lineup_payload = _latest_prior_lineup(connection, team_norm, as_of_datetime)
@@ -433,6 +454,13 @@ def infer_team_sheet(
             "source": source,
             "starters": [_player_ref_from_lineup_entry(row) for row in lineup_payload.get("startXI") or []],
             "bench": [_player_ref_from_lineup_entry(row) for row in lineup_payload.get("substitutes") or []],
+        }
+
+    if not allow_season_stats:
+        return {
+            "source": "historical_no_future_fallback",
+            "starters": [],
+            "bench": [],
         }
 
     season_year = _latest_season_year(as_of_datetime)
@@ -534,11 +562,22 @@ def _compute_player_snapshot(
     player_ref: dict[str, Any],
     as_of_datetime: str | None,
     role_weight: float,
+    allow_season_stats: bool = True,
 ) -> dict[str, Any]:
     api_player_id = player_ref.get("api_player_id")
     player_norm = player_ref.get("player_norm") or normalize_text(str(player_ref.get("player_name") or ""))
     recent_df = _load_player_recent_stats(connection, team_norm, api_player_id, player_norm, as_of_datetime)
-    season_df = _load_player_season_snapshot(connection, team_norm, api_player_id, player_norm, as_of_datetime)
+    season_df = (
+        _load_player_season_snapshot(
+            connection,
+            team_norm,
+            api_player_id,
+            player_norm,
+            as_of_datetime,
+        )
+        if allow_season_stats
+        else pd.DataFrame()
+    )
     position_group = _position_group(player_ref.get("position"))
     if position_group == "unknown" and not season_df.empty:
         position_group = _position_group(str(season_df.iloc[0].get("position")))
@@ -647,15 +686,42 @@ def aggregate_team_player_features(
     team_name: str,
     as_of_datetime: str | None = None,
     fixture_id: Any = None,
+    allow_season_stats: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    sheet = infer_team_sheet(connection, team_norm, as_of_datetime, fixture_id=fixture_id)
+    sheet = infer_team_sheet(
+        connection,
+        team_norm,
+        as_of_datetime,
+        fixture_id=fixture_id,
+        allow_season_stats=allow_season_stats,
+    )
     impacts: list[dict[str, Any]] = []
     starter_rows = [
-        _compute_player_snapshot(connection, team_norm, player_ref, as_of_datetime, role_weight=1.0)
+        {
+            **_compute_player_snapshot(
+                connection,
+                team_norm,
+                player_ref,
+                as_of_datetime,
+                role_weight=1.0,
+                allow_season_stats=allow_season_stats,
+            ),
+            "lineup_role": "starter",
+        }
         for player_ref in sheet.get("starters", [])
     ]
     bench_rows = [
-        _compute_player_snapshot(connection, team_norm, player_ref, as_of_datetime, role_weight=0.25)
+        {
+            **_compute_player_snapshot(
+                connection,
+                team_norm,
+                player_ref,
+                as_of_datetime,
+                role_weight=0.25,
+                allow_season_stats=allow_season_stats,
+            ),
+            "lineup_role": "bench",
+        }
         for player_ref in sheet.get("bench", [])
     ]
     impacts.extend(starter_rows)
@@ -769,6 +835,12 @@ def train_player_model(
 
 
 def load_player_model_artifact(artifact_path: Path | None = None) -> dict[str, Any] | None:
+    if artifact_path is None:
+        from quiniela.player_evidence import load_active_release_bundle
+
+        active_bundle = load_active_release_bundle()
+        if active_bundle is not None:
+            return active_bundle
     settings = get_settings()
     artifact_path = artifact_path or (settings.model_artifacts_dir / MODEL_ARTIFACT_NAME)
     if not artifact_path.exists():
