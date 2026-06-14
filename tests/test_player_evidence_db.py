@@ -79,6 +79,28 @@ def test_snapshot_is_immutable_and_latest_before_kickoff_is_selected(tmp_path: P
     assert latest["id"] == second_id
 
 
+def test_snapshot_selection_compares_timezone_aware_instants(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "timezone-evidence.sqlite")
+    before_id, _ = insert_pre_match_snapshot(
+        connection,
+        _snapshot("t-1", "2026-06-13T18:59:00+00:00", "before"),
+        [_player()],
+    )
+    insert_pre_match_snapshot(
+        connection,
+        _snapshot("post", "2026-06-13T19:01:00+00:00", "after"),
+        [_player()],
+    )
+
+    latest = get_latest_pre_match_snapshot(
+        connection,
+        "match-1",
+        "2026-06-13T13:00:00-06:00",
+    )
+
+    assert latest["id"] == before_id
+
+
 def test_targets_are_idempotent_and_release_activation_keeps_previous(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "targets.sqlite")
     snapshot_id, _ = insert_pre_match_snapshot(

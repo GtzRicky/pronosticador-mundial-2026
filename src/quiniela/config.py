@@ -35,6 +35,13 @@ class Settings:
     web_lineup_max_articles: int
     web_lineup_timeout_seconds: float
     web_lineup_min_direct_players: int
+    notifications_enabled: bool
+    ntfy_enabled: bool
+    ntfy_server_url: str
+    ntfy_topic: str
+    discord_enabled: bool
+    discord_webhook_url: str
+    notification_timeout_seconds: float
 
     def ensure_directories(self) -> None:
         for path in (
@@ -100,6 +107,21 @@ def get_settings() -> Settings:
         ),
         web_lineup_min_direct_players=int(
             os.getenv("WEB_LINEUP_MIN_DIRECT_PLAYERS", "4")
+        ),
+        notifications_enabled=os.getenv(
+            "NOTIFICATIONS_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"},
+        ntfy_enabled=os.getenv("NTFY_ENABLED", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
+        ntfy_server_url=os.getenv(
+            "NTFY_SERVER_URL", "https://ntfy.sh"
+        ).strip().rstrip("/"),
+        ntfy_topic=os.getenv("NTFY_TOPIC", "").strip(),
+        discord_enabled=os.getenv("DISCORD_ENABLED", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
+        discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        notification_timeout_seconds=float(
+            os.getenv("NOTIFICATION_TIMEOUT_SECONDS", "8")
         ),
     )
     settings.ensure_directories()

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 import json
+import math
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -156,18 +157,29 @@ def _load_lineups_by_fixture(connection: sqlite3.Connection, fixture_ids: list[s
     return lineups
 
 
-def _load_prediction_impacts(connection: sqlite3.Connection, match_ids: list[str]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+def _load_prediction_impacts(
+    connection: sqlite3.Connection,
+    match_ids: list[str],
+    prediction_ids: list[int] | None = None,
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
     if not match_ids:
         return {}
     placeholders = ",".join("?" for _ in match_ids)
+    params: list[Any] = list(match_ids)
+    prediction_filter = ""
+    if prediction_ids:
+        prediction_placeholders = ",".join("?" for _ in prediction_ids)
+        prediction_filter = f" AND prediction_id IN ({prediction_placeholders})"
+        params.extend(prediction_ids)
     rows = connection.execute(
         f"""
         SELECT match_id, team_norm, source_json
         FROM prediction_player_impacts
         WHERE match_id IN ({placeholders})
+        {prediction_filter}
         ORDER BY match_id, net_impact DESC, id ASC
         """,
-        match_ids,
+        params,
     ).fetchall()
     impacts: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
@@ -277,6 +289,56 @@ def _score_comparison(actual_home_goals: Any, actual_away_goals: Any) -> str:
     return f"{int(actual_home_goals)}-{int(actual_away_goals)}"
 
 
+def _render_evaluation(match: dict[str, Any]) -> str:
+    def available(value: Any) -> bool:
+        return value is not None and not (
+            isinstance(value, float) and math.isnan(value)
+        )
+
+    if not available(match.get("actual_home_goals")) or not available(
+        match.get("goal_mae")
+    ):
+        return '<p class="evaluation-empty">Evaluación pendiente hasta el resultado final.</p>'
+    outcome_correct = match.get("outcome_correct")
+    outcome_label = (
+        "correcto"
+        if available(outcome_correct) and int(outcome_correct) == 1
+        else "incorrecto"
+    )
+    return (
+        '<div class="evaluation-box">'
+        f"<span>MAE goles: <b>{float(match.get('goal_mae') or 0.0):.3f}</b></span>"
+        f"<span>Devianza: <b>{float(match.get('poisson_deviance') or 0.0):.3f}</b></span>"
+        f"<span>1-X-2: <b>{outcome_label}</b></span>"
+        f"<span>Log-loss: <b>{float(match.get('log_loss') or 0.0):.3f}</b></span>"
+        f"<span>Brier: <b>{float(match.get('brier_score') or 0.0):.3f}</b></span>"
+        "</div>"
+    )
+
+
+def _render_prediction_timeline(match: dict[str, Any]) -> str:
+    timeline = match.get("timeline") or []
+    if not timeline:
+        return '<p class="timeline-empty">Sin revisiones prepartido registradas.</p>'
+    rows = []
+    for item in timeline:
+        canonical = " · canónica" if int(item.get("is_canonical") or 0) else ""
+        rows.append(
+            "<li>"
+            f"<time>{escape(str(item.get('generated_at_utc') or 'n/d'))}</time>"
+            f"<strong>{escape(str(item.get('hybrid_predicted_score') or item.get('predicted_score') or 'n/d'))}</strong>"
+            f"<span>{escape(str(item.get('prediction_context') or 'legacy'))}"
+            f"{escape(canonical)}</span>"
+            "</li>"
+        )
+    return (
+        '<details class="timeline-accordion">'
+        f"<summary>Historial prepartido ({len(rows)})</summary>"
+        f'<ol class="timeline-list">{"".join(rows)}</ol>'
+        "</details>"
+    )
+
+
 def _match_card_html(
     match: dict[str, Any],
     lineups_by_fixture: dict[tuple[str, str], dict[str, Any]],
@@ -379,6 +441,7 @@ def _match_card_html(
         "</div>"
         "</div>"
         f"{outcome_html}"
+        f"{_render_evaluation(match)}"
         '<div class="impact-grid">'
         '<section class="impact-team">'
         f"<h4>{escape(str(match['home_team']))}</h4>"
@@ -396,6 +459,7 @@ def _match_card_html(
         f'{_render_team_lineup(str(match["away_team"]), away_lineup)}'
         "</div>"
         "</details>"
+        f"{_render_prediction_timeline(match)}"
         '<div class="match-footer">'
         f"<span>Modelo: {escape(str(match.get('model_version') or 'n/d'))}</span>"
         f"<span>Logit: {escape(str(match.get('outcome_model_version') or 'n/d'))}</span>"
@@ -416,7 +480,22 @@ def render_predictions_html(
     if match_rows:
         unique_dates = sorted({str(row["date_cdmx"]) for row in match_rows})
         date_label = unique_dates[0] if len(unique_dates) == 1 else f"{unique_dates[0]} a {unique_dates[-1]}"
-    cards = "".join(_match_card_html(match, lineups_by_fixture, impacts_by_match_team) for match in match_rows)
+    grouped_cards = []
+    for date_value in sorted({str(row["date_cdmx"]) for row in match_rows}):
+        date_rows = [
+            row for row in match_rows if str(row["date_cdmx"]) == date_value
+        ]
+        cards = "".join(
+            _match_card_html(match, lineups_by_fixture, impacts_by_match_team)
+            for match in date_rows
+        )
+        grouped_cards.append(
+            '<section class="matchday-group">'
+            f"<h2>{escape(date_value)}</h2>"
+            f"{cards}"
+            "</section>"
+        )
+    cards = "".join(grouped_cards)
     return f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -487,6 +566,16 @@ def render_predictions_html(
       display: grid;
       gap: 18px;
       margin-top: 24px;
+    }}
+    .matchday-group {{
+      display: grid;
+      gap: 18px;
+    }}
+    .matchday-group > h2 {{
+      margin: 10px 4px 0;
+      font-size: 1.25rem;
+      color: var(--muted);
+      letter-spacing: 0.04em;
     }}
     .match-card {{
       padding: 22px;
@@ -589,6 +678,23 @@ def render_predictions_html(
       margin: 0 0 14px;
       color: var(--muted);
     }}
+    .evaluation-box {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }}
+    .evaluation-box span {{
+      padding: 9px 11px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.66);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }}
+    .evaluation-empty, .timeline-empty {{
+      color: var(--muted);
+    }}
     .lineup-accordion {{
       margin-top: 14px;
       border: 1px solid var(--border);
@@ -659,6 +765,37 @@ def render_predictions_html(
       list-style: none;
       padding: 16px 18px;
       font-weight: 700;
+    }}
+    .timeline-accordion {{
+      margin-top: 12px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.5);
+    }}
+    .timeline-accordion summary {{
+      cursor: pointer;
+      padding: 14px 16px;
+      font-weight: 700;
+    }}
+    .timeline-list {{
+      list-style: none;
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0 16px 16px;
+    }}
+    .timeline-list li {{
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255,250,242,0.82);
+    }}
+    .timeline-list time, .timeline-list span {{
+      color: var(--muted);
+      font-size: 0.86rem;
     }}
     .lineup-accordion summary::-webkit-details-marker {{
       display: none;
@@ -749,6 +886,9 @@ def render_predictions_html(
     }}
     @media (max-width: 820px) {{
       .score-grid, .lineup-grid, .impact-grid, .outcome-probabilities {{
+        grid-template-columns: 1fr;
+      }}
+      .timeline-list li {{
         grid-template-columns: 1fr;
       }}
       .page {{

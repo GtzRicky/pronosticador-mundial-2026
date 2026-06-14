@@ -280,12 +280,13 @@ def build_player_targets(
         SELECT s.*
         FROM pre_match_snapshots s
         INNER JOIN (
-            SELECT match_id, MAX(captured_at) AS captured_at
+            SELECT match_id, MAX(julianday(captured_at)) AS captured_at_jd
             FROM pre_match_snapshots
-            WHERE captured_at < kickoff_at
+            WHERE julianday(captured_at) < julianday(kickoff_at)
             GROUP BY match_id
         ) latest
-          ON latest.match_id = s.match_id AND latest.captured_at = s.captured_at
+          ON latest.match_id = s.match_id
+         AND latest.captured_at_jd = julianday(s.captured_at)
         {where}
         ORDER BY s.kickoff_at, s.id
         """,
@@ -401,6 +402,128 @@ def _individual_dataset(connection: sqlite3.Connection) -> pd.DataFrame:
     return frame
 
 
+def evaluate_player_predictions(
+    connection: sqlite3.Connection,
+    match_ids: list[str] | None = None,
+) -> dict[str, int]:
+    params: list[Any] = []
+    match_filter = ""
+    if match_ids:
+        placeholders = ",".join("?" for _ in match_ids)
+        match_filter = f"AND s.match_id IN ({placeholders})"
+        params.extend(match_ids)
+    rows = fetch_dataframe(
+        connection,
+        f"""
+        SELECT
+            s.id AS snapshot_id, s.match_id, s.source_kind,
+            ps.team_norm, ps.player_name,
+            ps.attack_impact, ps.defense_impact, ps.discipline_impact,
+            ps.availability_impact,
+            t.participated, t.minutes, t.shots_on, t.goals_total,
+            t.goals_assists, t.dribbles_success, t.passes_key,
+            t.passes_accuracy, t.tackles_total, t.tackles_blocks,
+            t.tackles_interceptions, t.duels_won, t.goals_saves,
+            t.goals_conceded, t.fouls_committed, t.cards_yellow,
+            t.cards_red, t.penalty_commited
+        FROM player_match_targets t
+        INNER JOIN pre_match_snapshots s ON s.id = t.snapshot_id
+        INNER JOIN pre_match_player_snapshots ps
+          ON ps.snapshot_id = t.snapshot_id
+         AND ps.team_norm = t.team_norm
+         AND ps.player_name = t.player_name
+        INNER JOIN (
+            SELECT match_id, MAX(julianday(captured_at)) AS captured_at_jd
+            FROM pre_match_snapshots
+            WHERE julianday(captured_at) < julianday(kickoff_at)
+            GROUP BY match_id
+        ) latest
+          ON latest.match_id = s.match_id
+         AND latest.captured_at_jd = julianday(s.captured_at)
+        WHERE 1 = 1 {match_filter}
+        """,
+        params,
+    )
+    evaluated_at = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+    with connection:
+        for row in rows.to_dict(orient="records"):
+            actual = {
+                "attack": (
+                    _safe_float(row.get("shots_on"))
+                    + 2.0 * _safe_float(row.get("goals_total"))
+                    + _safe_float(row.get("goals_assists"))
+                    + _safe_float(row.get("dribbles_success"))
+                ),
+                "creation": (
+                    _safe_float(row.get("passes_key"))
+                    + _safe_float(row.get("goals_assists"))
+                    + _safe_float(row.get("passes_accuracy")) / 100.0
+                ),
+                "defense": (
+                    _safe_float(row.get("tackles_total"))
+                    + _safe_float(row.get("tackles_blocks"))
+                    + _safe_float(row.get("tackles_interceptions"))
+                    + _safe_float(row.get("duels_won"))
+                ),
+                "goalkeeping": (
+                    _safe_float(row.get("goals_saves"))
+                    - _safe_float(row.get("goals_conceded"))
+                ),
+                "discipline": (
+                    _safe_float(row.get("fouls_committed"))
+                    + 2.0 * _safe_float(row.get("cards_yellow"))
+                    + 5.0 * _safe_float(row.get("cards_red"))
+                    + 2.0 * _safe_float(row.get("penalty_commited"))
+                ),
+            }
+            metrics = {
+                "predicted": {
+                    "attack": _safe_float(row.get("attack_impact")),
+                    "defense": _safe_float(row.get("defense_impact")),
+                    "discipline": _safe_float(row.get("discipline_impact")),
+                    "availability": _safe_float(row.get("availability_impact")),
+                },
+                "actual": actual,
+                "participated": int(row.get("participated") or 0),
+                "minutes": _safe_float(row.get("minutes")),
+            }
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO player_prediction_evaluations (
+                    snapshot_id, match_id, team_norm, player_name, source_kind,
+                    participated, minutes, predicted_attack, predicted_defense,
+                    predicted_discipline, predicted_availability,
+                    actual_attack, actual_creation, actual_defense,
+                    actual_goalkeeping, actual_discipline,
+                    metrics_json, evaluated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row["snapshot_id"]),
+                    str(row["match_id"]),
+                    str(row["team_norm"]),
+                    str(row["player_name"]),
+                    str(row["source_kind"]),
+                    int(row.get("participated") or 0),
+                    _safe_float(row.get("minutes")),
+                    _safe_float(row.get("attack_impact")),
+                    _safe_float(row.get("defense_impact")),
+                    _safe_float(row.get("discipline_impact")),
+                    _safe_float(row.get("availability_impact")),
+                    actual["attack"],
+                    actual["creation"],
+                    actual["defense"],
+                    actual["goalkeeping"],
+                    actual["discipline"],
+                    _canonical_json(metrics),
+                    evaluated_at,
+                ),
+            )
+            inserted += int(cursor.rowcount == 1)
+    return {"considered": len(rows), "inserted": inserted}
+
+
 def _match_dataset(connection: sqlite3.Connection) -> pd.DataFrame:
     snapshots = fetch_dataframe(
         connection,
@@ -408,12 +531,13 @@ def _match_dataset(connection: sqlite3.Connection) -> pd.DataFrame:
         SELECT s.*
         FROM pre_match_snapshots s
         INNER JOIN (
-            SELECT match_id, MAX(captured_at) AS captured_at
+            SELECT match_id, MAX(julianday(captured_at)) AS captured_at_jd
             FROM pre_match_snapshots
-            WHERE captured_at < kickoff_at
+            WHERE julianday(captured_at) < julianday(kickoff_at)
             GROUP BY match_id
         ) latest
-          ON latest.match_id = s.match_id AND latest.captured_at = s.captured_at
+          ON latest.match_id = s.match_id
+         AND latest.captured_at_jd = julianday(s.captured_at)
         ORDER BY s.kickoff_at, s.match_id
         """,
     )
@@ -1066,6 +1190,7 @@ def finalize_player_evidence(
     connection: sqlite3.Connection,
 ) -> dict[str, Any]:
     targets = build_player_targets(connection, match_ids)
+    player_evaluations = evaluate_player_predictions(connection, match_ids)
     dataset = _match_dataset(connection)
     last_match = str(dataset["match_id"].iloc[-1]) if not dataset.empty else "none"
     run_key = f"player-evidence-train:{len(dataset)}:{last_match}"
@@ -1090,4 +1215,8 @@ def finalize_player_evidence(
             )
             raise
         finish_automation_run(connection, run_key, "completed", training)
-    return {"targets": targets, "training": training}
+    return {
+        "targets": targets,
+        "player_evaluations": player_evaluations,
+        "training": training,
+    }

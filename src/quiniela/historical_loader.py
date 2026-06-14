@@ -497,8 +497,9 @@ def backfill_team_history(
         report["events_stored"] += counts["events"]
         report["odds_stored"] += counts["odds"]
 
-    write_backfill_report(report, settings.logs_dir / "data_quality_report.md")
-    write_player_resolution_report(resolution_entries, settings.logs_dir / "player_resolution_report.md")
+    from quiniela.output_manager import rebuild_outputs
+
+    rebuild_outputs(connection=client.connection)
     return report
 
 
@@ -637,7 +638,9 @@ def fetch_today_data(
                             resolution_entries=resolution_entries,
                         )
 
-    write_player_resolution_report(resolution_entries, settings.logs_dir / "player_resolution_report.md")
+    from quiniela.output_manager import rebuild_outputs
+
+    rebuild_outputs(connection=client.connection)
     return dict(updated)
 
 

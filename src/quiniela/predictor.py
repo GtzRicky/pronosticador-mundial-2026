@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
@@ -81,11 +81,16 @@ class Predictor:
         }
         return pd.DataFrame([row])
 
-    def _predict_from_matches(self, matches_df: pd.DataFrame) -> pd.DataFrame:
+    def _predict_from_matches(
+        self,
+        matches_df: pd.DataFrame,
+        prediction_context: str = "manual",
+        window_label: str | None = None,
+    ) -> pd.DataFrame:
         features_df = build_features_for_matches(self.connection, matches_df)
         rated_df = apply_ratings(features_df)
         rows: list[dict[str, Any]] = []
-        generated_at = datetime.utcnow().isoformat()
+        generated_at = datetime.now(timezone.utc).isoformat()
 
         for row in rated_df.to_dict(orient="records"):
             score = self.model.predict_score(row)
@@ -99,7 +104,11 @@ class Predictor:
             data_freshness_at = self._data_freshness_at(row.get("api_fixture_id"), generated_at)
             home_impacts = row.get("home_player_impacts") or []
             away_impacts = row.get("away_player_impacts") or []
-            persist_prediction_impacts(self.connection, row["match_id"], home_impacts, away_impacts)
+            kickoff = pd.Timestamp(row["datetime_cdmx"])
+            generated_timestamp = pd.Timestamp(generated_at)
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.tz_localize(self.settings.local_timezone)
+            is_pre_kickoff = int(generated_timestamp < kickoff.tz_convert("UTC"))
             rows.append(
                 {
                     "match_id": row["match_id"],
@@ -111,6 +120,10 @@ class Predictor:
                     "probability": score.probability,
                     "model_version": self.model.model_version,
                     "generated_at": generated_at,
+                    "generated_at_utc": generated_at,
+                    "prediction_context": prediction_context,
+                    "window_label": window_label,
+                    "is_pre_kickoff": is_pre_kickoff,
                     "home_goals": score.home_goals,
                     "away_goals": score.away_goals,
                     "lambda_home": score.lambda_home,
@@ -146,7 +159,19 @@ class Predictor:
             )
         predictions_df = pd.DataFrame(rows)
         if not predictions_df.empty:
-            insert_prediction_rows(self.connection, predictions_df)
+            prediction_ids = insert_prediction_rows(self.connection, predictions_df)
+            for prediction_id, row in zip(
+                prediction_ids,
+                rated_df.to_dict(orient="records"),
+            ):
+                persist_prediction_impacts(
+                    self.connection,
+                    prediction_id,
+                    str(row["match_id"]),
+                    row.get("home_player_impacts") or [],
+                    row.get("away_player_impacts") or [],
+                )
+            predictions_df.insert(0, "prediction_id", prediction_ids)
         return predictions_df
 
     def _data_freshness_at(self, fixture_id: Any, fallback: str) -> str:
@@ -185,19 +210,31 @@ class Predictor:
         )
         return path
 
-    def predict_by_date(self, date_str: str) -> tuple[pd.DataFrame, Path]:
+    def predict_by_date(
+        self,
+        date_str: str,
+        prediction_context: str = "manual",
+        window_label: str | None = None,
+    ) -> tuple[pd.DataFrame, Path]:
         matches_df = self._matches_for_date(date_str)
         if matches_df.empty:
             raise ValueError(f"No se encontraron partidos para {date_str}.")
-        predictions_df = self._predict_from_matches(matches_df)
-        output_path = self.save_predictions_csv(predictions_df, f"predicciones_{date_str}.csv")
+        predictions_df = self._predict_from_matches(
+            matches_df,
+            prediction_context=prediction_context,
+            window_label=window_label,
+        )
+        output_path = self.save_predictions_csv(
+            predictions_df,
+            "predictions_latest.csv",
+        )
         return predictions_df, output_path
 
     def predict_match(self, home_team: str, away_team: str) -> pd.DataFrame:
         matches_df = self._match_for_teams(home_team, away_team)
         if matches_df.empty:
             matches_df = self._synthetic_match(home_team, away_team)
-        return self._predict_from_matches(matches_df)
+        return self._predict_from_matches(matches_df, prediction_context="manual")
 
 
 def format_prediction_lines(predictions_df: pd.DataFrame) -> list[str]:

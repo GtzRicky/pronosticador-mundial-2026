@@ -403,7 +403,7 @@ def train_outcome_model(
         pickle.dump(bundle, handle)
     report_path = write_outcome_model_report(
         bundle,
-        settings.logs_dir / "outcome_model_report.md",
+        settings.logs_dir / "model_performance.md",
     )
     return {
         "trained": True,

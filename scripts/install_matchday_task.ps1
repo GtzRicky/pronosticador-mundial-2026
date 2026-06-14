@@ -47,7 +47,7 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Description "Actualiza fixtures, alineaciones, odds, resultados, predicciones y HTML del Mundial 2026." `
+    -Description "Actualiza fixtures, alineaciones, odds, resultados, predicciones, HTML y notificaciones del Mundial 2026." `
     -Force | Out-Null
 
 Write-Host "Tarea instalada: $TaskName"

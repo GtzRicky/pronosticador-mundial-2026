@@ -15,7 +15,14 @@ from quiniela.db import create_schema, fetch_dataframe, get_connection, seed_fro
 from quiniela.historical_loader import backfill_team_history, fetch_today_data, update_after_match
 from quiniela.html_report import build_predictions_html_report
 from quiniela.matchday import MatchdayRunner
+from quiniela.notifications import dispatch_notifications, test_notifications
 from quiniela.outcome_model import train_outcome_model
+from quiniela.output_manager import (
+    cleanup_obsolete_outputs,
+    evaluate_predictions,
+    rebuild_outputs,
+    write_automation_status,
+)
 from quiniela.player_model import train_player_model
 from quiniela.player_evidence import (
     activate_model_release,
@@ -112,10 +119,15 @@ def predict_command(
 ) -> None:
     predictor = Predictor()
     if date:
-        predictions_df, output_path = predictor.predict_by_date(date)
+        predictions_df, output_path = predictor.predict_by_date(
+            date,
+            prediction_context="manual",
+        )
+        outputs = rebuild_outputs(connection=predictor.connection)
         for line in format_prediction_lines(predictions_df):
             console.print(line)
-        console.print(f"CSV guardado en {output_path}")
+        console.print(f"CSV actualizado en {output_path}")
+        console.print(outputs)
         return
 
     if home and away:
@@ -137,22 +149,7 @@ def update_after_match_command(
     result = update_after_match(home, away, dry_run=dry_run, force_refresh=force_refresh)
     console.print(result)
     if result.get("updated"):
-        settings = get_settings()
-        connection = get_connection(settings.db_path)
-        match_df = fetch_dataframe(
-            connection,
-            """
-            SELECT date_cdmx
-            FROM matches
-            WHERE match_id = ?
-            LIMIT 1
-            """,
-            (result["match_id"],),
-        )
-        if not match_df.empty:
-            date_value = str(match_df.iloc[0]["date_cdmx"])
-            html_path = build_predictions_html_report([date_value])
-            console.print(f"HTML actualizado en {html_path}")
+        console.print(rebuild_outputs())
 
 
 @app.command("report-api-usage")
@@ -233,8 +230,32 @@ def render_html_report_command(
     date: list[str] = typer.Option(..., help="Fecha YYYY-MM-DD. Repite la opción para múltiples fechas."),
     output: Optional[str] = typer.Option(None, help="Ruta opcional del archivo HTML de salida"),
 ) -> None:
-    output_path = build_predictions_html_report(date, Path(output) if output else None)
-    console.print(f"HTML guardado en {output_path}")
+    if output:
+        output_path = build_predictions_html_report(date, Path(output))
+        console.print(f"HTML guardado en {output_path}")
+    else:
+        console.print(rebuild_outputs())
+
+
+@app.command("rebuild-outputs")
+def rebuild_outputs_command() -> None:
+    console.print(rebuild_outputs())
+
+
+@app.command("evaluate-predictions")
+def evaluate_predictions_command(
+    match_id: Optional[list[str]] = typer.Option(None),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    console.print(evaluate_predictions(connection, match_id or None))
+
+
+@app.command("cleanup-obsolete-outputs")
+def cleanup_obsolete_outputs_command(
+    apply: bool = typer.Option(False, "--apply/--dry-run"),
+) -> None:
+    console.print(cleanup_obsolete_outputs(apply=apply))
 
 
 @app.command("train-player-model")
@@ -261,6 +282,8 @@ def train_outcome_model_command(
         min_per_class=min_per_class,
     )
     console.print(summary)
+    if summary.get("trained"):
+        console.print(rebuild_outputs(connection=connection))
 
 
 @app.command("capture-pre-match-snapshot")
@@ -333,7 +356,10 @@ def activate_model_release_command(
 ) -> None:
     settings = get_settings()
     connection = get_connection(settings.db_path)
-    console.print(activate_model_release(connection, release_id))
+    result = activate_model_release(connection, release_id)
+    console.print(result)
+    if result.get("activated"):
+        console.print(rebuild_outputs(connection=connection))
 
 
 @app.command("run-matchday")
@@ -345,6 +371,37 @@ def run_matchday_command(
 ) -> None:
     parsed_now = datetime.fromisoformat(now) if now else None
     console.print(MatchdayRunner().run(parsed_now))
+
+
+@app.command("dispatch-notifications")
+def dispatch_notifications_command(
+    now: Optional[str] = typer.Option(
+        None,
+        help="Fecha/hora ISO opcional para pruebas reproducibles.",
+    ),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    parsed_now = datetime.fromisoformat(now) if now else None
+    result = dispatch_notifications(
+        connection=connection,
+        now=parsed_now,
+        settings=settings,
+    )
+    write_automation_status(connection)
+    console.print(result)
+
+
+@app.command("test-notifications")
+def test_notifications_command(
+    channel: str = typer.Option(
+        "all",
+        help="Canal a probar: ntfy, discord o all.",
+    ),
+) -> None:
+    if channel not in {"ntfy", "discord", "all"}:
+        raise typer.BadParameter("El canal debe ser ntfy, discord o all.")
+    console.print(test_notifications(channel=channel))
 
 
 @app.command("fetch-web-lineup-fallback")

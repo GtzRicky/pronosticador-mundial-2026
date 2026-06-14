@@ -2,6 +2,20 @@
 
 Pronosticador local-first en Python para estimar marcadores exactos del Mundial 2026. El proyecto combina una base SQLite, fuentes manuales, cache local de API-Football, señales colectivas por selección y señales individuales por jugador para producir predicciones reproducibles, auditables y actualizables el mismo día del partido.
 
+## Features
+
+- Predicciones prepartido con enfoque local-first y trazabilidad completa.
+- Modelo híbrido que combina Poisson para marcadores exactos y Logit para probabilidades `1-X-2`.
+- Ajuste dinámico por alineaciones oficiales, alineaciones estimadas y datos individuales de jugadores.
+- Automatización de jornada con ventanas `T-60`, `T-30`, `T-15`, `T-5`, `T-1` y seguimiento postpartido.
+- Actualización horaria de fixtures, estados, odds, lineups, resultados y outputs estables.
+- Snapshots inmutables antes del kickoff para comparar inferencias contra lo que realmente ocurrió.
+- Aprendizaje continuo con evaluación temporal, gates estrictos y versionado de artefactos.
+- HTML, CSV y JSON acumulativos pensados para operación diaria, revisión humana y auditoría.
+- Fallback web de alineaciones cuando la API publica tarde los titulares.
+- Notificaciones push prepartido por `ntfy` y soporte opcional para `Discord Webhook`.
+- Base SQLite portable, bundle público sanitizado y flujo seguro para publicar el repositorio sin secretos.
+
 ## Resumen Corporativo
 
 Esta solución toma el calendario oficial y las convocatorias iniciales, crea una base de datos local y la enriquece con información en vivo e histórica de API-Football. Con esos datos calcula la fortaleza reciente de cada selección, la calidad esperada de su alineación titular, el impacto colectivo del banco y la influencia de cada jugador en ataque, defensa, disciplina y disponibilidad. Después estima los goles esperados de local y visitante y genera un marcador exacto probable.
@@ -341,13 +355,21 @@ python scripts/07_update_after_match.py --home "México" --away "Sudáfrica" --f
 ### 7. Generar reporte HTML
 
 ```bash
-python scripts/12_render_html_report.py --date 2026-06-11
-python scripts/12_render_html_report.py --date 2026-06-11 --date 2026-06-12 --date 2026-06-13
+python scripts/22_rebuild_outputs.py
 ```
 
-El reporte diario también actualiza `outputs/predictions/index.html` y muestra
-el marcador Poisson, el marcador híbrido, probabilidades `1-X-2`, fuente de
-alineación y frescura de datos.
+La reconstrucción genera dos HTML estables: `index.html` contiene el histórico
+completo del torneo y `today.html` muestra solamente la jornada actual. Cada
+partido conserva la última predicción válida antes del kickoff, su resultado,
+métricas de error y una timeline desplegable de revisiones prepartido.
+
+Comandos de mantenimiento:
+
+```bash
+python scripts/23_evaluate_predictions.py
+python scripts/24_cleanup_obsolete_outputs.py --dry-run
+python scripts/24_cleanup_obsolete_outputs.py --apply
+```
 
 ### 8. Automatizar la jornada en Windows
 
@@ -370,6 +392,72 @@ realiza al detectar el resultado final.
 
 ```bash
 python scripts/15_run_matchday.py --now 2026-06-13T12:59:00-06:00
+```
+
+### Notificaciones prepartido con ntfy y Discord
+
+La misma tarea por minuto puede enviar el pronostico en `T-15` y `T-5`.
+No se instala otra tarea y estas entregas no consumen cuota de API-Football.
+
+Los dos canales estan desactivados por defecto. Primero genera localmente un
+topico ntfy dificil de adivinar:
+
+```powershell
+"quiniela-" + [guid]::NewGuid().ToString("N")
+```
+
+Configura `.env` sin copiar estos valores al repositorio:
+
+```dotenv
+NOTIFICATIONS_ENABLED=false
+NTFY_ENABLED=true
+NTFY_SERVER_URL=https://ntfy.sh
+NTFY_TOPIC=PEGA_AQUI_EL_TOPICO_ALEATORIO
+DISCORD_ENABLED=true
+DISCORD_WEBHOOK_URL=PEGA_AQUI_LA_URL_PRIVADA
+NOTIFICATION_TIMEOUT_SECONDS=8
+```
+
+Configuracion de ntfy:
+
+1. Instala ntfy en Android o iOS y suscribete exactamente al valor de
+   `NTFY_TOPIC`.
+2. En navegador abre `https://ntfy.sh/TU_TOPICO` y habilita notificaciones.
+3. Trata el topico como una contrasena: quien lo conozca puede publicar o
+   suscribirse si se usa el servidor anonimo.
+
+Configuracion de Discord:
+
+1. En el servidor privado abre `Server Settings > Integrations > Webhooks`.
+2. Crea un webhook para el canal privado y guarda su URL en `.env`.
+3. Configura el canal en `Notification Settings > All Messages` para recibir
+   push sin guardar menciones, user IDs ni role IDs.
+
+Prueba ambos destinos mientras la automatizacion global sigue apagada:
+
+```bash
+python scripts/26_test_notifications.py --channel all
+python scripts/26_test_notifications.py --channel ntfy
+python scripts/26_test_notifications.py --channel discord
+```
+
+Cuando ambas pruebas funcionen, cambia:
+
+```dotenv
+NOTIFICATIONS_ENABLED=true
+```
+
+El mensaje incluye hora CDMX, Poisson, hibrido, probabilidades `1-X-2`,
+fuentes de alineacion, frescura y versiones del modelo. No incluye enlaces
+publicos. Si la PC despierta tarde, solo se envia la ventana pendiente mas
+reciente. Los errores `408`, `429`, `5xx` y de red se reintentan antes del
+kickoff; un fallo de ntfy o Discord nunca detiene el pronostico.
+
+La outbox `notification_deliveries` registra estados e intentos sin guardar el
+topico ntfy ni la URL del webhook. El despacho manual de entregas pendientes es:
+
+```bash
+python scripts/25_dispatch_notifications.py
 ```
 
 ### Fallback web de alineaciones
@@ -438,14 +526,18 @@ pipeline actual.
 
 ## Archivos de salida
 
-El proyecto genera principalmente:
+Los outputs se reconstruyen desde SQLite y mantienen nombres estables:
 
 - `data/db/quiniela.db`
-- `outputs/predictions/predicciones_YYYY-MM-DD.csv`
-- `outputs/predictions/predicciones_YYYY-MM-DD.json`
-- `outputs/predictions/predicciones_YYYY-MM-DD.html`
-- `outputs/logs/data_quality_report.md`
-- `outputs/logs/player_resolution_report.md`
+- `outputs/predictions/index.html`
+- `outputs/predictions/today.html`
+- `outputs/predictions/predictions_latest.csv`
+- `outputs/predictions/predictions_latest.json`
+- `outputs/predictions/predictions_history.csv`
+- `outputs/predictions/predictions_history.json`
+- `outputs/logs/data_quality.md`
+- `outputs/logs/model_performance.md`
+- `outputs/logs/automation_status.md`
 
 El HTML muestra:
 
@@ -455,7 +547,30 @@ El HTML muestra:
 - resultado real
 - alineaciones confirmadas o inferidas
 - alineaciones oficiales o estimadas con fuentes cuando aplica
+- métricas de error para partidos finalizados
+- historial de revisiones prepartido
 - top impactos por jugador/equipo
+
+`predictions_latest` contiene una fila por partido: usa la predicción canónica
+prepartido cuando el encuentro ya comenzó y la versión más reciente para
+partidos futuros. `predictions_history` conserva todas las corridas, incluidas
+las posteriores al kickoff, pero estas últimas se marcan como no evaluables.
+
+## Aprendizaje continuo
+
+Al finalizar un partido el pipeline:
+
+1. sincroniza resultado, eventos y estadísticas individuales
+2. selecciona la última predicción anterior al kickoff
+3. calcula MAE de goles, devianza Poisson, log-loss, Brier y calibración
+4. vincula inferencias de jugadores con participación, minutos y objetivos de
+   ataque, creación, defensa, portería y disciplina
+5. comprueba si hay cinco partidos completos nuevos para reentrenar
+
+Los modelos candidatos se validan temporalmente contra un baseline sin
+variables individuales. Sólo se activan si no empeoran ninguna métrica
+principal y mejoran al menos 2% la devianza de goles o el log-loss. El release
+anterior y los artefactos v1 permanecen disponibles para rollback.
 
 ## Cómo usarlo con agentes de IA
 
@@ -517,6 +632,7 @@ Tablas principales:
 - `actual_results`
 - `api_cache`
 - `api_usage`
+- `notification_deliveries`
 
 Herramientas recomendadas para inspección:
 

@@ -281,6 +281,7 @@ SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS prediction_player_impacts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prediction_id INTEGER,
         match_id TEXT NOT NULL,
         team_norm TEXT NOT NULL,
         api_player_id INTEGER,
@@ -292,7 +293,32 @@ SCHEMA_STATEMENTS = [
         availability_impact REAL NOT NULL DEFAULT 0,
         net_impact REAL NOT NULL DEFAULT 0,
         source_json TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(prediction_id) REFERENCES predictions(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS prediction_evaluations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prediction_id INTEGER NOT NULL UNIQUE,
+        match_id TEXT NOT NULL,
+        is_canonical INTEGER NOT NULL DEFAULT 0,
+        actual_home_goals INTEGER NOT NULL,
+        actual_away_goals INTEGER NOT NULL,
+        predicted_home_goals INTEGER,
+        predicted_away_goals INTEGER,
+        hybrid_home_goals INTEGER,
+        hybrid_away_goals INTEGER,
+        goal_mae REAL,
+        poisson_deviance REAL,
+        outcome_correct INTEGER,
+        log_loss REAL,
+        brier_score REAL,
+        calibration_error REAL,
+        metrics_json TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(prediction_id) REFERENCES predictions(id)
     )
     """,
     """
@@ -307,6 +333,29 @@ SCHEMA_STATEMENTS = [
         started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         finished_at TEXT,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS notification_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id TEXT NOT NULL,
+        kickoff_at TEXT NOT NULL,
+        window_label TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        prediction_id INTEGER,
+        scheduled_for TEXT NOT NULL,
+        payload_json TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        last_attempt_at TEXT,
+        sent_at TEXT,
+        last_http_status INTEGER,
+        error_code TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(match_id, kickoff_at, window_label, channel),
+        FOREIGN KEY(prediction_id) REFERENCES predictions(id)
     )
     """,
     """
@@ -407,6 +456,32 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS player_prediction_evaluations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id INTEGER NOT NULL,
+        match_id TEXT NOT NULL,
+        team_norm TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        participated INTEGER NOT NULL,
+        minutes REAL NOT NULL DEFAULT 0,
+        predicted_attack REAL NOT NULL DEFAULT 0,
+        predicted_defense REAL NOT NULL DEFAULT 0,
+        predicted_discipline REAL NOT NULL DEFAULT 0,
+        predicted_availability REAL NOT NULL DEFAULT 0,
+        actual_attack REAL NOT NULL DEFAULT 0,
+        actual_creation REAL NOT NULL DEFAULT 0,
+        actual_defense REAL NOT NULL DEFAULT 0,
+        actual_goalkeeping REAL NOT NULL DEFAULT 0,
+        actual_discipline REAL NOT NULL DEFAULT 0,
+        metrics_json TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(snapshot_id, team_norm, player_name),
+        FOREIGN KEY(snapshot_id) REFERENCES pre_match_snapshots(id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS model_training_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         dataset_hash TEXT NOT NULL UNIQUE,
@@ -492,9 +567,63 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "away_win_probability": "away_win_probability REAL",
         "outcome_model_version": "outcome_model_version TEXT",
         "data_freshness_at": "data_freshness_at TEXT",
+        "prediction_context": "prediction_context TEXT NOT NULL DEFAULT 'legacy'",
+        "window_label": "window_label TEXT",
+        "generated_at_utc": "generated_at_utc TEXT",
+        "is_pre_kickoff": "is_pre_kickoff INTEGER",
     }
     for column_name, column_def in prediction_columns.items():
         _ensure_column(connection, "predictions", column_name, column_def)
+
+    _ensure_column(
+        connection,
+        "prediction_player_impacts",
+        "prediction_id",
+        "prediction_id INTEGER REFERENCES predictions(id)",
+    )
+    with connection:
+        connection.execute(
+            """
+            UPDATE predictions
+            SET generated_at_utc = COALESCE(
+                    generated_at_utc,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', generated_at)
+                ),
+                is_pre_kickoff = COALESCE(
+                    is_pre_kickoff,
+                    CASE
+                        WHEN julianday(generated_at) < julianday(datetime_cdmx) THEN 1
+                        ELSE 0
+                    END
+                )
+            WHERE generated_at_utc IS NULL OR is_pre_kickoff IS NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE prediction_player_impacts
+            SET prediction_id = (
+                SELECT p.id
+                FROM predictions p
+                WHERE p.match_id = prediction_player_impacts.match_id
+                ORDER BY p.id DESC
+                LIMIT 1
+            )
+            WHERE prediction_id IS NULL
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_predictions_match_generated ON predictions(match_id, generated_at_utc)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_impacts_prediction ON prediction_player_impacts(prediction_id)"
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_due
+            ON notification_deliveries(status, next_attempt_at, kickoff_at)
+            """
+        )
 
 
 def _executemany(connection: sqlite3.Connection, query: str, rows: Iterable[tuple[Any, ...]]) -> None:
@@ -1169,23 +1298,24 @@ def upsert_player_season_stats(
             )
 
 
-def replace_prediction_player_impacts(
+def insert_prediction_player_impacts(
     connection: sqlite3.Connection,
+    prediction_id: int,
     match_id: str,
     impact_rows: list[dict[str, Any]],
 ) -> None:
     with connection:
-        connection.execute("DELETE FROM prediction_player_impacts WHERE match_id = ?", (match_id,))
         for row in impact_rows:
             connection.execute(
                 """
                 INSERT INTO prediction_player_impacts (
-                    match_id, team_norm, api_player_id, player_name, role_bucket,
+                    prediction_id, match_id, team_norm, api_player_id, player_name, role_bucket,
                     attack_impact, defense_impact, discipline_impact, availability_impact,
                     net_impact, source_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    prediction_id,
                     match_id,
                     row.get("team_norm"),
                     row.get("api_player_id"),
@@ -1201,42 +1331,58 @@ def replace_prediction_player_impacts(
             )
 
 
-def insert_prediction_rows(connection: sqlite3.Connection, predictions_df: pd.DataFrame) -> int:
-    rows = [
-        (
-            row.get("match_id"),
-            row.get("datetime_cdmx"),
-            row.get("group"),
-            row.get("home_team"),
-            row.get("away_team"),
-            row.get("predicted_score"),
-            float(row.get("probability", 0.0)),
-            row.get("model_version"),
-            row.get("hybrid_predicted_score"),
-            float(row.get("hybrid_probability", 0.0)) if row.get("hybrid_probability") is not None else None,
-            float(row.get("home_win_probability", 0.0)) if row.get("home_win_probability") is not None else None,
-            float(row.get("draw_probability", 0.0)) if row.get("draw_probability") is not None else None,
-            float(row.get("away_win_probability", 0.0)) if row.get("away_win_probability") is not None else None,
-            row.get("outcome_model_version"),
-            row.get("data_freshness_at"),
-            json.dumps(row, ensure_ascii=False),
-        )
-        for row in predictions_df.to_dict(orient="records")
-    ]
-    _executemany(
-        connection,
-        """
-        INSERT INTO predictions (
-            match_id, datetime_cdmx, group_name, home_team, away_team,
-            predicted_score, probability, model_version,
-            hybrid_predicted_score, hybrid_probability,
-            home_win_probability, draw_probability, away_win_probability,
-            outcome_model_version, data_freshness_at, source_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-    return len(rows)
+def insert_prediction_rows(
+    connection: sqlite3.Connection,
+    predictions_df: pd.DataFrame,
+) -> list[int]:
+    inserted_ids: list[int] = []
+    with connection:
+        for row in predictions_df.to_dict(orient="records"):
+            cursor = connection.execute(
+                """
+                INSERT INTO predictions (
+                    match_id, datetime_cdmx, group_name, home_team, away_team,
+                    predicted_score, probability, model_version,
+                    hybrid_predicted_score, hybrid_probability,
+                    home_win_probability, draw_probability, away_win_probability,
+                    outcome_model_version, data_freshness_at, source_json,
+                    prediction_context, window_label, generated_at_utc,
+                    is_pre_kickoff
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("match_id"),
+                    row.get("datetime_cdmx"),
+                    row.get("group"),
+                    row.get("home_team"),
+                    row.get("away_team"),
+                    row.get("predicted_score"),
+                    float(row.get("probability", 0.0)),
+                    row.get("model_version"),
+                    row.get("hybrid_predicted_score"),
+                    float(row.get("hybrid_probability", 0.0))
+                    if row.get("hybrid_probability") is not None
+                    else None,
+                    float(row.get("home_win_probability", 0.0))
+                    if row.get("home_win_probability") is not None
+                    else None,
+                    float(row.get("draw_probability", 0.0))
+                    if row.get("draw_probability") is not None
+                    else None,
+                    float(row.get("away_win_probability", 0.0))
+                    if row.get("away_win_probability") is not None
+                    else None,
+                    row.get("outcome_model_version"),
+                    row.get("data_freshness_at"),
+                    json.dumps(row, ensure_ascii=False),
+                    row.get("prediction_context", "manual"),
+                    row.get("window_label"),
+                    row.get("generated_at_utc") or row.get("generated_at"),
+                    int(row.get("is_pre_kickoff", 0)),
+                ),
+            )
+            inserted_ids.append(int(cursor.lastrowid))
+    return inserted_ids
 
 
 def claim_automation_run(
@@ -1375,9 +1521,9 @@ def get_latest_pre_match_snapshot(
     query = "SELECT * FROM pre_match_snapshots WHERE match_id = ?"
     params: list[Any] = [match_id]
     if before_kickoff:
-        query += " AND captured_at < ?"
+        query += " AND julianday(captured_at) < julianday(?)"
         params.append(before_kickoff)
-    query += " ORDER BY captured_at DESC, id DESC LIMIT 1"
+    query += " ORDER BY julianday(captured_at) DESC, id DESC LIMIT 1"
     return connection.execute(query, params).fetchone()
 
 

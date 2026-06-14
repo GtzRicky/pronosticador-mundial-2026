@@ -15,7 +15,7 @@ from quiniela.db import (
     get_connection,
 )
 from quiniela.historical_loader import fetch_today_data, sync_finished_results_for_date
-from quiniela.html_report import build_predictions_html_report
+from quiniela.output_manager import rebuild_outputs
 from quiniela.predictor import Predictor
 
 
@@ -122,11 +122,12 @@ class MatchdayRunner:
         connection=None,
         refresh: Callable[..., dict[str, Any]] = fetch_today_data,
         predict: Callable[[str], Any] | None = None,
-        render: Callable[[list[str]], Any] = build_predictions_html_report,
+        render: Callable[[list[str]], Any] | None = None,
         sync_results: Callable[..., dict[str, Any]] = sync_finished_results_for_date,
         capture_snapshot: Callable[..., dict[str, Any]] | None = None,
         finalize_evidence: Callable[..., dict[str, Any]] | None = None,
         lineup_fallback: Callable[..., dict[str, Any]] | None = None,
+        notification_cycle: Callable[..., dict[str, Any]] | None = None,
         timezone_name: str | None = None,
     ) -> None:
         from quiniela.player_evidence import (
@@ -134,21 +135,32 @@ class MatchdayRunner:
             finalize_player_evidence,
         )
         from quiniela.web_lineup_fallback import refresh_web_lineup_fallback
+        from quiniela.notifications import run_notification_cycle
 
         settings = get_settings()
         self.connection = connection or get_connection(settings.db_path)
         self.refresh = refresh
-        self.predict = predict or self._predict_date
+        self.predict = predict
         self.render = render
         self.sync_results = sync_results
         self.capture_snapshot = capture_snapshot or capture_pre_match_snapshot
         self.finalize_evidence = finalize_evidence or finalize_player_evidence
         self.lineup_fallback = lineup_fallback or refresh_web_lineup_fallback
+        self.notification_cycle = notification_cycle or run_notification_cycle
         self.timezone_name = timezone_name or settings.local_timezone
         self._web_fallback_run_keys: set[str] = set()
 
-    def _predict_date(self, date_str: str) -> Any:
-        return Predictor().predict_by_date(date_str)
+    def _predict_date(
+        self,
+        date_str: str,
+        prediction_context: str,
+        window_label: str | None,
+    ) -> Any:
+        return Predictor().predict_by_date(
+            date_str,
+            prediction_context=prediction_context,
+            window_label=window_label,
+        )
 
     def _load_relevant_matches(self, now: datetime) -> list[dict[str, Any]]:
         local_now = now.astimezone(ZoneInfo(self.timezone_name))
@@ -213,7 +225,19 @@ class MatchdayRunner:
                     sorted(newly_finished),
                     connection=self.connection,
                 )
-        result["prediction"] = self.predict(action.date_cdmx)
+        window_label = (
+            action.run_key.rsplit(":", 1)[-1]
+            if action.action == "pre_match"
+            else None
+        )
+        if self.predict is None:
+            result["prediction"] = self._predict_date(
+                action.date_cdmx,
+                prediction_context=action.action,
+                window_label=window_label,
+            )
+        else:
+            result["prediction"] = self.predict(action.date_cdmx)
         if action.action == "pre_match" and action.match_id:
             result["snapshot"] = self.capture_snapshot(
                 action.match_id,
@@ -221,14 +245,20 @@ class MatchdayRunner:
                 connection=self.connection,
                 source_kind="live",
             )
-        result["html"] = str(self.render([action.date_cdmx]))
+        if self.render is None:
+            result["outputs"] = rebuild_outputs(
+                connection=self.connection,
+            )
+        else:
+            result["html"] = str(self.render([action.date_cdmx]))
         return result
 
     def run(self, now: datetime | None = None) -> dict[str, Any]:
         local_tz = ZoneInfo(self.timezone_name)
         local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
+        matches = self._load_relevant_matches(local_now)
         actions = plan_matchday_actions(
-            self._load_relevant_matches(local_now),
+            matches,
             local_now,
             self.timezone_name,
         )
@@ -278,10 +308,20 @@ class MatchdayRunner:
                 details,
             )
             completed.append(action.run_key)
+        try:
+            notifications = self.notification_cycle(
+                connection=self.connection,
+                now=local_now,
+            )
+        except Exception:
+            notifications = {
+                "error": "notification_cycle_error",
+            }
         return {
             "now": local_now.isoformat(),
             "planned": len(actions),
             "completed": completed,
             "skipped": skipped,
             "failed": failed,
+            "notifications": notifications,
         }

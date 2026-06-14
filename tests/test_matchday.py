@@ -59,6 +59,7 @@ def test_runner_is_idempotent_and_records_failures(tmp_path: Path) -> None:
         render=lambda dates: tmp_path / "index.html",
         sync_results=lambda *args, **kwargs: {"updated": 0},
         finalize_evidence=lambda *args, **kwargs: {},
+        notification_cycle=lambda **kwargs: {},
     )
     runner._load_relevant_matches = lambda now: []
     now = datetime(2026, 6, 13, 10, 1, tzinfo=TZ)
@@ -76,6 +77,7 @@ def test_runner_is_idempotent_and_records_failures(tmp_path: Path) -> None:
         predict=lambda date: None,
         render=lambda dates: tmp_path / "index.html",
         finalize_evidence=lambda *args, **kwargs: {},
+        notification_cycle=lambda **kwargs: {},
     )
     failing._load_relevant_matches = lambda now: []
     result = failing.run(datetime(2026, 6, 13, 11, 1, tzinfo=TZ))
@@ -108,6 +110,7 @@ def test_hourly_run_syncs_new_final_result_and_fetches_final_data(tmp_path: Path
             ("evidence", tuple(match_ids))
         )
         or {"targets": 1},
+        notification_cycle=lambda **kwargs: {},
     )
     runner._load_relevant_matches = lambda now: []
 
@@ -139,6 +142,7 @@ def test_hourly_run_does_not_refetch_known_final_result(tmp_path: Path) -> None:
         finalize_evidence=lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("known results must not rebuild evidence")
         ),
+        notification_cycle=lambda **kwargs: {},
     )
     runner._load_relevant_matches = lambda now: []
 
@@ -165,6 +169,7 @@ def test_pre_match_run_captures_window_after_prediction(tmp_path: Path) -> None:
         )
         or {"status": "completed"},
         finalize_evidence=lambda *args, **kwargs: {},
+        notification_cycle=lambda **kwargs: {},
     )
     runner._load_relevant_matches = lambda now: [
         _match("2026-06-13T13:00:00-06:00")
@@ -192,6 +197,7 @@ def test_pre_match_t_minus_sixty_does_not_use_web_fallback(tmp_path: Path) -> No
         capture_snapshot=lambda *args, **kwargs: {},
         lineup_fallback=lambda *args, **kwargs: fallback_calls.append(args) or {},
         finalize_evidence=lambda *args, **kwargs: {},
+        notification_cycle=lambda **kwargs: {},
     )
     runner._load_relevant_matches = lambda now: [
         _match("2026-06-13T13:00:00-06:00")
@@ -200,3 +206,24 @@ def test_pre_match_t_minus_sixty_does_not_use_web_fallback(tmp_path: Path) -> No
     runner.run(datetime(2026, 6, 13, 12, 0, tzinfo=TZ))
 
     assert not fallback_calls
+
+
+def test_notification_failure_does_not_fail_matchday_actions(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "notification-isolation.sqlite")
+    runner = MatchdayRunner(
+        connection=connection,
+        refresh=lambda *args, **kwargs: {},
+        predict=lambda date: None,
+        render=lambda dates: tmp_path / "index.html",
+        finalize_evidence=lambda *args, **kwargs: {},
+        notification_cycle=lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("external notification outage")
+        ),
+    )
+    runner._load_relevant_matches = lambda now: []
+
+    result = runner.run(datetime(2026, 6, 13, 10, 1, tzinfo=TZ))
+
+    assert not result["failed"]
+    assert len(result["completed"]) == 2
+    assert result["notifications"] == {"error": "notification_cycle_error"}

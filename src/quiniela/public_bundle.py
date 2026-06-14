@@ -39,12 +39,16 @@ def _table_counts(connection: sqlite3.Connection) -> dict[str, int]:
         "historical_player_stats",
         "odds_snapshots",
         "predictions",
+        "prediction_player_impacts",
+        "prediction_evaluations",
         "actual_results",
         "automation_runs",
+        "notification_deliveries",
         "pre_match_snapshots",
         "pre_match_player_snapshots",
         "player_match_targets",
         "player_evidence_evaluations",
+        "player_prediction_evaluations",
         "model_training_runs",
         "model_releases",
         "api_cache",
@@ -69,7 +73,7 @@ def _public_manifest(connection: sqlite3.Connection) -> dict[str, object]:
         "db_file": PUBLIC_DB_NAME,
         "processed_files": ["processed/calendar.csv", "processed/rosters.csv"],
         "table_counts": counts,
-        "excluded_tables": ["api_cache", "api_usage"],
+        "excluded_tables": ["api_cache", "api_usage", "notification_deliveries"],
         "notes": [
             "This bundle is designed for offline prediction bootstrap.",
             "No API key is included in this bundle.",
@@ -97,6 +101,15 @@ def export_public_bundle(
     with connection:
         connection.execute("DELETE FROM api_cache")
         connection.execute("DELETE FROM api_usage")
+        notification_table = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'notification_deliveries'
+            """
+        ).fetchone()
+        if notification_table:
+            connection.execute("DELETE FROM notification_deliveries")
     connection.execute("VACUUM")
 
     processed_dir = output_dir / "processed"

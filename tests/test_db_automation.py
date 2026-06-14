@@ -28,6 +28,23 @@ def test_prediction_columns_and_automation_runs_are_migrated(tmp_path: Path) -> 
     }
     assert {"run_key", "action", "scheduled_for", "status"}.issubset(run_columns)
 
+    notification_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(notification_deliveries)"
+        ).fetchall()
+    }
+    assert {
+        "match_id",
+        "kickoff_at",
+        "window_label",
+        "channel",
+        "prediction_id",
+        "status",
+        "attempt_count",
+        "next_attempt_at",
+    }.issubset(notification_columns)
+
 
 def test_claim_automation_run_is_idempotent(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "automation.sqlite")

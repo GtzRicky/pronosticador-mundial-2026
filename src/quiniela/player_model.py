@@ -15,7 +15,7 @@ from sklearn.linear_model import PoissonRegressor
 from quiniela.config import get_settings
 from quiniela.db import (
     fetch_dataframe,
-    replace_prediction_player_impacts,
+    insert_prediction_player_impacts,
     upsert_fixture_player_stats,
     upsert_player_api_profile,
     upsert_player_season_stats,
@@ -851,8 +851,14 @@ def load_player_model_artifact(artifact_path: Path | None = None) -> dict[str, A
 
 def persist_prediction_impacts(
     connection: sqlite3.Connection,
+    prediction_id: int,
     match_id: str,
     home_impacts: list[dict[str, Any]],
     away_impacts: list[dict[str, Any]],
 ) -> None:
-    replace_prediction_player_impacts(connection, match_id, home_impacts + away_impacts)
+    insert_prediction_player_impacts(
+        connection,
+        prediction_id,
+        match_id,
+        home_impacts + away_impacts,
+    )
