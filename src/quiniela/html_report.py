@@ -289,6 +289,13 @@ def _score_comparison(actual_home_goals: Any, actual_away_goals: Any) -> str:
     return f"{int(actual_home_goals)}-{int(actual_away_goals)}"
 
 
+def _format_cdmx_timestamp(value: datetime | None = None) -> str:
+    settings = get_settings()
+    local_tz = ZoneInfo(settings.local_timezone)
+    timestamp = value.astimezone(local_tz) if value else datetime.now(local_tz)
+    return f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} CDMX"
+
+
 def _render_evaluation(match: dict[str, Any]) -> str:
     def available(value: Any) -> bool:
         return value is not None and not (
@@ -475,8 +482,10 @@ def render_predictions_html(
     match_rows: list[dict[str, Any]],
     lineups_by_fixture: dict[tuple[str, str], dict[str, Any]],
     impacts_by_match_team: dict[tuple[str, str], list[dict[str, Any]]],
+    generated_at: datetime | None = None,
 ) -> str:
     date_label = "Sin fechas"
+    updated_at_label = _format_cdmx_timestamp(generated_at)
     if match_rows:
         unique_dates = sorted({str(row["date_cdmx"]) for row in match_rows})
         date_label = unique_dates[0] if len(unique_dates) == 1 else f"{unique_dates[0]} a {unique_dates[-1]}"
@@ -912,6 +921,7 @@ def render_predictions_html(
         <span>Fechas: {escape(date_label)}</span>
         <span>Partidos: {len(match_rows)}</span>
         <span>Fuente operativa: SQLite local</span>
+        <span>Ultima actualizacion: {escape(updated_at_label)}</span>
       </div>
     </section>
     <section class="matches">
@@ -934,7 +944,11 @@ def build_predictions_html_report(dates: list[str], output_path: Path | None = N
             fixture_ids.append(str(int(fixture_id)))
     lineups_by_fixture = _load_lineups_by_fixture(connection, sorted(set(fixture_ids)))
     impacts_by_match_team = _load_prediction_impacts(connection, [str(row["match_id"]) for row in match_rows])
-    html = render_predictions_html(match_rows, lineups_by_fixture, impacts_by_match_team)
+    html = render_predictions_html(
+        match_rows,
+        lineups_by_fixture,
+        impacts_by_match_team,
+    )
     if output_path is None:
         date_label = dates[0] if len(dates) == 1 else f"{dates[0]}_a_{dates[-1]}"
         output_path = settings.predictions_dir / f"predicciones_{date_label}.html"

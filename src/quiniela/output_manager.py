@@ -500,7 +500,7 @@ def _write_model_performance(connection: sqlite3.Connection, path: Path) -> None
 def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None:
     runs = connection.execute(
         """
-        SELECT run_key, action, status, scheduled_for, finished_at
+        SELECT run_key, action, status, scheduled_for, finished_at, details_json
         FROM automation_runs
         ORDER BY id DESC LIMIT 20
         """
@@ -546,7 +546,7 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
     ).fetchone()
     recent_notifications = connection.execute(
         """
-        SELECT match_id, window_label, channel, status, error_code
+        SELECT match_id, window_label, channel, status, error_code, notification_type, team_norm
         FROM notification_deliveries
         ORDER BY id DESC
         LIMIT 12
@@ -565,16 +565,49 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
         "## Recent runs",
     ]
     lines.extend(
-        f"- `{row['run_key']}`: {row['status']} ({row['action']})"
+        (
+            f"- `{row['run_key']}`: {row['status']} ({row['action']})"
+            + (
+                f" - {json.loads(row['details_json']).get('error')}"
+                if row["status"] == "failed" and row["details_json"]
+                else ""
+            )
+        )
         for row in runs
     )
     if not runs:
         lines.append("- No runs recorded.")
+    failed_issues: list[str] = []
+    for row in runs:
+        if row["status"] != "failed" or not row["details_json"]:
+            continue
+        details = json.loads(row["details_json"])
+        for issue in details.get("retrieval_issues", []):
+            parts = [f"`{row['run_key']}`", issue.get("reason", "unknown_reason")]
+            if issue.get("fixture_id"):
+                parts.append(f"fixture={issue['fixture_id']}")
+            if issue.get("raw_home_team") or issue.get("raw_away_team"):
+                parts.append(
+                    f"raw={issue.get('raw_home_team', '?')} vs {issue.get('raw_away_team', '?')}"
+                )
+            if issue.get("expected_pair"):
+                expected_home, expected_away = issue["expected_pair"]
+                parts.append(f"expected_norm={expected_home} vs {expected_away}")
+            if issue.get("detail"):
+                parts.append(str(issue["detail"]))
+            failed_issues.append("- " + " | ".join(parts))
+    lines.extend(["", "## Recent retrieval failures"])
+    lines.extend(failed_issues or ["- No retrieval failures recorded."])
     lines.extend(["", "## Recent notifications"])
     lines.extend(
         (
-            f"- `{row['match_id']}:{row['window_label']}:{row['channel']}`: "
+            f"- `{row['match_id']}:{row['notification_type']}:{row['window_label']}:{row['channel']}`: "
             f"{row['status']}"
+            + (
+                f" [{row['team_norm']}]"
+                if row["team_norm"]
+                else ""
+            )
             + (f" ({row['error_code']})" if row["error_code"] else "")
         )
         for row in recent_notifications
@@ -601,6 +634,7 @@ def rebuild_outputs(
     connection = connection or get_connection(settings.db_path)
     local_tz = ZoneInfo(settings.local_timezone)
     local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
+    generated_at_cdmx = f"{local_now.strftime('%Y-%m-%d %H:%M:%S')} CDMX"
     evaluation = evaluate_predictions(connection)
     from quiniela.player_evidence import evaluate_player_predictions
 
@@ -652,11 +686,21 @@ def rebuild_outputs(
     _fill_snapshot_impacts(connection, all_rows, impacts)
     _atomic_write_text(
         settings.predictions_dir / "index.html",
-        render_predictions_html(all_rows, lineups, impacts),
+        render_predictions_html(
+            all_rows,
+            lineups,
+            impacts,
+            generated_at=local_now,
+        ),
     )
     _atomic_write_text(
         settings.predictions_dir / "today.html",
-        render_predictions_html(today_rows, lineups, impacts),
+        render_predictions_html(
+            today_rows,
+            lineups,
+            impacts,
+            generated_at=local_now,
+        ),
     )
     _write_data_quality(connection, settings.logs_dir / "data_quality.md")
     _write_model_performance(connection, settings.logs_dir / "model_performance.md")
@@ -668,6 +712,7 @@ def rebuild_outputs(
         "history_rows": len(history),
         "latest_rows": len(latest),
         "today_rows": len(today_rows),
+        "generated_at_cdmx": generated_at_cdmx,
         "evaluation": evaluation,
         "player_evaluation": player_evaluation,
         "files": sorted(STABLE_PREDICTION_FILES | STABLE_LOG_FILES),

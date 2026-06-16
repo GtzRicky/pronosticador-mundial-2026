@@ -12,6 +12,7 @@ from quiniela.config import get_settings
 from quiniela.db import get_connection
 from quiniela.notifications import (
     dispatch_notifications,
+    queue_official_lineup_notifications,
     schedule_due_notifications,
     test_notifications as send_test_notifications,
 )
@@ -110,6 +111,41 @@ def _seed_prediction(
                 generated_at,
                 generated_at,
             ),
+        )
+
+
+def _official_lineup_payload(
+    team_name: str,
+    starters: list[str] | None = None,
+) -> dict:
+    starters = starters or [f"{team_name} Player {index}" for index in range(1, 12)]
+    return {
+        "team": {"name": team_name},
+        "startXI": [
+            {"player": {"name": player_name, "number": index}}
+            for index, player_name in enumerate(starters, start=1)
+        ],
+        "substitutes": [],
+    }
+
+
+def _store_official_lineup(
+    connection,
+    *,
+    fixture_id: str = "123",
+    team_norm: str,
+    payload: dict,
+) -> None:
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO historical_lineups (fixture_id, team_norm, source_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(fixture_id, team_norm) DO UPDATE SET
+                source_json = excluded.source_json,
+                fetched_at = CURRENT_TIMESTAMP
+            """,
+            (fixture_id, team_norm, json.dumps(payload)),
         )
 
 
@@ -351,6 +387,196 @@ def test_rescheduled_match_uses_new_kickoff_identity(tmp_path: Path) -> None:
     assert rows[0]["status"] == "expired"
     assert rows[1]["status"] == "pending"
     assert rows[0]["kickoff_at"] != rows[1]["kickoff_at"]
+
+
+def test_queue_official_lineup_deduplicates_same_hash(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "official-queue.sqlite")
+    _seed_match(connection)
+    settings = _settings()
+    now = datetime(2026, 6, 13, 12, 35, tzinfo=TZ)
+    payload = {"response": [_official_lineup_payload("Mexico")]}
+
+    first = queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload=payload,
+        now=now,
+        settings=settings,
+    )
+    second = queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload=payload,
+        now=now,
+        settings=settings,
+    )
+
+    rows = connection.execute(
+        """
+        SELECT notification_type, team_norm, window_label, channel
+        FROM notification_deliveries
+        ORDER BY channel
+        """
+    ).fetchall()
+    assert first["scheduled"] == 2
+    assert second["scheduled"] == 0
+    assert {(row["notification_type"], row["team_norm"], row["channel"]) for row in rows} == {
+        ("official_lineup", "mexico", "discord"),
+        ("official_lineup", "mexico", "ntfy"),
+    }
+    assert all(str(row["window_label"]).startswith("official:mexico:") for row in rows)
+
+
+def test_queue_official_lineup_supersedes_pending_hash(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "official-supersede.sqlite")
+    _seed_match(connection)
+    settings = _settings()
+    now = datetime(2026, 6, 13, 12, 35, tzinfo=TZ)
+
+    first_payload = {"response": [_official_lineup_payload("Mexico")]}
+    changed_payload = {
+        "response": [
+            _official_lineup_payload(
+                "Mexico",
+                starters=["Mexico Player 1"] + [f"Mexico Alt {index}" for index in range(2, 12)],
+            )
+        ]
+    }
+    queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload=first_payload,
+        now=now,
+        settings=settings,
+    )
+    result = queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload=changed_payload,
+        now=now,
+        settings=settings,
+    )
+
+    status_rows = connection.execute(
+        """
+        SELECT status
+        FROM notification_deliveries
+        WHERE notification_type = 'official_lineup'
+        ORDER BY id
+        """
+    ).fetchall()
+    assert result["scheduled"] == 2
+    assert result["superseded"] == 2
+    assert [row["status"] for row in status_rows] == [
+        "superseded",
+        "superseded",
+        "pending",
+        "pending",
+    ]
+
+
+def test_dispatch_sends_official_lineup_with_prediction_summary(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "official-dispatch.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False)
+    now = datetime(2026, 6, 13, 12, 40, tzinfo=TZ)
+    lineup_payload = _official_lineup_payload("Mexico")
+    _store_official_lineup(
+        connection,
+        team_norm="mexico",
+        payload=lineup_payload,
+    )
+    queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload={"response": [lineup_payload]},
+        now=now,
+        settings=settings,
+    )
+
+    result = dispatch_notifications(
+        connection,
+        now=now,
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200))},
+    )
+
+    row = connection.execute(
+        """
+        SELECT status, payload_json
+        FROM notification_deliveries
+        WHERE notification_type = 'official_lineup'
+        """
+    ).fetchone()
+    assert result["sent"] == 1
+    assert row["status"] == "sent"
+    assert "Alineacion oficial: Mexico" in row["payload_json"]
+    assert "Mexico Player 1" in row["payload_json"]
+    assert "Mini pronostico" in row["payload_json"]
+
+
+def test_changed_official_lineup_after_sent_creates_new_delivery(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "official-changed-after-sent.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False)
+    now = datetime(2026, 6, 13, 12, 40, tzinfo=TZ)
+
+    first_lineup = _official_lineup_payload("Mexico")
+    _store_official_lineup(connection, team_norm="mexico", payload=first_lineup)
+    queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload={"response": [first_lineup]},
+        now=now,
+        settings=settings,
+    )
+    first_result = dispatch_notifications(
+        connection,
+        now=now,
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200))},
+    )
+
+    second_lineup = _official_lineup_payload(
+        "Mexico",
+        starters=["Mexico Player 1"] + [f"Mexico XI {index}" for index in range(2, 12)],
+    )
+    _store_official_lineup(connection, team_norm="mexico", payload=second_lineup)
+    queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload={"response": [second_lineup]},
+        now=datetime(2026, 6, 13, 12, 41, tzinfo=TZ),
+        settings=settings,
+    )
+    second_result = dispatch_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 12, 41, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200))},
+    )
+
+    rows = connection.execute(
+        """
+        SELECT status, lineup_hash
+        FROM notification_deliveries
+        WHERE notification_type = 'official_lineup'
+        ORDER BY id
+        """
+    ).fetchall()
+    assert first_result["sent"] == 1
+    assert second_result["sent"] == 1
+    assert [row["status"] for row in rows] == ["sent", "sent"]
+    assert rows[0]["lineup_hash"] != rows[1]["lineup_hash"]
 
 
 def test_manual_test_messages_do_not_require_global_switch(tmp_path: Path) -> None:
