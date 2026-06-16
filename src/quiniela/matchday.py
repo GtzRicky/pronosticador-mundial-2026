@@ -293,11 +293,14 @@ class MatchdayRunner:
             try:
                 details = self._execute(action)
             except Exception as exc:
+                error_details = {"error": str(exc), "action": asdict(action)}
+                if hasattr(exc, "issues"):
+                    error_details["retrieval_issues"] = getattr(exc, "issues")
                 finish_automation_run(
                     self.connection,
                     action.run_key,
                     "failed",
-                    {"error": str(exc), "action": asdict(action)},
+                    error_details,
                 )
                 failed.append({"run_key": action.run_key, "error": str(exc)})
                 continue
@@ -317,6 +320,12 @@ class MatchdayRunner:
             notifications = {
                 "error": "notification_cycle_error",
             }
+        try:
+            from quiniela.output_manager import write_automation_status
+
+            write_automation_status(self.connection)
+        except Exception:
+            pass
         return {
             "now": local_now.isoformat(),
             "planned": len(actions),

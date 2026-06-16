@@ -22,10 +22,12 @@ from quiniela.db import (
 from quiniela.logging_utils import get_logger
 from quiniela.name_maps import (
     TEAM_NAME_MAP,
+    UnknownTeamNameError,
     fix_common_mojibake,
     normalize_team_name,
     normalize_text,
     preferred_team_search_name,
+    require_known_team_name,
 )
 from quiniela.player_model import (
     store_fixture_players_payload,
@@ -36,6 +38,12 @@ from quiniela.player_model import (
 
 logger = get_logger(__name__)
 FREE_PLAN_FALLBACK_SEASONS = (2024, 2023, 2022)
+
+
+class RetrievalValidationError(RuntimeError):
+    def __init__(self, message: str, issues: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(message)
+        self.issues = issues or []
 
 
 def _display_team_name(team_name: str) -> str:
@@ -62,26 +70,81 @@ def _team_aliases(team_name: str) -> list[str]:
     return unique_aliases
 
 
+def _strict_team_norm(team_name: str, *, context: str) -> str:
+    return require_known_team_name(team_name, context=context)
+
+
+def _retrieval_issue(
+    *,
+    reason: str,
+    fixture_id: str | None = None,
+    raw_home_team: str | None = None,
+    raw_away_team: str | None = None,
+    expected_match_id: str | None = None,
+    expected_pair: tuple[str, str] | None = None,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    issue: dict[str, Any] = {"reason": reason}
+    if fixture_id:
+        issue["fixture_id"] = fixture_id
+    if raw_home_team:
+        issue["raw_home_team"] = raw_home_team
+    if raw_away_team:
+        issue["raw_away_team"] = raw_away_team
+    if expected_match_id:
+        issue["expected_match_id"] = expected_match_id
+    if expected_pair:
+        issue["expected_pair"] = list(expected_pair)
+    if detail:
+        issue["detail"] = detail
+    return issue
+
+
+def _format_retrieval_issues(issues: list[dict[str, Any]]) -> str:
+    lines = ["Retrieval validation failed:"]
+    for issue in issues:
+        parts = [issue.get("reason", "unknown_reason")]
+        if issue.get("fixture_id"):
+            parts.append(f"fixture={issue['fixture_id']}")
+        if issue.get("raw_home_team") or issue.get("raw_away_team"):
+            parts.append(
+                f"raw={issue.get('raw_home_team', '?')} vs {issue.get('raw_away_team', '?')}"
+            )
+        if issue.get("expected_match_id"):
+            parts.append(f"match_id={issue['expected_match_id']}")
+        if issue.get("expected_pair"):
+            home_expected, away_expected = issue["expected_pair"]
+            parts.append(f"expected_norm={home_expected} vs {away_expected}")
+        if issue.get("detail"):
+            parts.append(str(issue["detail"]))
+        lines.append("- " + " | ".join(parts))
+    return "\n".join(lines)
+
+
 def _pick_team_candidate(team_name: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-    target_norm = normalize_team_name(team_name)
+    target_norm = _strict_team_norm(team_name, context="team id resolution target")
     exact = []
     fallback = []
     for candidate in candidates:
         team_info = candidate.get("team", {})
         name = team_info.get("name") or ""
-        candidate_norm = normalize_team_name(name)
+        try:
+            candidate_norm = _strict_team_norm(
+                str(name),
+                context=f"team id resolution candidate for {team_name}",
+            )
+        except UnknownTeamNameError:
+            fallback.append(candidate)
+            continue
         if candidate_norm == target_norm:
             exact.append(candidate)
         else:
             fallback.append(candidate)
 
-    for bucket in (exact, fallback):
-        for candidate in bucket:
-            team_info = candidate.get("team", {})
-            if team_info.get("national") is True:
-                return candidate
-        if bucket:
-            return bucket[0]
+    for candidate in exact:
+        team_info = candidate.get("team", {})
+        if team_info.get("national") is True:
+            return candidate
     return None
 
 
@@ -244,8 +307,18 @@ def _store_fixture_children(
     collect_odds: bool,
     resolution_entries: list[dict[str, Any]] | None = None,
     include_stats_events: bool = True,
+    match_id: str | None = None,
+    kickoff_at: str | None = None,
 ) -> dict[str, int]:
-    counts = {"lineups": 0, "fixture_player_stats": 0, "statistics": 0, "events": 0, "odds": 0}
+    counts = {
+        "lineups": 0,
+        "fixture_player_stats": 0,
+        "statistics": 0,
+        "events": 0,
+        "odds": 0,
+        "official_lineup_notifications": 0,
+        "official_lineup_superseded": 0,
+    }
 
     try:
         lineups_payload = client.get_fixture_lineups(fixture_id)
@@ -255,10 +328,28 @@ def _store_fixture_children(
                 client.connection,
                 "historical_lineups",
                 fixture_id,
-                normalize_team_name(team_name),
+                _strict_team_norm(
+                    team_name,
+                    context=f"fixture {fixture_id} lineup team",
+                ),
                 lineup,
             )
             counts["lineups"] += 1
+        if match_id and kickoff_at:
+            from quiniela.notifications import queue_official_lineup_notifications
+
+            notification_result = queue_official_lineup_notifications(
+                client.connection,
+                match_id=match_id,
+                kickoff_at=kickoff_at,
+                lineups_payload=lineups_payload,
+            )
+            counts["official_lineup_notifications"] += int(
+                notification_result.get("scheduled", 0)
+            )
+            counts["official_lineup_superseded"] += int(
+                notification_result.get("superseded", 0)
+            )
     except APILimitReachedError:
         logger.warning("Límite/rate limit alcanzado al pedir lineups para fixture %s", fixture_id)
         return counts
@@ -271,7 +362,10 @@ def _store_fixture_children(
                 counts["fixture_player_stats"] += store_fixture_players_payload(
                     client.connection,
                     fixture_id=fixture_id,
-                    team_norm=normalize_team_name(team_name),
+                    team_norm=_strict_team_norm(
+                        team_name,
+                        context=f"fixture {fixture_id} player stats team",
+                    ),
                     team_name=team_name,
                     team_payload=team_payload,
                     resolution_entries=resolution_entries,
@@ -288,7 +382,10 @@ def _store_fixture_children(
                     client.connection,
                     "historical_team_stats",
                     fixture_id,
-                    normalize_team_name(team_name),
+                    _strict_team_norm(
+                        team_name,
+                        context=f"fixture {fixture_id} statistics team",
+                    ),
                     stat_row,
                 )
                 counts["statistics"] += 1
@@ -305,7 +402,10 @@ def _store_fixture_children(
                     client.connection,
                     "historical_player_stats",
                     fixture_id,
-                    normalize_team_name(team_name),
+                    _strict_team_norm(
+                        team_name,
+                        context=f"fixture {fixture_id} event team",
+                    ),
                     event_row,
                     player_norm=normalize_text(player_name),
                 )
@@ -548,42 +648,121 @@ def fetch_today_data(
         (date_str,),
     )
     scheduled_pairs: dict[tuple[str, str], str] = {}
+    retrieval_issues: list[dict[str, Any]] = []
     for row in scheduled_df.to_dict(orient="records"):
         pair = (
-            normalize_team_name(row.get("home_team") or ""),
-            normalize_team_name(row.get("away_team") or ""),
+            _strict_team_norm(
+                str(row.get("home_team") or ""),
+                context=f"scheduled match {row['match_id']} home team",
+            ),
+            _strict_team_norm(
+                str(row.get("away_team") or ""),
+                context=f"scheduled match {row['match_id']} away team",
+            ),
         )
+        if pair in scheduled_pairs:
+            retrieval_issues.append(
+                _retrieval_issue(
+                    reason="duplicate_scheduled_pair",
+                    expected_match_id=str(row["match_id"]),
+                    expected_pair=pair,
+                )
+            )
+            continue
         scheduled_pairs[pair] = str(row["match_id"])
-    fixtures = [
-        fixture
-        for fixture in fixtures
-        if (
-            normalize_team_name(fixture.get("teams", {}).get("home", {}).get("name") or ""),
-            normalize_team_name(fixture.get("teams", {}).get("away", {}).get("name") or ""),
-        ) in scheduled_pairs
-    ]
+
+    validated_fixtures: list[dict[str, Any]] = []
+    matched_pairs: dict[tuple[str, str], str] = {}
+    for fixture in fixtures:
+        fixture_id = str(fixture.get("fixture", {}).get("id"))
+        kickoff = pd.Timestamp(fixture.get("fixture", {}).get("date"))
+        if kickoff.tzinfo is None:
+            kickoff = kickoff.tz_localize("UTC")
+        kickoff_cdmx = kickoff.tz_convert(cdmx_tz)
+        if kickoff_cdmx.date() != target_date:
+            continue
+        home_team = str(fixture.get("teams", {}).get("home", {}).get("name") or "")
+        away_team = str(fixture.get("teams", {}).get("away", {}).get("name") or "")
+        try:
+            pair = (
+                _strict_team_norm(
+                    home_team,
+                    context=f"live fixture {fixture_id} home team",
+                ),
+                _strict_team_norm(
+                    away_team,
+                    context=f"live fixture {fixture_id} away team",
+                ),
+            )
+        except UnknownTeamNameError as exc:
+            retrieval_issues.append(
+                _retrieval_issue(
+                    reason="unknown_live_team_name",
+                    fixture_id=fixture_id,
+                    raw_home_team=home_team,
+                    raw_away_team=away_team,
+                    detail=str(exc),
+                )
+            )
+            continue
+        match_id = scheduled_pairs.get(pair)
+        if match_id is None:
+            retrieval_issues.append(
+                _retrieval_issue(
+                    reason="fixture_not_in_local_schedule",
+                    fixture_id=fixture_id,
+                    raw_home_team=home_team,
+                    raw_away_team=away_team,
+                    expected_pair=pair,
+                )
+            )
+            continue
+        previous_fixture = matched_pairs.get(pair)
+        if previous_fixture and previous_fixture != fixture_id:
+            retrieval_issues.append(
+                _retrieval_issue(
+                    reason="duplicate_live_fixture_for_scheduled_match",
+                    fixture_id=fixture_id,
+                    raw_home_team=home_team,
+                    raw_away_team=away_team,
+                    expected_match_id=match_id,
+                    expected_pair=pair,
+                    detail=f"previous_fixture={previous_fixture}",
+                )
+            )
+            continue
+        matched_pairs[pair] = fixture_id
+        validated_fixtures.append(
+            {
+                "fixture": fixture,
+                "fixture_id": fixture_id,
+                "kickoff_cdmx": kickoff_cdmx,
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_team_norm": pair[0],
+                "away_team_norm": pair[1],
+                "match_id": match_id,
+            }
+        )
+
+    if retrieval_issues:
+        raise RetrievalValidationError(
+            _format_retrieval_issues(retrieval_issues),
+            issues=retrieval_issues,
+        )
     updated = defaultdict(int)
     resolution_entries: list[dict[str, Any]] = []
 
     with client.connection:
-        for fixture in fixtures:
+        for validated in validated_fixtures:
+            fixture = validated["fixture"]
             store_historical_match(client.connection, fixture)
             updated["fixtures"] += 1
-            fixture_id = str(fixture.get("fixture", {}).get("id"))
-            home_team = fixture.get("teams", {}).get("home", {}).get("name") or ""
-            away_team = fixture.get("teams", {}).get("away", {}).get("name") or ""
-            kickoff = pd.Timestamp(fixture.get("fixture", {}).get("date"))
-            if kickoff.tzinfo is None:
-                kickoff = kickoff.tz_localize("UTC")
-            kickoff_cdmx = kickoff.tz_convert(cdmx_tz)
-            match_id = scheduled_pairs.get(
-                (
-                    normalize_team_name(home_team),
-                    normalize_team_name(away_team),
-                )
-            )
-            if not match_id:
-                continue
+            fixture_id = str(validated["fixture_id"])
+            home_team = str(validated["home_team"])
+            away_team = str(validated["away_team"])
+            kickoff_cdmx = validated["kickoff_cdmx"]
+            match_id = str(validated["match_id"])
             client.connection.execute(
                 """
                 UPDATE matches
@@ -616,16 +795,24 @@ def fetch_today_data(
                 collect_odds=collect_odds,
                 resolution_entries=resolution_entries,
                 include_stats_events=include_stats_events,
+                match_id=match_id,
+                kickoff_at=kickoff_cdmx.isoformat(),
             )
             updated["lineups"] += counts["lineups"]
             updated["fixture_player_stats"] += counts["fixture_player_stats"]
             updated["odds"] += counts["odds"]
+            updated["official_lineup_notifications"] += counts[
+                "official_lineup_notifications"
+            ]
+            updated["official_lineup_superseded"] += counts[
+                "official_lineup_superseded"
+            ]
             if include_stats_events:
                 updated["statistics"] += counts["statistics"]
                 updated["events"] += counts["events"]
                 for team_name, team_norm in (
-                    (home_team, normalize_team_name(home_team)),
-                    (away_team, normalize_team_name(away_team)),
+                    (home_team, str(validated["home_team_norm"])),
+                    (away_team, str(validated["away_team_norm"])),
                 ):
                     api_team_id = get_team_api_id(client.connection, team_norm)
                     if api_team_id is not None:

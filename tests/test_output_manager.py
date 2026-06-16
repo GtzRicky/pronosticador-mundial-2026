@@ -124,6 +124,7 @@ def test_canonical_prediction_uses_real_timestamp_and_exports_all_versions(
 
     assert summary["history_rows"] == 2
     assert summary["latest_rows"] == 1
+    assert summary["generated_at_cdmx"] == "2026-06-13 14:00:00 CDMX"
     latest = pd.read_csv(settings.predictions_dir / "predictions_latest.csv")
     history = pd.read_csv(settings.predictions_dir / "predictions_history.csv")
     assert latest.iloc[0]["predicted_score"] == "0-1"
@@ -135,6 +136,7 @@ def test_canonical_prediction_uses_real_timestamp_and_exports_all_versions(
     html = (settings.predictions_dir / "index.html").read_text(encoding="utf-8")
     assert "Historial prepartido (1)" in html
     assert "MAE goles" in html
+    assert "Ultima actualizacion: 2026-06-13 14:00:00 CDMX" in html
     assert not list(settings.predictions_dir.glob(".*.tmp"))
 
 

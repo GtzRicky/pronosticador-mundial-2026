@@ -1,124 +1,118 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Dict
 
-from rapidfuzz import fuzz, process
 from unidecode import unidecode
 
 
-TEAM_NAME_MAP: Dict[str, str] = {
-    "México": "mexico",
-    "MÃ©xico": "mexico",
-    "Mexico": "mexico",
-    "M?xico": "mexico",
-    "Sudáfrica": "south_africa",
-    "SudÃ¡frica": "south_africa",
-    "Sudafrica": "south_africa",
-    "Sud?frica": "south_africa",
-    "South Africa": "south_africa",
-    "República de Corea": "south_korea",
-    "RepÃºblica de Corea": "south_korea",
-    "Republica de Corea": "south_korea",
-    "Rep?blica de Corea": "south_korea",
-    "Corea del Sur": "south_korea",
-    "South Korea": "south_korea",
-    "Korea Republic": "south_korea",
-    "Republic of Korea": "south_korea",
-    "Chequia": "czech_republic",
-    "República Checa": "czech_republic",
-    "RepÃºblica Checa": "czech_republic",
-    "Republica Checa": "czech_republic",
-    "Rep?blica Checa": "czech_republic",
-    "Czech Republic": "czech_republic",
-    "Canadá": "canada",
-    "CanadÃ¡": "canada",
-    "Canada": "canada",
-    "Catar": "qatar",
-    "Qatar": "qatar",
-    "Suiza": "switzerland",
-    "Switzerland": "switzerland",
-    "Bosnia y Herzegovina": "bosnia_herzegovina",
-    "Bosnia & Herzegovina": "bosnia_herzegovina",
-    "Estados Unidos": "usa",
-    "USA": "usa",
-    "United States": "usa",
-    "Paraguay": "paraguay",
-    "Brasil": "brazil",
-    "Brazil": "brazil",
-    "Argelia": "algeria",
-    "Algeria": "algeria",
-    "Irán": "iran",
-    "IrÃ¡n": "iran",
-    "Iran": "iran",
-    "RI de Irán": "iran",
-    "RI de IrÃ¡n": "iran",
-    "Costa de Marfil": "ivory_coast",
-    "Ivory Coast": "ivory_coast",
-    "Países Bajos": "netherlands",
-    "PaÃ­ses Bajos": "netherlands",
-    "Netherlands": "netherlands",
-    "Curazao": "curacao",
-    "Curacao": "curacao",
-    "Túnez": "tunisia",
-    "TÃºnez": "tunisia",
-    "Tunisia": "tunisia",
-    "Turquía": "turkey",
-    "TurquÃ­a": "turkey",
-    "Turkey": "turkey",
-    "Australia": "australia",
-    "Marruecos": "morocco",
-    "Morocco": "morocco",
-    "Haití": "haiti",
-    "HaitÃ­": "haiti",
-    "Haiti": "haiti",
-    "Escocia": "scotland",
-    "Scotland": "scotland",
-    "Arabia Saudí": "saudi_arabia",
-    "Arabia SaudÃ­": "saudi_arabia",
-    "Arabia Saudita": "saudi_arabia",
-    "Saudi Arabia": "saudi_arabia",
-    "Cabo Verde": "cape_verde",
-    "Cape Verde": "cape_verde",
-    "RD Congo": "dr_congo",
-    "DR Congo": "dr_congo",
-    "República Democrática del Congo": "dr_congo",
-    "RepÃºblica DemocrÃ¡tica del Congo": "dr_congo",
-    "Panamá": "panama",
-    "PanamÃ¡": "panama",
-    "Panama": "panama",
-}
+@dataclass(frozen=True)
+class TeamSpec:
+    team_norm: str
+    preferred_search_name: str
+    aliases: tuple[str, ...]
 
+
+class UnknownTeamNameError(ValueError):
+    def __init__(self, value: str, *, context: str | None = None) -> None:
+        detail = f"Selección desconocida: {value!r}"
+        if context:
+            detail = f"{detail} ({context})"
+        super().__init__(detail)
+        self.value = value
+        self.context = context
+
+
+TEAM_SPECS: tuple[TeamSpec, ...] = (
+    TeamSpec("mexico", "Mexico", ("Mexico", "MÃ©xico")),
+    TeamSpec("south_africa", "South Africa", ("South Africa", "SudÃ¡frica")),
+    TeamSpec(
+        "south_korea",
+        "South Korea",
+        (
+            "South Korea",
+            "Korea Republic",
+            "Republic of Korea",
+            "Corea del Sur",
+            "RepÃºblica de Corea",
+        ),
+    ),
+    TeamSpec(
+        "czech_republic",
+        "Czech Republic",
+        ("Czech Republic", "Czechia", "Chequia", "RepÃºblica Checa"),
+    ),
+    TeamSpec("canada", "Canada", ("Canada", "CanadÃ¡")),
+    TeamSpec("qatar", "Qatar", ("Qatar", "Catar")),
+    TeamSpec("switzerland", "Switzerland", ("Switzerland", "Suiza")),
+    TeamSpec("sweden", "Sweden", ("Sweden", "Suecia")),
+    TeamSpec(
+        "bosnia_herzegovina",
+        "Bosnia & Herzegovina",
+        ("Bosnia & Herzegovina", "Bosnia y Herzegovina"),
+    ),
+    TeamSpec("usa", "United States", ("United States", "USA", "Estados Unidos")),
+    TeamSpec("germany", "Germany", ("Germany", "Alemania")),
+    TeamSpec("argentina", "Argentina", ("Argentina",)),
+    TeamSpec("austria", "Austria", ("Austria",)),
+    TeamSpec("paraguay", "Paraguay", ("Paraguay",)),
+    TeamSpec("brazil", "Brazil", ("Brazil", "Brasil")),
+    TeamSpec("belgium", "Belgium", ("Belgium", "BÃ©lgica")),
+    TeamSpec("algeria", "Algeria", ("Algeria", "Argelia")),
+    TeamSpec("colombia", "Colombia", ("Colombia",)),
+    TeamSpec("croatia", "Croatia", ("Croatia", "Croacia")),
+    TeamSpec("ecuador", "Ecuador", ("Ecuador",)),
+    TeamSpec("egypt", "Egypt", ("Egypt", "Egipto")),
+    TeamSpec("spain", "Spain", ("Spain", "EspaÃ±a")),
+    TeamSpec("france", "France", ("France", "Francia")),
+    TeamSpec("ghana", "Ghana", ("Ghana",)),
+    TeamSpec("england", "England", ("England", "Inglaterra")),
+    TeamSpec("iran", "Iran", ("Iran", "IrÃ¡n", "RI de IrÃ¡n", "IR Iran")),
+    TeamSpec("iraq", "Iraq", ("Iraq", "Irak")),
+    TeamSpec("japan", "Japan", ("Japan", "JapÃ³n")),
+    TeamSpec("jordan", "Jordan", ("Jordan", "Jordania")),
+    TeamSpec(
+        "ivory_coast",
+        "Ivory Coast",
+        ("Ivory Coast", "Cote d'Ivoire", "CÃ´te d'Ivoire", "Costa de Marfil"),
+    ),
+    TeamSpec("netherlands", "Netherlands", ("Netherlands", "PaÃ­ses Bajos")),
+    TeamSpec("curacao", "Curacao", ("Curacao", "CuraÃ§ao", "Curazao")),
+    TeamSpec("norway", "Norway", ("Norway", "Noruega")),
+    TeamSpec("new_zealand", "New Zealand", ("New Zealand", "Nueva Zelanda")),
+    TeamSpec("portugal", "Portugal", ("Portugal",)),
+    TeamSpec("senegal", "Senegal", ("Senegal",)),
+    TeamSpec("tunisia", "Tunisia", ("Tunisia", "TÃºnez")),
+    TeamSpec("turkey", "Turkey", ("Turkey", "TurquÃ­a")),
+    TeamSpec("australia", "Australia", ("Australia",)),
+    TeamSpec("morocco", "Morocco", ("Morocco", "Marruecos")),
+    TeamSpec("haiti", "Haiti", ("Haiti", "HaitÃ­")),
+    TeamSpec("scotland", "Scotland", ("Scotland", "Escocia")),
+    TeamSpec(
+        "saudi_arabia",
+        "Saudi Arabia",
+        ("Saudi Arabia", "Arabia SaudÃ­", "Arabia Saudita"),
+    ),
+    TeamSpec("cape_verde", "Cape Verde", ("Cape Verde", "Cabo Verde")),
+    TeamSpec(
+        "dr_congo",
+        "DR Congo",
+        ("DR Congo", "RD Congo", "Democratic Republic of the Congo"),
+    ),
+    TeamSpec("panama", "Panama", ("Panama", "PanamÃ¡")),
+    TeamSpec("uruguay", "Uruguay", ("Uruguay",)),
+    TeamSpec("uzbekistan", "Uzbekistan", ("Uzbekistan", "UzbekistÃ¡n")),
+)
+
+
+TEAM_ALIASES: Dict[str, tuple[str, ...]] = {
+    spec.team_norm: spec.aliases for spec in TEAM_SPECS
+}
+TEAM_NAME_MAP: Dict[str, str] = {}
 TEAM_SEARCH_PREFERENCE: Dict[str, str] = {
-    "mexico": "Mexico",
-    "south_africa": "South Africa",
-    "south_korea": "South Korea",
-    "czech_republic": "Czech Republic",
-    "canada": "Canada",
-    "usa": "United States",
-    "paraguay": "Paraguay",
-    "qatar": "Qatar",
-    "switzerland": "Switzerland",
-    "bosnia_herzegovina": "Bosnia",
-    "brazil": "Brazil",
-    "algeria": "Algeria",
-    "iran": "Iran",
-    "ivory_coast": "Ivory Coast",
-    "netherlands": "Netherlands",
-    "curacao": "Curacao",
-    "tunisia": "Tunisia",
-    "turkey": "Turkey",
-    "australia": "Australia",
-    "morocco": "Morocco",
-    "haiti": "Haiti",
-    "scotland": "Scotland",
-    "saudi_arabia": "Saudi Arabia",
-    "cape_verde": "Cape Verde",
-    "dr_congo": "DR Congo",
-    "panama": "Panama",
+    spec.team_norm: spec.preferred_search_name for spec in TEAM_SPECS
 }
-
-NORMALIZED_TEAM_MAP = {unidecode(key).lower(): value for key, value in TEAM_NAME_MAP.items()}
 
 
 def fix_common_mojibake(value: str) -> str:
@@ -143,26 +137,67 @@ def normalize_text(value: str) -> str:
     return text
 
 
-def normalize_team_name(value: str) -> str:
+def _question_mark_variant(value: str) -> str:
+    return "".join("?" if ord(char) > 127 else char for char in value)
+
+
+def _alias_variants(alias: str) -> set[str]:
+    repaired = fix_common_mojibake(alias)
+    variants = {
+        alias.strip(),
+        repaired.strip(),
+        unidecode(repaired).strip(),
+    }
+    if any(ord(char) > 127 for char in repaired):
+        variants.add(_question_mark_variant(repaired).strip())
+    return {variant for variant in variants if variant}
+
+
+for spec in TEAM_SPECS:
+    for alias in spec.aliases:
+        for variant in _alias_variants(alias):
+            TEAM_NAME_MAP[variant] = spec.team_norm
+
+
+NORMALIZED_TEAM_MAP = {
+    normalize_text(alias): team_norm
+    for alias, team_norm in TEAM_NAME_MAP.items()
+}
+KNOWN_TEAM_NORMS = frozenset(spec.team_norm for spec in TEAM_SPECS)
+
+
+def normalize_team_name(
+    value: str,
+    *,
+    strict: bool = False,
+    context: str | None = None,
+) -> str:
     stripped = fix_common_mojibake((value or "").strip())
     if stripped in TEAM_NAME_MAP:
         return TEAM_NAME_MAP[stripped]
 
-    ascii_key = unidecode(stripped).lower()
-    if ascii_key in NORMALIZED_TEAM_MAP:
-        return NORMALIZED_TEAM_MAP[ascii_key]
+    ascii_key = unidecode(stripped).strip()
+    if ascii_key in TEAM_NAME_MAP:
+        return TEAM_NAME_MAP[ascii_key]
 
     normalized = normalize_text(stripped)
     if normalized in NORMALIZED_TEAM_MAP:
         return NORMALIZED_TEAM_MAP[normalized]
 
-    if normalized:
-        compact = normalized.replace("_", "")
-        choices = {normalize_text(key).replace("_", ""): norm for key, norm in TEAM_NAME_MAP.items()}
-        match = process.extractOne(compact, list(choices.keys()), scorer=fuzz.ratio, score_cutoff=72)
-        if match:
-            return choices[match[0]]
+    if strict:
+        raise UnknownTeamNameError(stripped or value, context=context)
     return normalized
+
+
+def require_known_team_name(value: str, *, context: str | None = None) -> str:
+    return normalize_team_name(value, strict=True, context=context)
+
+
+def is_known_team_name(value: str) -> bool:
+    try:
+        return normalize_team_name(value, strict=True) in KNOWN_TEAM_NORMS
+    except UnknownTeamNameError:
+        return False
 
 
 def preferred_team_search_name(value: str) -> str:

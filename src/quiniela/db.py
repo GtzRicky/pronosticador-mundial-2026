@@ -342,6 +342,9 @@ SCHEMA_STATEMENTS = [
         kickoff_at TEXT NOT NULL,
         window_label TEXT NOT NULL,
         channel TEXT NOT NULL,
+        notification_type TEXT NOT NULL DEFAULT 'prediction_window',
+        team_norm TEXT,
+        lineup_hash TEXT,
         prediction_id INTEGER,
         scheduled_for TEXT NOT NULL,
         payload_json TEXT,
@@ -575,6 +578,14 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
     for column_name, column_def in prediction_columns.items():
         _ensure_column(connection, "predictions", column_name, column_def)
 
+    notification_columns = {
+        "notification_type": "notification_type TEXT NOT NULL DEFAULT 'prediction_window'",
+        "team_norm": "team_norm TEXT",
+        "lineup_hash": "lineup_hash TEXT",
+    }
+    for column_name, column_def in notification_columns.items():
+        _ensure_column(connection, "notification_deliveries", column_name, column_def)
+
     _ensure_column(
         connection,
         "prediction_player_impacts",
@@ -622,6 +633,12 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_notification_due
             ON notification_deliveries(status, next_attempt_at, kickoff_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_official_open
+            ON notification_deliveries(notification_type, match_id, team_norm, status, created_at)
             """
         )
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import hashlib
 import json
 import sqlite3
 from typing import Any
@@ -13,12 +14,15 @@ import requests
 
 from quiniela.config import Settings, get_settings
 from quiniela.db import get_connection
+from quiniela.name_maps import normalize_team_name, normalize_text
 
 
 NOTIFICATION_WINDOWS = (15, 5)
 RETRY_DELAYS_MINUTES = (1, 2, 4, 5)
 OPEN_STATUSES = ("pending", "waiting_prediction", "retry", "sending")
 TERMINAL_MATCH_STATUSES = {"FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
+PREDICTION_WINDOW_NOTIFICATION = "prediction_window"
+OFFICIAL_LINEUP_NOTIFICATION = "official_lineup"
 
 
 @dataclass(frozen=True)
@@ -90,7 +94,7 @@ class NtfyAdapter:
         url = f"{self.settings.ntfy_server_url}/{topic}"
         headers = {
             "Title": str(payload["title"]),
-            "Priority": "5" if payload["window_label"] == "t-5" else "4",
+            "Priority": str(payload.get("priority") or ("5" if payload["window_label"] == "t-5" else "4")),
             "Tags": "soccer",
         }
         try:
@@ -121,7 +125,7 @@ class DiscordAdapter:
         self.session = session or requests.Session()
 
     def send(self, payload: dict[str, Any], now: datetime) -> DeliveryResult:
-        fields = [
+        fields = payload.get("fields") or [
             {"name": "Poisson", "value": payload["poisson"], "inline": True},
             {"name": "Hibrido", "value": payload["hybrid"], "inline": True},
             {"name": "1-X-2", "value": payload["outcomes"], "inline": False},
@@ -135,7 +139,10 @@ class DiscordAdapter:
                 {
                     "title": payload["title"],
                     "description": payload["kickoff"],
-                    "color": 0xD97706 if payload["window_label"] == "t-5" else 0x2563EB,
+                    "color": int(
+                        payload.get("color")
+                        or (0xD97706 if payload["window_label"] == "t-5" else 0x2563EB)
+                    ),
                     "fields": fields,
                 }
             ],
@@ -173,6 +180,110 @@ def _configured_channels(settings: Settings) -> tuple[list[str], list[str]]:
 
 def _window_minutes(window_label: str) -> int:
     return int(window_label.removeprefix("t-"))
+
+
+def _starting_xi_names(payload: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for player_row in payload.get("startXI") or []:
+        name = str(player_row.get("player", {}).get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def official_lineup_hash(payload: dict[str, Any]) -> str | None:
+    normalized_names = [
+        normalize_text(name)
+        for name in _starting_xi_names(payload)
+        if normalize_text(name)
+    ]
+    if len(normalized_names) < 11:
+        return None
+    return hashlib.sha256("|".join(normalized_names).encode("utf-8")).hexdigest()
+
+
+def queue_official_lineup_notifications(
+    connection: sqlite3.Connection,
+    *,
+    match_id: str,
+    kickoff_at: str,
+    lineups_payload: dict[str, Any],
+    now: datetime | None = None,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    if not settings.notifications_enabled:
+        return {"enabled": False, "scheduled": 0, "superseded": 0, "errors": []}
+
+    channels, errors = _configured_channels(settings)
+    if not channels:
+        return {"enabled": True, "scheduled": 0, "superseded": 0, "errors": errors}
+
+    local_tz = ZoneInfo(settings.local_timezone)
+    local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
+    now_iso = _utc_iso(local_now)
+    scheduled = 0
+    superseded = 0
+
+    for lineup in lineups_payload.get("response", []):
+        team_name = str(lineup.get("team", {}).get("name") or "").strip()
+        team_norm = normalize_team_name(team_name)
+        lineup_hash = official_lineup_hash(lineup)
+        if not team_norm or lineup_hash is None:
+            continue
+        window_label = f"official:{team_norm}:{lineup_hash[:12]}"
+        for channel in channels:
+            with connection:
+                superseded += connection.execute(
+                    """
+                    UPDATE notification_deliveries
+                    SET status = 'superseded',
+                        error_code = 'official_lineup_updated',
+                        updated_at = ?
+                    WHERE notification_type = ?
+                      AND match_id = ?
+                      AND channel = ?
+                      AND team_norm = ?
+                      AND status IN ('pending', 'waiting_prediction', 'retry', 'sending')
+                      AND lineup_hash <> ?
+                    """,
+                    (
+                        now_iso,
+                        OFFICIAL_LINEUP_NOTIFICATION,
+                        match_id,
+                        channel,
+                        team_norm,
+                        lineup_hash,
+                    ),
+                ).rowcount
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        match_id, kickoff_at, window_label, channel,
+                        notification_type, team_norm, lineup_hash, scheduled_for,
+                        status, next_attempt_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        match_id,
+                        kickoff_at,
+                        window_label,
+                        channel,
+                        OFFICIAL_LINEUP_NOTIFICATION,
+                        team_norm,
+                        lineup_hash,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+            scheduled += int(cursor.rowcount > 0)
+
+    return {
+        "enabled": True,
+        "scheduled": scheduled,
+        "superseded": superseded,
+        "errors": errors,
+    }
 
 
 def schedule_due_notifications(
@@ -239,9 +350,10 @@ def schedule_due_notifications(
             FROM notification_deliveries
             WHERE match_id = ?
               AND kickoff_at = ?
+              AND notification_type = ?
               AND status IN ('pending', 'waiting_prediction', 'retry', 'sending')
             """,
-            (str(match["match_id"]), kickoff_at),
+            (str(match["match_id"]), kickoff_at, PREDICTION_WINDOW_NOTIFICATION),
         ).fetchall()
         older_ids = [
             int(row["id"])
@@ -269,14 +381,15 @@ def schedule_due_notifications(
                     """
                     INSERT OR IGNORE INTO notification_deliveries (
                         match_id, kickoff_at, window_label, channel,
-                        scheduled_for, status, next_attempt_at
-                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                        notification_type, scheduled_for, status, next_attempt_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
                     """,
                     (
                         str(match["match_id"]),
                         kickoff_at,
                         window_label,
                         channel,
+                        PREDICTION_WINDOW_NOTIFICATION,
                         scheduled_for,
                         now_iso,
                     ),
@@ -310,13 +423,12 @@ def _percentage(value: Any) -> str:
     return f"{float(value):.1%}"
 
 
-def _latest_prediction_payload(
+def _latest_prediction_row(
     connection: sqlite3.Connection,
     match_id: str,
     now: datetime,
-    window_label: str,
-) -> tuple[int, dict[str, Any]] | None:
-    row = connection.execute(
+) -> sqlite3.Row | None:
+    return connection.execute(
         """
         SELECT
             p.id AS prediction_id,
@@ -349,9 +461,9 @@ def _latest_prediction_payload(
         """,
         (match_id, _utc_iso(now)),
     ).fetchone()
-    if row is None:
-        return None
 
+
+def _prediction_summary_from_row(row: sqlite3.Row) -> dict[str, str]:
     source = json.loads(row["source_json"] or "{}")
     poisson = (
         f"{row['predicted_score']} "
@@ -377,35 +489,149 @@ def _latest_prediction_payload(
         f"{row['model_version']} / "
         f"{row['outcome_model_version'] or 'Poisson fallback'}"
     )
-    title = (
-        f"Pronostico {window_label.upper()}: "
-        f"{row['home_team']} vs {row['away_team']}"
-    )
     kickoff = f"Inicio: {row['time_cdmx']} (America/Mexico_City)"
-    message = "\n".join(
-        [
-            kickoff,
-            f"Poisson: {poisson}",
-            f"Hibrido: {hybrid}",
-            f"1-X-2: {outcomes}",
-            f"Alineaciones: {lineups}",
-            f"Frescura: {freshness}",
-            f"Modelos: {models}",
-        ]
-    )
-    payload = {
-        "title": title,
-        "message": message,
-        "window_label": window_label,
-        "kickoff": kickoff,
+    return {
         "poisson": poisson,
         "hybrid": hybrid,
         "outcomes": outcomes,
         "lineups": lineups,
         "freshness": freshness,
         "models": models,
+        "kickoff": kickoff,
+    }
+
+
+def _latest_prediction_payload(
+    connection: sqlite3.Connection,
+    match_id: str,
+    now: datetime,
+    window_label: str,
+) -> tuple[int, dict[str, Any]] | None:
+    row = _latest_prediction_row(connection, match_id, now)
+    if row is None:
+        return None
+
+    summary = _prediction_summary_from_row(row)
+    title = (
+        f"Pronostico {window_label.upper()}: "
+        f"{row['home_team']} vs {row['away_team']}"
+    )
+    message = "\n".join(
+        [
+            summary["kickoff"],
+            f"Poisson: {summary['poisson']}",
+            f"Hibrido: {summary['hybrid']}",
+            f"1-X-2: {summary['outcomes']}",
+            f"Alineaciones: {summary['lineups']}",
+            f"Frescura: {summary['freshness']}",
+            f"Modelos: {summary['models']}",
+        ]
+    )
+    payload = {
+        "title": title,
+        "message": message,
+        "window_label": window_label,
+        "notification_type": PREDICTION_WINDOW_NOTIFICATION,
+        **summary,
     }
     return int(row["prediction_id"]), payload
+
+
+def _official_lineup_payload(
+    connection: sqlite3.Connection,
+    match_id: str,
+    team_norm: str,
+    lineup_hash: str,
+    now: datetime,
+    window_label: str,
+) -> dict[str, Any]:
+    match = connection.execute(
+        """
+        SELECT
+            m.match_id,
+            m.home_team,
+            m.away_team,
+            m.home_team_norm,
+            m.away_team_norm,
+            m.api_fixture_id,
+            m.time_cdmx
+        FROM matches m
+        WHERE m.match_id = ?
+        """,
+        (match_id,),
+    ).fetchone()
+    if match is None or match["api_fixture_id"] is None:
+        return {"status": "lineup_missing"}
+
+    fixture_id = str(int(match["api_fixture_id"]))
+    lineup_row = connection.execute(
+        """
+        SELECT source_json
+        FROM historical_lineups
+        WHERE fixture_id = ? AND team_norm = ?
+        """,
+        (fixture_id, team_norm),
+    ).fetchone()
+    if lineup_row is None:
+        return {"status": "lineup_missing"}
+
+    lineup_payload = json.loads(lineup_row["source_json"] or "{}")
+    current_hash = official_lineup_hash(lineup_payload)
+    if current_hash is None:
+        return {"status": "lineup_missing"}
+    if current_hash != lineup_hash:
+        return {"status": "lineup_changed"}
+
+    prediction_row = _latest_prediction_row(connection, match_id, now)
+    if prediction_row is None:
+        return {"status": "prediction_missing"}
+
+    if team_norm == str(match["home_team_norm"]):
+        team_name = str(match["home_team"])
+        opponent = str(match["away_team"])
+    else:
+        team_name = str(match["away_team"])
+        opponent = str(match["home_team"])
+    starters = _starting_xi_names(lineup_payload)
+    summary = _prediction_summary_from_row(prediction_row)
+    xi_text = ", ".join(starters)
+    message = "\n".join(
+        [
+            summary["kickoff"],
+            f"Rival: {opponent}",
+            f"XI oficial {team_name}: {xi_text}",
+            f"Mini pronostico: Poisson {summary['poisson']}",
+            f"Hibrido: {summary['hybrid']}",
+            f"1-X-2: {summary['outcomes']}",
+        ]
+    )
+    payload = {
+        "title": f"Alineacion oficial: {team_name}",
+        "message": message,
+        "window_label": window_label,
+        "notification_type": OFFICIAL_LINEUP_NOTIFICATION,
+        "kickoff": f"{summary['kickoff']}\nVs {opponent}",
+        "poisson": summary["poisson"],
+        "hybrid": summary["hybrid"],
+        "outcomes": summary["outcomes"],
+        "lineups": summary["lineups"],
+        "freshness": summary["freshness"],
+        "models": summary["models"],
+        "priority": "4",
+        "color": 0x16A34A,
+        "fields": [
+            {"name": "Rival", "value": opponent, "inline": True},
+            {"name": "Poisson", "value": summary["poisson"], "inline": True},
+            {"name": "Hibrido", "value": summary["hybrid"], "inline": True},
+            {"name": "1-X-2", "value": summary["outcomes"], "inline": False},
+            {"name": f"XI oficial {team_name}", "value": xi_text, "inline": False},
+        ],
+    }
+    return {
+        "status": "ready",
+        "prediction_id": int(prediction_row["prediction_id"]),
+        "payload": payload,
+    }
 
 
 def _adapter(
@@ -494,12 +720,45 @@ def dispatch_notifications(
         if claimed.rowcount == 0:
             continue
 
-        prediction = _latest_prediction_payload(
-            connection,
-            str(row["match_id"]),
-            local_now,
-            str(row["window_label"]),
+        notification_type = str(
+            row["notification_type"] or PREDICTION_WINDOW_NOTIFICATION
         )
+        if notification_type == OFFICIAL_LINEUP_NOTIFICATION:
+            official = _official_lineup_payload(
+                connection,
+                str(row["match_id"]),
+                str(row["team_norm"] or ""),
+                str(row["lineup_hash"] or ""),
+                local_now,
+                str(row["window_label"]),
+            )
+            if official["status"] == "lineup_changed":
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE notification_deliveries
+                        SET status = 'superseded',
+                            error_code = 'official_lineup_updated',
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso, int(row["id"])),
+                    )
+                continue
+            prediction = (
+                None
+                if official["status"] == "prediction_missing"
+                else (official.get("prediction_id"), official.get("payload"))
+                if official["status"] == "ready"
+                else None
+            )
+        else:
+            prediction = _latest_prediction_payload(
+                connection,
+                str(row["match_id"]),
+                local_now,
+                str(row["window_label"]),
+            )
         if prediction is None:
             next_attempt = min(
                 local_now + timedelta(minutes=1),

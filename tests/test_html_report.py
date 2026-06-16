@@ -1,3 +1,6 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from quiniela.html_report import extract_lineup_players, render_predictions_html
 
 
@@ -87,6 +90,17 @@ def test_render_predictions_html_shows_predicted_and_pending_actual() -> None:
     assert "Jugador 1" in html
     assert "Player 12" in html
     assert "Top impactos" in html
+
+
+def test_render_predictions_html_shows_last_updated_in_cdmx() -> None:
+    html = render_predictions_html(
+        [],
+        {},
+        {},
+        generated_at=datetime(2026, 6, 13, 18, 45, tzinfo=ZoneInfo("America/Mexico_City")),
+    )
+
+    assert "Ultima actualizacion: 2026-06-13 18:45:00 CDMX" in html
 
 
 def test_render_predictions_html_labels_web_estimated_lineup() -> None:
