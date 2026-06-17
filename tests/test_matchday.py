@@ -84,6 +84,40 @@ def test_runner_is_idempotent_and_records_failures(tmp_path: Path) -> None:
     assert result["failed"]
 
 
+def test_runner_refresh_failure_keeps_degraded_outputs(tmp_path: Path, monkeypatch) -> None:
+    connection = get_connection(tmp_path / "degraded.sqlite")
+    calls = []
+
+    def rebuild_outputs(*, connection, now=None):
+        calls.append(("rebuild", now))
+        return {"latest_rows": 0}
+
+    monkeypatch.setattr("quiniela.matchday.rebuild_outputs", rebuild_outputs)
+
+    runner = MatchdayRunner(
+        connection=connection,
+        refresh=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network down")),
+        predict=lambda date: calls.append(("predict", date)) or {"ok": True},
+        sync_results=lambda *args, **kwargs: {"updated": 0},
+        finalize_evidence=lambda *args, **kwargs: {},
+        notification_cycle=lambda **kwargs: {},
+    )
+    runner._load_relevant_matches = lambda now: []
+
+    result = runner.run(datetime(2026, 6, 13, 10, 1, tzinfo=TZ))
+
+    failed_runs = connection.execute(
+        "SELECT status, details_json FROM automation_runs ORDER BY id"
+    ).fetchall()
+
+    assert not result["completed"]
+    assert len(result["failed"]) == 2
+    assert calls.count(("rebuild", datetime(2026, 6, 13, 10, 1, tzinfo=TZ))) == 2
+    assert all(row["status"] == "failed" for row in failed_runs)
+    assert all("degraded_outputs" in row["details_json"] for row in failed_runs)
+    assert all("network down" in row["details_json"] for row in failed_runs)
+
+
 def test_hourly_run_syncs_new_final_result_and_fetches_final_data(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "hourly-final.sqlite")
     calls = []

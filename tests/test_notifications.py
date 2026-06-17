@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 import requests
 
 from quiniela.config import get_settings
+import quiniela.historical_loader as historical_loader
+import quiniela.notifications as notifications_module
 from quiniela.db import get_connection
 from quiniela.notifications import (
     dispatch_notifications,
@@ -577,6 +579,134 @@ def test_changed_official_lineup_after_sent_creates_new_delivery(tmp_path: Path)
     assert second_result["sent"] == 1
     assert [row["status"] for row in rows] == ["sent", "sent"]
     assert rows[0]["lineup_hash"] != rows[1]["lineup_hash"]
+
+
+def test_fetch_today_data_stores_and_dispatches_official_lineups(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "refresh.sqlite"
+    settings = _settings(
+        db_path=db_path,
+        outputs_dir=tmp_path / "outputs",
+        bundles_dir=tmp_path / "outputs" / "bundles",
+        predictions_dir=tmp_path / "outputs" / "predictions",
+        logs_dir=tmp_path / "outputs" / "logs",
+        data_dir=tmp_path / "data",
+        raw_dir=tmp_path / "data" / "raw",
+        processed_dir=tmp_path / "data" / "processed",
+        db_dir=tmp_path / "data" / "db",
+        public_dir=tmp_path / "data" / "public",
+        model_artifacts_dir=tmp_path / "data" / "processed" / "model_artifacts",
+    )
+    _seed_match(get_connection(db_path))
+    _seed_prediction(get_connection(db_path))
+
+    fixture = {
+        "fixture": {
+            "id": 123,
+            "date": "2026-06-13T19:00:00+00:00",
+            "status": {"short": "NS"},
+        },
+        "teams": {
+            "home": {"name": "Mexico"},
+            "away": {"name": "Canada"},
+        },
+        "league": {"name": "World Cup"},
+        "goals": {"home": None, "away": None},
+    }
+    lineups_payload = {
+        "response": [
+            _official_lineup_payload("Mexico"),
+            _official_lineup_payload("Canada"),
+        ]
+    }
+    queue_now = datetime(2026, 6, 13, 12, 40, tzinfo=TZ)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return queue_now.replace(tzinfo=None)
+            return queue_now.astimezone(tz)
+
+    class FakeAPIFootballClient:
+        def __init__(self, settings=None, dry_run=False, force_refresh=False, session=None):
+            self.settings = settings
+            self.connection = get_connection(settings.db_path)
+
+        def get_fixtures(self, **params):
+            if params.get("date") == "2026-06-13":
+                return {"response": [fixture]}
+            return {"response": []}
+
+        def get_fixture_lineups(self, fixture_id):
+            assert str(fixture_id) == "123"
+            return lineups_payload
+
+    monkeypatch.setattr(historical_loader, "APIFootballClient", FakeAPIFootballClient)
+    monkeypatch.setattr("quiniela.output_manager.rebuild_outputs", lambda **kwargs: None)
+    monkeypatch.setattr(historical_loader, "get_settings", lambda: settings)
+    monkeypatch.setattr(notifications_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(notifications_module, "datetime", FrozenDateTime)
+
+    refresh_result = historical_loader.fetch_today_data("2026-06-13", fetch_mode="lineups")
+
+    rows = get_connection(db_path).execute(
+        """
+        SELECT fixture_id, team_norm, source_json
+        FROM historical_lineups
+        ORDER BY team_norm
+        """
+    ).fetchall()
+    deliveries = get_connection(db_path).execute(
+        """
+        SELECT channel, team_norm, notification_type, status, payload_json
+        FROM notification_deliveries
+        ORDER BY id
+        """
+    ).fetchall()
+    assert refresh_result["fixtures"] == 1
+    assert refresh_result["lineups"] == 2
+    assert refresh_result["official_lineup_notifications"] == 4
+    assert [(row["fixture_id"], row["team_norm"]) for row in rows] == [
+        ("123", "canada"),
+        ("123", "mexico"),
+    ]
+    assert len(deliveries) == 4
+    assert {(row["notification_type"], row["status"]) for row in deliveries} == {
+        ("official_lineup", "pending"),
+    }
+
+    ntfy = FakeSession(FakeResponse(200), FakeResponse(200))
+    discord = FakeSession(FakeResponse(204), FakeResponse(204))
+    dispatch_result = dispatch_notifications(
+        get_connection(db_path),
+        now=queue_now,
+        settings=settings,
+        sessions={"ntfy": ntfy, "discord": discord},
+    )
+
+    sent_rows = get_connection(db_path).execute(
+        """
+        SELECT channel, team_norm, status, payload_json
+        FROM notification_deliveries
+        ORDER BY id
+        """
+    ).fetchall()
+    assert dispatch_result["sent"] == 4
+    assert [call["headers"]["Title"] for call in ntfy.calls] == [
+        "Alineacion oficial: Mexico",
+        "Alineacion oficial: Canada",
+    ]
+    assert [call["json"]["embeds"][0]["title"] for call in discord.calls] == [
+        "Alineacion oficial: Mexico",
+        "Alineacion oficial: Canada",
+    ]
+    assert all(row["status"] == "sent" for row in sent_rows)
+    assert "XI oficial Mexico" in sent_rows[0]["payload_json"]
+    assert "Mini pronostico" in sent_rows[0]["payload_json"]
+    assert "Rival" in discord.calls[0]["json"]["embeds"][0]["fields"][0]["name"]
 
 
 def test_manual_test_messages_do_not_require_global_switch(tmp_path: Path) -> None:

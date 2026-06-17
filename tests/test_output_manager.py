@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from quiniela.db import (
+    claim_automation_run,
+    finish_automation_run,
     get_connection,
     insert_prediction_player_impacts,
     insert_prediction_rows,
@@ -198,3 +200,42 @@ def test_cleanup_obsolete_outputs_has_dry_run_and_apply(
     assert applied["count"] == 1
     assert not obsolete.exists()
     assert stable.exists()
+
+
+def test_automation_status_marks_failed_run_with_degraded_outputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(outputs, "get_settings", lambda: settings)
+    connection = get_connection(settings.db_path)
+    claim_automation_run(
+        connection,
+        run_key="hourly:2026-06-13T10",
+        action="hourly",
+        scheduled_for="2026-06-13T10:00:00-06:00",
+        details={"action": "hourly"},
+    )
+    finish_automation_run(
+        connection,
+        "hourly:2026-06-13T10",
+        "failed",
+        {
+            "error": "scheduled team mismatch",
+            "degraded_outputs": {"source": "sqlite_latest", "latest_rows": 1},
+            "retrieval_issues": [
+                {
+                    "reason": "scheduled_team_mismatch",
+                    "fixture_id": "123",
+                    "raw_home_team": "Mexico",
+                    "raw_away_team": "Panama",
+                }
+            ],
+        },
+    )
+
+    outputs.write_automation_status(connection)
+
+    content = (settings.logs_dir / "automation_status.md").read_text(encoding="utf-8")
+    assert "outputs rebuilt from sqlite_latest" in content
+    assert "scheduled_team_mismatch" in content

@@ -98,7 +98,7 @@ TEAM_SPECS: tuple[TeamSpec, ...] = (
     TeamSpec(
         "dr_congo",
         "DR Congo",
-        ("DR Congo", "RD Congo", "Democratic Republic of the Congo"),
+        ("DR Congo", "RD Congo", "Congo DR", "Democratic Republic of the Congo"),
     ),
     TeamSpec("panama", "Panama", ("Panama", "PanamÃ¡")),
     TeamSpec("uruguay", "Uruguay", ("Uruguay",)),

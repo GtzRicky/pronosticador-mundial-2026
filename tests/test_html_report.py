@@ -1,7 +1,27 @@
 from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from quiniela.html_report import extract_lineup_players, render_predictions_html
+from quiniela.db import get_connection, insert_pre_match_snapshot
+from quiniela.html_report import (
+    build_predictions_html_report,
+    extract_lineup_players,
+    render_predictions_html,
+)
+
+
+def _settings(tmp_path: Path) -> SimpleNamespace:
+    predictions = tmp_path / "predictions"
+    logs = tmp_path / "logs"
+    predictions.mkdir()
+    logs.mkdir()
+    return SimpleNamespace(
+        db_path=tmp_path / "report.sqlite",
+        predictions_dir=predictions,
+        logs_dir=logs,
+        local_timezone="America/Mexico_City",
+    )
 
 
 def test_extract_lineup_players_maps_number_and_position() -> None:
