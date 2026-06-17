@@ -247,6 +247,43 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
+### Arranque rápido para un clon nuevo
+
+Para el escenario operativo normal, un usuario nuevo sólo necesita clonar el
+repo, crear el entorno, llenar `.env` y dejar instalada la tarea de Windows. El
+agente de IA puede seguir esta secuencia:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+Edita `.env` y configura al menos:
+
+```dotenv
+API_FOOTBALL_KEY=TU_API_KEY
+NOTIFICATIONS_ENABLED=true
+NTFY_ENABLED=true
+NTFY_TOPIC=TU_TOPIC_PRIVADO
+```
+
+Inicializa la base y verifica que los comandos locales funcionan:
+
+```powershell
+python scripts/03_init_db.py
+python scripts/22_rebuild_outputs.py
+python scripts/26_test_notifications.py --channel ntfy
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1
+```
+
+El instalador de Task Scheduler usa automáticamente
+`.\.venv\Scripts\python.exe` cuando existe. Si no encuentra `.venv`, usa el
+`python` disponible en `PATH` y lo muestra en `-DryRun`.
+
 Variables de entorno:
 
 - `API_FOOTBALL_KEY`
@@ -397,7 +434,9 @@ python scripts/15_run_matchday.py --now 2026-06-13T12:59:00-06:00
 ### Notificaciones prepartido con ntfy y Discord
 
 La misma tarea por minuto puede enviar el pronostico en `T-15` y `T-5`.
-No se instala otra tarea y estas entregas no consumen cuota de API-Football.
+Tambien envia una push inmediata por seleccion cuando API-Football publica un
+`startXI` oficial completo de 11 titulares. No se instala otra tarea y estas
+entregas no consumen cuota adicional de API-Football fuera del refresh normal.
 
 Los dos canales estan desactivados por defecto. Primero genera localmente un
 topico ntfy dificil de adivinar:
@@ -447,11 +486,13 @@ Cuando ambas pruebas funcionen, cambia:
 NOTIFICATIONS_ENABLED=true
 ```
 
-El mensaje incluye hora CDMX, Poisson, hibrido, probabilidades `1-X-2`,
-fuentes de alineacion, frescura y versiones del modelo. No incluye enlaces
-publicos. Si la PC despierta tarde, solo se envia la ventana pendiente mas
-reciente. Los errores `408`, `429`, `5xx` y de red se reintentan antes del
-kickoff; un fallo de ntfy o Discord nunca detiene el pronostico.
+El mensaje de pronostico incluye hora CDMX, Poisson, hibrido, probabilidades
+`1-X-2`, fuentes de alineacion, frescura y versiones del modelo. La push de
+alineacion oficial incluye rival, hora CDMX, XI oficial y mini pronostico del
+partido. No incluye enlaces publicos. Si la PC despierta tarde, solo se envia la
+ventana pendiente mas reciente. Los errores `408`, `429`, `5xx` y de red se
+reintentan antes del kickoff; un fallo de ntfy o Discord nunca detiene el
+pronostico.
 
 La outbox `notification_deliveries` registra estados e intentos sin guardar el
 topico ntfy ni la URL del webhook. El despacho manual de entregas pendientes es:

@@ -79,3 +79,52 @@ def test_claim_automation_run_is_idempotent(tmp_path: Path) -> None:
     assert duplicate is False
     assert row["status"] == "completed"
     assert '"fixtures": 3' in row["details_json"]
+
+
+def test_claim_automation_run_recovers_stale_running_claim(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "automation-stale.sqlite")
+    run_key = "daily:2026-06-13"
+
+    claimed = claim_automation_run(
+        connection,
+        run_key=run_key,
+        action="daily",
+        scheduled_for="2026-06-13T00:00:00-06:00",
+        details={"attempt": 1},
+    )
+    fresh_duplicate = claim_automation_run(
+        connection,
+        run_key=run_key,
+        action="daily",
+        scheduled_for="2026-06-13T00:00:00-06:00",
+        details={"attempt": 2},
+    )
+    with connection:
+        connection.execute(
+            """
+            UPDATE automation_runs
+            SET started_at = datetime('now', '-31 minutes')
+            WHERE run_key = ?
+            """,
+            (run_key,),
+        )
+
+    reclaimed = claim_automation_run(
+        connection,
+        run_key=run_key,
+        action="daily",
+        scheduled_for="2026-06-13T00:00:00-06:00",
+        details={"attempt": 3},
+        stale_after_minutes=25,
+    )
+    row = connection.execute(
+        "SELECT status, details_json, finished_at FROM automation_runs WHERE run_key = ?",
+        (run_key,),
+    ).fetchone()
+
+    assert claimed is True
+    assert fresh_duplicate is False
+    assert reclaimed is True
+    assert row["status"] == "running"
+    assert '"attempt": 3' in row["details_json"]
+    assert row["finished_at"] is None
