@@ -188,6 +188,46 @@ def _load_prediction_impacts(
     return impacts
 
 
+def _fill_snapshot_impacts(
+    connection: sqlite3.Connection,
+    match_rows: list[dict[str, Any]],
+    impacts: dict[tuple[str, str], list[dict[str, Any]]],
+) -> None:
+    for row in match_rows:
+        match_id = str(row["match_id"])
+        expected_teams = {
+            normalize_team_name(str(row["home_team"])),
+            normalize_team_name(str(row["away_team"])),
+        }
+        if all((match_id, team_norm) in impacts for team_norm in expected_teams):
+            continue
+        snapshot = connection.execute(
+            """
+            SELECT id
+            FROM pre_match_snapshots
+            WHERE match_id = ?
+              AND julianday(captured_at) < julianday(kickoff_at)
+            ORDER BY julianday(captured_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (match_id,),
+        ).fetchone()
+        if snapshot is None:
+            continue
+        players = connection.execute(
+            """
+            SELECT team_norm, features_json
+            FROM pre_match_player_snapshots
+            WHERE snapshot_id = ?
+            ORDER BY net_impact DESC, id
+            """,
+            (int(snapshot["id"]),),
+        ).fetchall()
+        for player in players:
+            key = (match_id, str(player["team_norm"]))
+            impacts.setdefault(key, []).append(json.loads(player["features_json"]))
+
+
 def _render_impact_summary(impacts: list[dict[str, Any]]) -> str:
     if not impacts:
         return '<p class="impact-empty">Sin desglose de impacto disponible todavía.</p>'
@@ -944,6 +984,7 @@ def build_predictions_html_report(dates: list[str], output_path: Path | None = N
             fixture_ids.append(str(int(fixture_id)))
     lineups_by_fixture = _load_lineups_by_fixture(connection, sorted(set(fixture_ids)))
     impacts_by_match_team = _load_prediction_impacts(connection, [str(row["match_id"]) for row in match_rows])
+    _fill_snapshot_impacts(connection, match_rows, impacts_by_match_team)
     html = render_predictions_html(
         match_rows,
         lineups_by_fixture,

@@ -16,9 +16,9 @@ from quiniela.db import fetch_dataframe, get_connection
 from quiniela.html_report import (
     _load_lineups_by_fixture,
     _load_prediction_impacts,
+    _fill_snapshot_impacts,
     render_predictions_html,
 )
-from quiniela.name_maps import normalize_team_name
 from quiniela.outcome_model import load_outcome_model_artifact
 
 
@@ -349,46 +349,6 @@ def _html_rows(
     return sorted(rows, key=lambda row: (row["datetime_cdmx"], row["home_team"]))
 
 
-def _fill_snapshot_impacts(
-    connection: sqlite3.Connection,
-    rows: list[dict[str, Any]],
-    impacts: dict[tuple[str, str], list[dict[str, Any]]],
-) -> None:
-    for row in rows:
-        match_id = str(row["match_id"])
-        expected_teams = {
-            normalize_team_name(str(row["home_team"])),
-            normalize_team_name(str(row["away_team"])),
-        }
-        if all((match_id, team_norm) in impacts for team_norm in expected_teams):
-            continue
-        snapshot = connection.execute(
-            """
-            SELECT id
-            FROM pre_match_snapshots
-            WHERE match_id = ?
-              AND julianday(captured_at) < julianday(kickoff_at)
-            ORDER BY julianday(captured_at) DESC, id DESC
-            LIMIT 1
-            """,
-            (match_id,),
-        ).fetchone()
-        if snapshot is None:
-            continue
-        players = connection.execute(
-            """
-            SELECT team_norm, features_json
-            FROM pre_match_player_snapshots
-            WHERE snapshot_id = ?
-            ORDER BY net_impact DESC, id
-            """,
-            (int(snapshot["id"]),),
-        ).fetchall()
-        for player in players:
-            key = (match_id, str(player["team_norm"]))
-            impacts.setdefault(key, []).append(json.loads(player["features_json"]))
-
-
 def _write_data_quality(connection: sqlite3.Connection, path: Path) -> None:
     row = connection.execute(
         """
@@ -564,17 +524,28 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
         "",
         "## Recent runs",
     ]
-    lines.extend(
-        (
-            f"- `{row['run_key']}`: {row['status']} ({row['action']})"
-            + (
-                f" - {json.loads(row['details_json']).get('error')}"
-                if row["status"] == "failed" and row["details_json"]
-                else ""
-            )
-        )
-        for row in runs
-    )
+    for row in runs:
+        line = f"- `{row['run_key']}`: {row['status']} ({row['action']})"
+        if row["details_json"]:
+            details = json.loads(row["details_json"])
+            if row["status"] == "failed" and details.get("error"):
+                line += f" - {details['error']}"
+                if details.get("degraded_outputs"):
+                    line += " [outputs rebuilt from sqlite_latest]"
+                elif details.get("degraded_outputs_error"):
+                    line += (
+                        " [degraded output rebuild failed: "
+                        f"{details['degraded_outputs_error']}]"
+                    )
+            elif details.get("degraded"):
+                refresh_error = details.get("refresh_error")
+                if isinstance(refresh_error, dict):
+                    refresh_error = refresh_error.get("error") or refresh_error.get("message")
+                if refresh_error:
+                    line += f" - degraded refresh: {refresh_error}"
+                else:
+                    line += " - degraded refresh"
+        lines.append(line)
     if not runs:
         lines.append("- No runs recorded.")
     failed_issues: list[str] = []

@@ -121,6 +121,17 @@ def _format_retrieval_issues(issues: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_live_team_name(
+    team_name: str,
+    *,
+    context: str,
+) -> tuple[str | None, str | None]:
+    try:
+        return _strict_team_norm(team_name, context=context), None
+    except UnknownTeamNameError as exc:
+        return None, str(exc)
+
+
 def _pick_team_candidate(team_name: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     target_norm = _strict_team_norm(team_name, context="team id resolution target")
     exact = []
@@ -648,6 +659,7 @@ def fetch_today_data(
         (date_str,),
     )
     scheduled_pairs: dict[tuple[str, str], str] = {}
+    scheduled_team_expectations: dict[str, list[tuple[tuple[str, str], str]]] = defaultdict(list)
     retrieval_issues: list[dict[str, Any]] = []
     for row in scheduled_df.to_dict(orient="records"):
         pair = (
@@ -670,9 +682,13 @@ def fetch_today_data(
             )
             continue
         scheduled_pairs[pair] = str(row["match_id"])
+        scheduled_team_expectations[pair[0]].append((pair, str(row["match_id"])))
+        scheduled_team_expectations[pair[1]].append((pair, str(row["match_id"])))
+    scheduled_team_norms = set(scheduled_team_expectations)
 
     validated_fixtures: list[dict[str, Any]] = []
     matched_pairs: dict[tuple[str, str], str] = {}
+    ignored_non_world_cup_fixtures = 0
     for fixture in fixtures:
         fixture_id = str(fixture.get("fixture", {}).get("id"))
         kickoff = pd.Timestamp(fixture.get("fixture", {}).get("date"))
@@ -683,37 +699,57 @@ def fetch_today_data(
             continue
         home_team = str(fixture.get("teams", {}).get("home", {}).get("name") or "")
         away_team = str(fixture.get("teams", {}).get("away", {}).get("name") or "")
-        try:
-            pair = (
-                _strict_team_norm(
-                    home_team,
-                    context=f"live fixture {fixture_id} home team",
-                ),
-                _strict_team_norm(
-                    away_team,
-                    context=f"live fixture {fixture_id} away team",
-                ),
-            )
-        except UnknownTeamNameError as exc:
+        home_team_norm, home_error = _normalize_live_team_name(
+            home_team,
+            context=f"live fixture {fixture_id} home team",
+        )
+        away_team_norm, away_error = _normalize_live_team_name(
+            away_team,
+            context=f"live fixture {fixture_id} away team",
+        )
+        candidate_norms = {
+            team_norm
+            for team_norm in (home_team_norm, away_team_norm)
+            if team_norm in scheduled_team_norms
+        }
+        if not candidate_norms:
+            ignored_non_world_cup_fixtures += 1
+            continue
+        expected_context = {
+            expectation
+            for team_norm in candidate_norms
+            for expectation in scheduled_team_expectations[team_norm]
+        }
+        expected_pair = None
+        expected_match_id = None
+        if len(expected_context) == 1:
+            expected_pair, expected_match_id = next(iter(expected_context))
+        if home_team_norm is None or away_team_norm is None:
+            details = [detail for detail in (home_error, away_error) if detail]
             retrieval_issues.append(
                 _retrieval_issue(
-                    reason="unknown_live_team_name",
+                    reason="unknown_candidate_team_name",
                     fixture_id=fixture_id,
                     raw_home_team=home_team,
                     raw_away_team=away_team,
-                    detail=str(exc),
+                    expected_match_id=expected_match_id,
+                    expected_pair=expected_pair,
+                    detail=" | ".join(details),
                 )
             )
             continue
+        pair = (home_team_norm, away_team_norm)
         match_id = scheduled_pairs.get(pair)
         if match_id is None:
             retrieval_issues.append(
                 _retrieval_issue(
-                    reason="fixture_not_in_local_schedule",
+                    reason="scheduled_team_mismatch",
                     fixture_id=fixture_id,
                     raw_home_team=home_team,
                     raw_away_team=away_team,
-                    expected_pair=pair,
+                    expected_match_id=expected_match_id,
+                    expected_pair=expected_pair,
+                    detail=f"normalized_pair={pair[0]} vs {pair[1]}",
                 )
             )
             continue
@@ -721,7 +757,7 @@ def fetch_today_data(
         if previous_fixture and previous_fixture != fixture_id:
             retrieval_issues.append(
                 _retrieval_issue(
-                    reason="duplicate_live_fixture_for_scheduled_match",
+                    reason="duplicate_candidate_fixture",
                     fixture_id=fixture_id,
                     raw_home_team=home_team,
                     raw_away_team=away_team,
@@ -751,6 +787,8 @@ def fetch_today_data(
             issues=retrieval_issues,
         )
     updated = defaultdict(int)
+    updated["ignored_non_world_cup_fixtures"] = ignored_non_world_cup_fixtures
+    updated["candidate_fixtures_validated"] = len(validated_fixtures)
     resolution_entries: list[dict[str, Any]] = []
 
     with client.connection:

@@ -184,10 +184,11 @@ class MatchdayRunner:
 
     def _execute(self, action: MatchdayAction) -> dict[str, Any]:
         force_refresh = action.action in {"hourly", "pre_match", "post_match"}
+        fetch_mode = action.fetch_mode or "hourly"
         refresh_result = self.refresh(
             action.date_cdmx,
             force_refresh=force_refresh,
-            fetch_mode=action.fetch_mode or "hourly",
+            fetch_mode=fetch_mode,
         )
         result: dict[str, Any] = {"refresh": refresh_result}
         if action.action == "pre_match" and action.match_id:
@@ -216,11 +217,12 @@ class MatchdayRunner:
                 else bool(newly_finished)
             )
             if should_fetch_final_data:
-                result["final_refresh"] = self.refresh(
+                final_refresh = self.refresh(
                     action.date_cdmx,
                     force_refresh=True,
                     fetch_mode="full",
                 )
+                result["final_refresh"] = final_refresh
                 result["evidence"] = self.finalize_evidence(
                     sorted(newly_finished),
                     connection=self.connection,
@@ -293,9 +295,20 @@ class MatchdayRunner:
             try:
                 details = self._execute(action)
             except Exception as exc:
-                error_details = {"error": str(exc), "action": asdict(action)}
+                error_details = {
+                    "error": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                    "action": asdict(action),
+                }
                 if hasattr(exc, "issues"):
                     error_details["retrieval_issues"] = getattr(exc, "issues")
+                try:
+                    error_details["degraded_outputs"] = rebuild_outputs(
+                        connection=self.connection,
+                        now=local_now,
+                    )
+                except Exception as rebuild_exc:
+                    error_details["degraded_outputs_error"] = str(rebuild_exc)
                 finish_automation_run(
                     self.connection,
                     action.run_key,

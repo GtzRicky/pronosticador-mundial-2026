@@ -13,7 +13,6 @@ from quiniela.historical_loader import (
     resolve_team_id,
 )
 from quiniela import historical_loader
-from quiniela import output_manager
 
 
 def _seed_match(connection) -> None:
@@ -35,13 +34,54 @@ def _seed_match(connection) -> None:
         )
 
 
-def test_fetch_today_data_fails_on_unknown_live_team_name(
+def test_fetch_today_data_ignores_unknown_non_candidate_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = get_connection(tmp_path / "unknown-live-team.sqlite")
     _seed_match(connection)
     settings = replace(get_settings(), db_path=tmp_path / "unknown-live-team.sqlite")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.connection = connection
+
+        def get_fixtures(self, **params):
+            return {
+                "response": [
+                    {
+                        "fixture": {
+                            "id": 123,
+                            "date": "2026-06-13T19:00:00+00:00",
+                            "status": {"short": "NS"},
+                        },
+                        "teams": {
+                            "home": {"name": "Atlantis"},
+                            "away": {"name": "El Dorado"},
+                        },
+                        "goals": {"home": None, "away": None},
+                        "league": {"name": "Noise"},
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(historical_loader, "APIFootballClient", FakeClient)
+    monkeypatch.setattr(historical_loader, "get_settings", lambda: settings)
+    monkeypatch.setattr("quiniela.output_manager.rebuild_outputs", lambda **kwargs: {})
+
+    result = fetch_today_data("2026-06-13", fetch_mode="post_status")
+
+    assert result["ignored_non_world_cup_fixtures"] == 1
+    assert result["candidate_fixtures_validated"] == 0
+
+
+def test_fetch_today_data_fails_on_unknown_candidate_team_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = get_connection(tmp_path / "unknown-candidate-team.sqlite")
+    _seed_match(connection)
+    settings = replace(get_settings(), db_path=tmp_path / "unknown-candidate-team.sqlite")
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -68,12 +108,12 @@ def test_fetch_today_data_fails_on_unknown_live_team_name(
 
     monkeypatch.setattr(historical_loader, "APIFootballClient", FakeClient)
     monkeypatch.setattr(historical_loader, "get_settings", lambda: settings)
-    monkeypatch.setattr(output_manager, "rebuild_outputs", lambda **kwargs: {})
+    monkeypatch.setattr("quiniela.output_manager.rebuild_outputs", lambda **kwargs: {})
 
     with pytest.raises(RetrievalValidationError) as exc_info:
         fetch_today_data("2026-06-13", fetch_mode="post_status")
 
-    assert exc_info.value.issues[0]["reason"] == "unknown_live_team_name"
+    assert exc_info.value.issues[0]["reason"] == "unknown_candidate_team_name"
 
 
 def test_fetch_today_data_fails_on_fixture_schedule_mismatch(
@@ -109,12 +149,72 @@ def test_fetch_today_data_fails_on_fixture_schedule_mismatch(
 
     monkeypatch.setattr(historical_loader, "APIFootballClient", FakeClient)
     monkeypatch.setattr(historical_loader, "get_settings", lambda: settings)
-    monkeypatch.setattr(output_manager, "rebuild_outputs", lambda **kwargs: {})
+    monkeypatch.setattr("quiniela.output_manager.rebuild_outputs", lambda **kwargs: {})
 
     with pytest.raises(RetrievalValidationError) as exc_info:
         fetch_today_data("2026-06-13", fetch_mode="post_status")
 
-    assert exc_info.value.issues[0]["reason"] == "fixture_not_in_local_schedule"
+    assert exc_info.value.issues[0]["reason"] == "scheduled_team_mismatch"
+
+
+def test_fetch_today_data_processes_valid_fixture_and_ignores_external_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = get_connection(tmp_path / "valid-with-noise.sqlite")
+    _seed_match(connection)
+    settings = replace(get_settings(), db_path=tmp_path / "valid-with-noise.sqlite")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.connection = connection
+
+        def get_fixtures(self, **params):
+            return {
+                "response": [
+                    {
+                        "fixture": {
+                            "id": 456,
+                            "date": "2026-06-13T19:00:00+00:00",
+                            "status": {"short": "NS"},
+                        },
+                        "teams": {
+                            "home": {"name": "Mexico"},
+                            "away": {"name": "Canada"},
+                        },
+                        "goals": {"home": None, "away": None},
+                        "league": {"name": "World Cup"},
+                    },
+                    {
+                        "fixture": {
+                            "id": 789,
+                            "date": "2026-06-13T21:00:00+00:00",
+                            "status": {"short": "NS"},
+                        },
+                        "teams": {
+                            "home": {"name": "Rochedale Rovers"},
+                            "away": {"name": "WDSC Wolves"},
+                        },
+                        "goals": {"home": None, "away": None},
+                        "league": {"name": "Club Friendly"},
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(historical_loader, "APIFootballClient", FakeClient)
+    monkeypatch.setattr(historical_loader, "get_settings", lambda: settings)
+    monkeypatch.setattr("quiniela.output_manager.rebuild_outputs", lambda **kwargs: {})
+
+    result = fetch_today_data("2026-06-13", fetch_mode="post_status")
+    match = connection.execute(
+        "SELECT api_fixture_id, status FROM matches WHERE match_id = 'match-1'"
+    ).fetchone()
+
+    assert result["fixtures"] == 1
+    assert result["candidate_fixtures_validated"] == 1
+    assert result["ignored_non_world_cup_fixtures"] == 1
+    assert match["api_fixture_id"] == 456
+    assert match["status"] == "NS"
 
 
 def test_resolve_team_id_requires_exact_national_candidate(tmp_path: Path) -> None:

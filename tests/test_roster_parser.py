@@ -81,6 +81,7 @@ def test_name_normalization_maps_world_cup_aliases_without_false_matches() -> No
         "Países Bajos": "netherlands",
         "Paraguay": "paraguay",
         "Portugal": "portugal",
+        "Congo DR": "dr_congo",
         "RD Congo": "dr_congo",
         "República Checa": "czech_republic",
         "República de Corea": "south_korea",
