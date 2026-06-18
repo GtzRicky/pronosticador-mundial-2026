@@ -1409,9 +1409,48 @@ def claim_automation_run(
     scheduled_for: str,
     match_id: str | None = None,
     details: dict[str, Any] | None = None,
+    stale_after_minutes: int = 25,
 ) -> bool:
-    try:
-        with connection:
+    details_payload = json.dumps(details or {}, ensure_ascii=False)
+    stale_modifier = f"-{int(stale_after_minutes)} minutes"
+    with connection:
+        existing = connection.execute(
+            """
+            SELECT status
+            FROM automation_runs
+            WHERE run_key = ?
+            """,
+            (run_key,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["status"]) != "running":
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE automation_runs
+                SET action = ?,
+                    match_id = ?,
+                    scheduled_for = ?,
+                    details_json = ?,
+                    started_at = CURRENT_TIMESTAMP,
+                    finished_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_key = ?
+                  AND status = 'running'
+                  AND julianday(started_at) <= julianday('now', ?)
+                """,
+                (
+                    action,
+                    match_id,
+                    scheduled_for,
+                    details_payload,
+                    run_key,
+                    stale_modifier,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        try:
             connection.execute(
                 """
                 INSERT INTO automation_runs (
@@ -1423,11 +1462,11 @@ def claim_automation_run(
                     action,
                     match_id,
                     scheduled_for,
-                    json.dumps(details or {}, ensure_ascii=False),
+                    details_payload,
                 ),
             )
-    except sqlite3.IntegrityError:
-        return False
+        except sqlite3.IntegrityError:
+            return False
     return True
 
 
