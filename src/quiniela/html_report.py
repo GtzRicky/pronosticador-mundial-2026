@@ -295,6 +295,10 @@ def _load_match_rows(connection: sqlite3.Connection, dates: list[str]) -> list[d
             lp.outcome_model_version,
             lp.data_freshness_at,
             lp.generated_at,
+            json_extract(lp.source_json, '$.odds_consensus') AS odds_consensus,
+            json_extract(lp.source_json, '$.odds_adjusted_exact_score') AS odds_adjusted_exact_score,
+            json_extract(lp.source_json, '$.odds_adjusted_probability') AS odds_adjusted_probability,
+            json_extract(lp.source_json, '$.odds_model_version') AS odds_model_version,
             (
                 SELECT release_id FROM model_releases
                 WHERE status = 'active'
@@ -319,6 +323,56 @@ def _load_match_rows(connection: sqlite3.Connection, dates: list[str]) -> list[d
     """
     df = fetch_dataframe(connection, query, dates)
     return df.to_dict(orient="records")
+
+
+def _attach_odds_consensus(
+    connection: sqlite3.Connection,
+    match_rows: list[dict[str, Any]],
+) -> None:
+    fixture_ids = [
+        str(int(row["api_fixture_id"]))
+        for row in match_rows
+        if row.get("api_fixture_id") not in (None, "")
+        and str(row.get("api_fixture_id")) != "nan"
+    ]
+    if not fixture_ids:
+        return
+    placeholders = ",".join("?" for _ in fixture_ids)
+    rows = connection.execute(
+        f"""
+        SELECT fixture_id, market_key, selection_key, line_key,
+               consensus_probability, median_decimal_odd, bookmaker_count
+        FROM odds_market_consensus
+        WHERE fixture_id IN ({placeholders})
+        ORDER BY fixture_id, market_key, line_key, selection_key
+        """,
+        fixture_ids,
+    ).fetchall()
+    by_fixture: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        fixture_key = str(row["fixture_id"])
+        line_key = str(row["line_key"] or "")
+        market_key = str(row["market_key"])
+        bucket_key = market_key if not line_key else f"{market_key}:{line_key}"
+        by_fixture.setdefault(fixture_key, {"fixture_id": fixture_key, "markets": {}})
+        by_fixture[fixture_key]["markets"].setdefault(bucket_key, {})[
+            str(row["selection_key"])
+        ] = {
+            "probability": float(row["consensus_probability"]),
+            "median_decimal_odd": (
+                float(row["median_decimal_odd"])
+                if row["median_decimal_odd"] is not None
+                else None
+            ),
+            "bookmakers": int(row["bookmaker_count"] or 0),
+        }
+    for row in match_rows:
+        fixture_id = row.get("api_fixture_id")
+        if fixture_id in (None, "") or str(fixture_id) == "nan":
+            continue
+        fixture_key = str(int(fixture_id))
+        if fixture_key in by_fixture:
+            row["odds_consensus_full"] = by_fixture[fixture_key]
 
 
 def _score_comparison(actual_home_goals: Any, actual_away_goals: Any) -> str:
@@ -383,6 +437,272 @@ def _render_prediction_timeline(match: dict[str, Any]) -> str:
         f"<summary>Historial prepartido ({len(rows)})</summary>"
         f'<ol class="timeline-list">{"".join(rows)}</ol>'
         "</details>"
+    )
+
+
+def _json_field(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value or (isinstance(value, float) and math.isnan(value)):
+        return {}
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _format_probability(value: Any) -> str:
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "n/d"
+
+
+def _format_decimal_odd(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "n/d"
+
+
+def _market_item(
+    label: str,
+    item: dict[str, Any],
+    *,
+    tone: str = "blue",
+) -> str:
+    probability = _format_probability(item.get("probability"))
+    odd = _format_decimal_odd(item.get("median_decimal_odd"))
+    bookmakers = int(item.get("bookmakers") or 0)
+    bookmaker_text = f"{bookmakers} casas" if bookmakers else "consenso"
+    return (
+        f'<span class="market-tag {escape(tone)}">'
+        f"<strong>{escape(label)}</strong>"
+        f"<b>{escape(probability)}</b>"
+        f"<em>momio {escape(odd)} · {escape(bookmaker_text)}</em>"
+        "</span>"
+    )
+
+
+def _top_market_items(
+    markets: dict[str, Any],
+    market_key: str,
+    *,
+    limit: int = 3,
+) -> list[tuple[str, dict[str, Any]]]:
+    values = markets.get(market_key) or {}
+    ranked = sorted(
+        values.items(),
+        key=lambda item: float((item[1] or {}).get("probability") or 0.0),
+        reverse=True,
+    )
+    return [(str(key), dict(value or {})) for key, value in ranked[:limit]]
+
+
+def _top_market_items_by_prefix(
+    markets: dict[str, Any],
+    market_prefix: str,
+    *,
+    limit: int = 3,
+) -> list[tuple[str, dict[str, Any]]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for key, values in markets.items():
+        if key != market_prefix and not key.startswith(f"{market_prefix}:"):
+            continue
+        for selection, item in (values or {}).items():
+            current = merged.get(str(selection))
+            if current is None or float(item.get("probability") or 0.0) > float(
+                current.get("probability") or 0.0
+            ):
+                merged[str(selection)] = dict(item or {})
+    ranked = sorted(
+        merged.items(),
+        key=lambda item: float((item[1] or {}).get("probability") or 0.0),
+        reverse=True,
+    )
+    return [(str(key), dict(value or {})) for key, value in ranked[:limit]]
+
+
+def _closest_line_key(
+    markets: dict[str, Any],
+    prefix: str,
+    target: float = 2.5,
+) -> str | None:
+    keys = [key for key in markets if key.startswith(f"{prefix}:")]
+    if not keys:
+        return None
+
+    def distance(key: str) -> float:
+        try:
+            return abs(float(key.split(":", 1)[1]) - target)
+        except ValueError:
+            return 999.0
+
+    return sorted(keys, key=distance)[0]
+
+
+def _market_group(
+    title: str,
+    subtitle: str,
+    items: list[str],
+) -> str:
+    if not items:
+        return ""
+    return (
+        '<section class="market-panel">'
+        f"<h5>{escape(title)}</h5>"
+        f"<p>{escape(subtitle)}</p>"
+        f'<div class="market-tags">{"".join(items)}</div>'
+        "</section>"
+    )
+
+
+def _model_market_signal(match: dict[str, Any], match_winner: dict[str, Any]) -> str:
+    if not match_winner:
+        return '<span class="signal-chip neutral">Sin consenso 1-X-2 todavia</span>'
+    model = {
+        "1": float(match.get("home_win_probability") or 0.0),
+        "X": float(match.get("draw_probability") or 0.0),
+        "2": float(match.get("away_win_probability") or 0.0),
+    }
+    market = {
+        "1": float((match_winner.get("home") or {}).get("probability") or 0.0),
+        "X": float((match_winner.get("draw") or {}).get("probability") or 0.0),
+        "2": float((match_winner.get("away") or {}).get("probability") or 0.0),
+    }
+    if not any(model.values()) or not any(market.values()):
+        return '<span class="signal-chip neutral">Comparacion modelo/mercado pendiente</span>'
+    label = max(model, key=lambda key: abs(model[key] - market[key]))
+    delta = model[label] - market[label]
+    strength = "alta" if abs(delta) >= 0.12 else "media" if abs(delta) >= 0.07 else "baja"
+    direction = "modelo arriba" if delta > 0 else "mercado arriba"
+    return (
+        f'<span class="signal-chip {escape(strength)}">'
+        f"senal {escape(strength)} en {escape(label)}: {escape(direction)} "
+        f"{abs(delta) * 100:.1f} pts"
+        "</span>"
+    )
+
+
+def _render_market_section(match: dict[str, Any]) -> str:
+    consensus = _json_field(match.get("odds_consensus_full")) or _json_field(match.get("odds_consensus"))
+    markets = consensus.get("markets") or {}
+    exact_score = match.get("odds_adjusted_exact_score")
+    exact_probability = match.get("odds_adjusted_probability")
+    if not markets and not exact_score:
+        return '<p class="market-empty">Momios prepartido pendientes para este partido.</p>'
+
+    match_winner = markets.get("match_winner") or {}
+    top_exact_scores = _top_market_items_by_prefix(markets, "exact_score", limit=3)
+    headline_tags = []
+    if exact_score:
+        headline_tags.append(
+            '<span class="market-tag gold featured">'
+            "<strong>Marcador odds-aware</strong>"
+            f"<b>{escape(str(exact_score))}</b>"
+            f"<em>{escape(_format_probability(exact_probability))} · ajuste de mercado</em>"
+            "</span>"
+        )
+    elif top_exact_scores:
+        score, item = top_exact_scores[0]
+        headline_tags.append(
+            '<span class="market-tag gold featured">'
+            "<strong>Marcador odds-aware pendiente</strong>"
+            f"<b>{escape(score)}</b>"
+            f"<em>top mercado exact score · momio {escape(_format_decimal_odd(item.get('median_decimal_odd')))}</em>"
+            "</span>"
+        )
+    if match_winner:
+        for key, label in (("home", "1"), ("draw", "X"), ("away", "2")):
+            item = match_winner.get(key) or {}
+            if item:
+                headline_tags.append(_market_item(label, item, tone="blue"))
+
+    goals_items: list[str] = []
+    btts = markets.get("both_teams_score") or {}
+    for key, label in (("yes", "Ambos anotan: si"), ("no", "Ambos anotan: no")):
+        if key in btts:
+            goals_items.append(_market_item(label, btts[key], tone="green"))
+    ou_key = _closest_line_key(markets, "goals_over_under", 2.5)
+    if ou_key:
+        values = markets.get(ou_key) or {}
+        line = ou_key.split(":", 1)[1]
+        for key, label in (("over", f"Over {line}"), ("under", f"Under {line}")):
+            if key in values:
+                goals_items.append(_market_item(label, values[key], tone="green"))
+
+    exact_items = [
+        _market_item(score, item, tone="gold")
+        for score, item in top_exact_scores
+    ]
+    prop_items: list[str] = []
+    prop_markets = (
+        ("cards_over_under", "Tarjetas"),
+        ("corners_over_under", "Corners"),
+        ("total_shotongoal", "Tiros a puerta"),
+        ("home_total_shotongoal", "Tiros local"),
+        ("away_total_shotongoal", "Tiros visita"),
+        ("player_to_be_booked", "Jugador amonestado"),
+        ("player_fouls_committed", "Faltas jugador"),
+        ("player_shots_on_target", "Tiros a puerta jugador"),
+        ("home_player_shots", "Tiros jugador local"),
+        ("away_player_shots", "Tiros jugador visita"),
+        ("goalkeeper_saves", "Atajadas"),
+        ("player_saves", "Atajadas jugador"),
+    )
+    for prefix, title in prop_markets:
+        candidate_keys = [
+            key for key in markets if key == prefix or key.startswith(f"{prefix}:")
+        ]
+        for key in candidate_keys[:2]:
+            values = markets.get(key) or {}
+            line = key.split(":", 1)[1] if ":" in key else ""
+            for selection, item in _top_market_items(markets, key, limit=2):
+                label = f"{title} {line} {selection}".strip()
+                prop_items.append(_market_item(label, item, tone="red"))
+                if len(prop_items) >= 6:
+                    break
+            if len(prop_items) >= 6:
+                break
+        if len(prop_items) >= 6:
+            break
+
+    groups = [
+        _market_group(
+            "Resultado y formula",
+            "Lectura combinada del modelo con el consenso prepartido.",
+            headline_tags,
+        ),
+        _market_group(
+            "Marcadores probables de mercado",
+            "Top opciones del mercado de resultado exacto.",
+            exact_items,
+        ),
+        _market_group(
+            "Goles",
+            "Senales principales de over/under y ambos equipos anotan.",
+            goals_items,
+        ),
+        _market_group(
+            "Props y disciplina",
+            "Mercados adicionales disponibles: tarjetas, faltas, tiros, corners o atajadas.",
+            prop_items,
+        ),
+    ]
+    return (
+        '<section class="market-dashboard">'
+        '<div class="market-header">'
+        "<div>"
+        "<span>Mercados y apuestas</span>"
+        "<h4>Modelo vs Mercado</h4>"
+        "<p>Formula: Poisson + fortaleza del modelo + consenso 1-X-2 + O/U + BTTS + Exact Score.</p>"
+        "</div>"
+        f"{_model_market_signal(match, match_winner)}"
+        "</div>"
+        + "".join(group for group in groups if group)
+        + '<p class="market-disclaimer">Informacion analitica para comparar senales; no es recomendacion financiera ni garantia de apuesta.</p>'
+        "</section>"
     )
 
 
@@ -488,6 +808,7 @@ def _match_card_html(
         "</div>"
         "</div>"
         f"{outcome_html}"
+        f"{_render_market_section(match)}"
         f"{_render_evaluation(match)}"
         '<div class="impact-grid">'
         '<section class="impact-team">'
@@ -553,16 +874,21 @@ def render_predictions_html(
   <title>Predicciones Mundial 2026</title>
   <style>
     :root {{
-      --bg: #f5efe3;
-      --surface: rgba(255, 252, 247, 0.88);
-      --surface-strong: #fffaf2;
-      --ink: #1e2430;
-      --muted: #5f6777;
-      --accent: #b6462a;
-      --accent-soft: #e9c9b2;
-      --success: #1f6a52;
-      --border: rgba(30, 36, 48, 0.12);
-      --shadow: 0 20px 50px rgba(34, 28, 19, 0.12);
+      --bg: #f4f7fb;
+      --surface: rgba(255, 255, 255, 0.90);
+      --surface-strong: #ffffff;
+      --ink: #111827;
+      --muted: #5d6575;
+      --wc-blue: #1746d2;
+      --wc-red: #cf2434;
+      --wc-green: #00843d;
+      --wc-gold: #c99a18;
+      --wc-cream: #fff8e7;
+      --accent: var(--wc-blue);
+      --accent-soft: rgba(23, 70, 210, 0.12);
+      --success: var(--wc-green);
+      --border: rgba(17, 24, 39, 0.12);
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.14);
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -570,9 +896,10 @@ def render_predictions_html(
       font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
       color: var(--ink);
       background:
-        radial-gradient(circle at top left, rgba(182, 70, 42, 0.22), transparent 34%),
-        radial-gradient(circle at top right, rgba(31, 106, 82, 0.18), transparent 30%),
-        linear-gradient(180deg, #f9f2e6 0%, #efe4d3 100%);
+        radial-gradient(circle at 8% 0%, rgba(207, 36, 52, 0.20), transparent 28%),
+        radial-gradient(circle at 88% 2%, rgba(0, 132, 61, 0.18), transparent 30%),
+        radial-gradient(circle at 50% 12%, rgba(23, 70, 210, 0.20), transparent 34%),
+        linear-gradient(180deg, #f9fbff 0%, #eef3fb 48%, #fff8e7 100%);
     }}
     .page {{
       max-width: 1180px;
@@ -582,9 +909,23 @@ def render_predictions_html(
     .hero {{
       padding: 28px;
       border-radius: 28px;
-      background: linear-gradient(135deg, rgba(255,250,242,0.96), rgba(245,236,222,0.92));
+      background:
+        linear-gradient(135deg, rgba(255,255,255,0.96), rgba(255,248,231,0.90)),
+        linear-gradient(90deg, var(--wc-blue), var(--wc-red), var(--wc-green));
       border: 1px solid var(--border);
       box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }}
+    .hero::after {{
+      content: "";
+      position: absolute;
+      inset: auto -80px -120px auto;
+      width: 320px;
+      height: 320px;
+      border-radius: 999px;
+      background: conic-gradient(from 30deg, var(--wc-blue), var(--wc-red), var(--wc-green), var(--wc-gold), var(--wc-blue));
+      opacity: 0.11;
     }}
     .hero h1 {{
       margin: 0 0 8px;
@@ -677,13 +1018,13 @@ def render_predictions_html(
       background: rgba(255,255,255,0.75);
     }}
     .score-box.predicted {{
-      background: linear-gradient(135deg, rgba(182,70,42,0.12), rgba(255,255,255,0.82));
+      background: linear-gradient(135deg, rgba(23,70,210,0.14), rgba(255,255,255,0.86));
     }}
     .score-box.actual {{
-      background: linear-gradient(135deg, rgba(31,106,82,0.12), rgba(255,255,255,0.82));
+      background: linear-gradient(135deg, rgba(0,132,61,0.13), rgba(255,255,255,0.86));
     }}
     .score-box.hybrid {{
-      background: linear-gradient(135deg, rgba(20,87,122,0.14), rgba(255,255,255,0.82));
+      background: linear-gradient(135deg, rgba(201,154,24,0.18), rgba(255,255,255,0.86));
     }}
     .score-box label {{
       display: block;
@@ -724,6 +1065,139 @@ def render_predictions_html(
       font-size: 1.05rem;
     }}
     .outcome-empty {{
+      margin: 0 0 14px;
+      color: var(--muted);
+    }}
+    .market-dashboard {{
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      margin: 0 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background:
+        linear-gradient(135deg, rgba(23,70,210,0.09), rgba(0,132,61,0.07)),
+        rgba(255,255,255,0.76);
+    }}
+    .market-header {{
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+      justify-content: space-between;
+    }}
+    .market-header > div > span {{
+      display: inline-flex;
+      margin-bottom: 5px;
+      color: var(--wc-blue);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }}
+    .market-header h4 {{
+      margin: 0;
+      font-size: 1.25rem;
+      letter-spacing: -0.03em;
+    }}
+    .market-header p, .market-panel p {{
+      margin: 4px 0 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .signal-chip {{
+      flex: 0 0 auto;
+      max-width: 270px;
+      padding: 10px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.82);
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 700;
+      text-align: center;
+    }}
+    .signal-chip.alta {{
+      color: #8a1722;
+      background: rgba(207,36,52,0.11);
+      border-color: rgba(207,36,52,0.24);
+    }}
+    .signal-chip.media {{
+      color: #8b650f;
+      background: rgba(201,154,24,0.15);
+      border-color: rgba(201,154,24,0.28);
+    }}
+    .signal-chip.baja, .signal-chip.neutral {{
+      color: #145c35;
+      background: rgba(0,132,61,0.10);
+      border-color: rgba(0,132,61,0.22);
+    }}
+    .market-panel {{
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.70);
+      border: 1px solid rgba(17,24,39,0.08);
+    }}
+    .market-panel h5 {{
+      margin: 0;
+      font-size: 0.95rem;
+    }}
+    .market-tags {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 11px;
+    }}
+    .market-tag {{
+      display: grid;
+      min-width: 142px;
+      gap: 3px;
+      padding: 11px 12px;
+      border-radius: 16px;
+      border: 1px solid rgba(17,24,39,0.10);
+      background: rgba(255,255,255,0.84);
+      box-shadow: 0 8px 20px rgba(15,23,42,0.06);
+    }}
+    .market-tag strong {{
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }}
+    .market-tag b {{
+      font-size: 1.12rem;
+      letter-spacing: -0.03em;
+    }}
+    .market-tag em {{
+      font-style: normal;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }}
+    .market-tag.featured {{
+      min-width: 190px;
+    }}
+    .market-tag.blue {{
+      border-color: rgba(23,70,210,0.24);
+      background: linear-gradient(135deg, rgba(23,70,210,0.12), rgba(255,255,255,0.92));
+    }}
+    .market-tag.green {{
+      border-color: rgba(0,132,61,0.24);
+      background: linear-gradient(135deg, rgba(0,132,61,0.12), rgba(255,255,255,0.92));
+    }}
+    .market-tag.red {{
+      border-color: rgba(207,36,52,0.24);
+      background: linear-gradient(135deg, rgba(207,36,52,0.10), rgba(255,255,255,0.92));
+    }}
+    .market-tag.gold {{
+      border-color: rgba(201,154,24,0.30);
+      background: linear-gradient(135deg, rgba(201,154,24,0.18), rgba(255,255,255,0.92));
+    }}
+    .market-disclaimer {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }}
+    .market-empty {{
       margin: 0 0 14px;
       color: var(--muted);
     }}
@@ -878,8 +1352,8 @@ def render_predictions_html(
       margin-bottom: 12px;
       padding: 11px 12px;
       border-radius: 12px;
-      background: rgba(182,70,42,0.10);
-      border: 1px solid rgba(182,70,42,0.20);
+      background: rgba(207,36,52,0.10);
+      border: 1px solid rgba(207,36,52,0.20);
       color: var(--muted);
       font-size: 0.86rem;
     }}
@@ -940,6 +1414,16 @@ def render_predictions_html(
       .timeline-list li {{
         grid-template-columns: 1fr;
       }}
+      .market-header {{
+        display: grid;
+      }}
+      .signal-chip {{
+        max-width: none;
+        width: 100%;
+      }}
+      .market-tag {{
+        width: 100%;
+      }}
       .page {{
         padding: 20px 14px 42px;
       }}
@@ -977,6 +1461,7 @@ def build_predictions_html_report(dates: list[str], output_path: Path | None = N
     settings = get_settings()
     connection = get_connection(settings.db_path)
     match_rows = _load_match_rows(connection, dates)
+    _attach_odds_consensus(connection, match_rows)
     fixture_ids = []
     for row in match_rows:
         fixture_id = row.get("api_fixture_id")

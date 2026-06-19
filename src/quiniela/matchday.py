@@ -13,6 +13,7 @@ from quiniela.db import (
     fetch_dataframe,
     finish_automation_run,
     get_connection,
+    recover_stale_automation_runs,
 )
 from quiniela.historical_loader import fetch_today_data, sync_finished_results_for_date
 from quiniela.output_manager import rebuild_outputs
@@ -95,7 +96,7 @@ def plan_matchday_actions(
         has_result = bool(match.get("has_actual_result"))
         if (
             not has_result
-            and status not in TERMINAL_STATUSES
+            and status not in INACTIVE_STATUSES
             and post_start <= local_now <= post_end
         ):
             elapsed = int((local_now - post_start).total_seconds() // 60)
@@ -149,6 +150,17 @@ class MatchdayRunner:
         self.notification_cycle = notification_cycle or run_notification_cycle
         self.timezone_name = timezone_name or settings.local_timezone
         self._web_fallback_run_keys: set[str] = set()
+
+    def _run_notifications(self, local_now: datetime) -> dict[str, Any]:
+        try:
+            return self.notification_cycle(
+                connection=self.connection,
+                now=local_now,
+            )
+        except Exception:
+            return {
+                "error": "notification_cycle_error",
+            }
 
     def _predict_date(
         self,
@@ -277,6 +289,14 @@ class MatchdayRunner:
         self._web_fallback_run_keys = {
             run_key for _, run_key in fallback_actions.values()
         }
+        stale_recovery = recover_stale_automation_runs(
+            self.connection,
+            stale_after_minutes=25,
+            apply=True,
+        )
+        notification_cycles: list[dict[str, Any]] = [
+            self._run_notifications(local_now)
+        ]
         completed: list[str] = []
         skipped: list[str] = []
         failed: list[dict[str, str]] = []
@@ -316,6 +336,7 @@ class MatchdayRunner:
                     error_details,
                 )
                 failed.append({"run_key": action.run_key, "error": str(exc)})
+                notification_cycles.append(self._run_notifications(local_now))
                 continue
             finish_automation_run(
                 self.connection,
@@ -324,15 +345,9 @@ class MatchdayRunner:
                 details,
             )
             completed.append(action.run_key)
-        try:
-            notifications = self.notification_cycle(
-                connection=self.connection,
-                now=local_now,
-            )
-        except Exception:
-            notifications = {
-                "error": "notification_cycle_error",
-            }
+            notification_cycles.append(self._run_notifications(local_now))
+        notifications = self._run_notifications(local_now)
+        notification_cycles.append(notifications)
         try:
             from quiniela.output_manager import write_automation_status
 
@@ -345,5 +360,7 @@ class MatchdayRunner:
             "completed": completed,
             "skipped": skipped,
             "failed": failed,
+            "stale_recovery": stale_recovery,
             "notifications": notifications,
+            "notification_cycles": notification_cycles,
         }

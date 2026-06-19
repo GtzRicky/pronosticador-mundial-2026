@@ -11,11 +11,23 @@ from rich.table import Table
 
 from quiniela.calendar_parser import ingest_calendar
 from quiniela.config import get_settings
-from quiniela.db import create_schema, fetch_dataframe, get_connection, seed_from_processed
+from quiniela.db import (
+    create_schema,
+    fetch_dataframe,
+    get_connection,
+    recover_stale_automation_runs,
+    seed_from_processed,
+)
 from quiniela.historical_loader import backfill_team_history, fetch_today_data, update_after_match
 from quiniela.html_report import build_predictions_html_report
 from quiniela.matchday import MatchdayRunner
-from quiniela.notifications import dispatch_notifications, test_notifications
+from quiniela.notifications import (
+    dispatch_notifications,
+    run_notification_cycle,
+    send_isolated_lineup_test_notifications,
+    test_notifications,
+)
+from quiniela.odds_loader import build_odds_consensus, fetch_odds_by_date
 from quiniela.outcome_model import train_outcome_model
 from quiniela.output_manager import (
     cleanup_obsolete_outputs,
@@ -373,6 +385,41 @@ def run_matchday_command(
     console.print(MatchdayRunner().run(parsed_now))
 
 
+@app.command("recover-automation-runs")
+def recover_automation_runs_command(
+    stale_after_minutes: int = typer.Option(25, min=1),
+    apply: bool = typer.Option(False, "--apply/--dry-run"),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    result = recover_stale_automation_runs(
+        connection,
+        stale_after_minutes=stale_after_minutes,
+        apply=apply,
+    )
+    write_automation_status(connection)
+    console.print(result)
+
+
+@app.command("run-notification-cycle")
+def run_notification_cycle_command(
+    now: Optional[str] = typer.Option(
+        None,
+        help="Fecha/hora ISO opcional para pruebas reproducibles.",
+    ),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    parsed_now = datetime.fromisoformat(now) if now else None
+    result = run_notification_cycle(
+        connection=connection,
+        now=parsed_now,
+        settings=settings,
+    )
+    write_automation_status(connection)
+    console.print(result)
+
+
 @app.command("dispatch-notifications")
 def dispatch_notifications_command(
     now: Optional[str] = typer.Option(
@@ -392,6 +439,37 @@ def dispatch_notifications_command(
     console.print(result)
 
 
+@app.command("fetch-odds")
+def fetch_odds_command(
+    date: str = typer.Option(..., help="Fecha YYYY-MM-DD"),
+    dry_run: bool = typer.Option(False),
+    force_refresh: bool = typer.Option(False),
+) -> None:
+    console.print(
+        fetch_odds_by_date(
+            date,
+            dry_run=dry_run,
+            force_refresh=force_refresh,
+        )
+    )
+
+
+@app.command("build-odds-consensus")
+def build_odds_consensus_command(
+    date: Optional[str] = typer.Option(None, help="Fecha YYYY-MM-DD"),
+    fixture_id: Optional[str] = typer.Option(None),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    console.print(
+        build_odds_consensus(
+            connection,
+            date_str=date,
+            fixture_id=fixture_id,
+        )
+    )
+
+
 @app.command("test-notifications")
 def test_notifications_command(
     channel: str = typer.Option(
@@ -402,6 +480,31 @@ def test_notifications_command(
     if channel not in {"ntfy", "discord", "all"}:
         raise typer.BadParameter("El canal debe ser ntfy, discord o all.")
     console.print(test_notifications(channel=channel))
+
+
+@app.command("send-lineup-test-notifications")
+def send_lineup_test_notifications_command(
+    date: str = typer.Option(..., help="Fecha local YYYY-MM-DD"),
+    send: bool = typer.Option(False, "--send/--dry-run"),
+) -> None:
+    settings = get_settings()
+    connection = get_connection(settings.db_path)
+    before_count = connection.execute(
+        "SELECT COUNT(*) AS total FROM notification_deliveries"
+    ).fetchone()["total"]
+    result = send_isolated_lineup_test_notifications(
+        date_str=date,
+        connection=connection,
+        settings=settings,
+        send=send,
+    )
+    after_count = connection.execute(
+        "SELECT COUNT(*) AS total FROM notification_deliveries"
+    ).fetchone()["total"]
+    result["notification_deliveries_before"] = int(before_count)
+    result["notification_deliveries_after"] = int(after_count)
+    result["notification_deliveries_unchanged"] = before_count == after_count
+    console.print(result)
 
 
 @app.command("fetch-web-lineup-fallback")

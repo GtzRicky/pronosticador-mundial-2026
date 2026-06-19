@@ -327,6 +327,8 @@ def _store_fixture_children(
         "statistics": 0,
         "events": 0,
         "odds": 0,
+        "odds_market_snapshots": 0,
+        "odds_market_consensus": 0,
         "official_lineup_notifications": 0,
         "official_lineup_superseded": 0,
     }
@@ -428,6 +430,9 @@ def _store_fixture_children(
     if collect_odds:
         try:
             odds_payload = client.get_odds(fixture_id)
+            from quiniela.odds_loader import build_odds_consensus, store_odds_payload
+
+            normalized_odds = store_odds_payload(client.connection, odds_payload)
             for odd_row in odds_payload.get("response", []):
                 bookmakers = odd_row.get("bookmakers", [])
                 if bookmakers:
@@ -444,6 +449,12 @@ def _store_fixture_children(
                     market="match_winner",
                 )
                 counts["odds"] += 1
+            consensus = build_odds_consensus(
+                client.connection,
+                fixture_id=fixture_id,
+            )
+            counts["odds_market_snapshots"] = normalized_odds.get("inserted", 0)
+            counts["odds_market_consensus"] = consensus.get("consensus_rows", 0)
         except APILimitReachedError:
             logger.warning("Límite/rate limit alcanzado al pedir odds para fixture %s", fixture_id)
             return counts
@@ -839,6 +850,8 @@ def fetch_today_data(
             updated["lineups"] += counts["lineups"]
             updated["fixture_player_stats"] += counts["fixture_player_stats"]
             updated["odds"] += counts["odds"]
+            updated["odds_market_snapshots"] += counts["odds_market_snapshots"]
+            updated["odds_market_consensus"] += counts["odds_market_consensus"]
             updated["official_lineup_notifications"] += counts[
                 "official_lineup_notifications"
             ]

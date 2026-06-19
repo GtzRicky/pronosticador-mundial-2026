@@ -23,6 +23,7 @@ OPEN_STATUSES = ("pending", "waiting_prediction", "retry", "sending")
 TERMINAL_MATCH_STATUSES = {"FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
 PREDICTION_WINDOW_NOTIFICATION = "prediction_window"
 OFFICIAL_LINEUP_NOTIFICATION = "official_lineup"
+OFFICIAL_LINEUP_EXPIRATION_GRACE_MINUTES = 120
 
 
 @dataclass(frozen=True)
@@ -409,6 +410,7 @@ def _lineup_label(value: str | None) -> str:
         "confirmed_lineup": "oficial",
         "official": "oficial",
         "web_estimated": "estimada por noticias",
+        "web_estimated_lineup": "estimada por noticias",
         "recent_lineup": "ultimo once conocido",
         "season_stats": "estimada por temporada",
     }
@@ -445,6 +447,9 @@ def _latest_prediction_row(
             p.source_json,
             m.home_team,
             m.away_team,
+            m.home_team_norm,
+            m.away_team_norm,
+            m.api_fixture_id,
             m.datetime_cdmx,
             m.time_cdmx
         FROM predictions p
@@ -463,8 +468,90 @@ def _latest_prediction_row(
     ).fetchone()
 
 
-def _prediction_summary_from_row(row: sqlite3.Row) -> dict[str, str]:
+def _lineup_payload_status(
+    connection: sqlite3.Connection,
+    fixture_id: Any,
+    team_norm: str,
+) -> str | None:
+    if fixture_id in (None, "") or str(fixture_id) == "nan" or not team_norm:
+        return None
+    fixture_key = str(int(fixture_id))
+    official_row = connection.execute(
+        """
+        SELECT source_json
+        FROM historical_lineups
+        WHERE fixture_id = ? AND team_norm = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (fixture_key, team_norm),
+    ).fetchone()
+    if official_row is not None:
+        payload = json.loads(official_row["source_json"] or "{}")
+        if len(payload.get("startXI") or []) >= 11:
+            return "confirmed_lineup"
+
+    estimate_row = connection.execute(
+        """
+        SELECT source_json
+        FROM lineup_estimates
+        WHERE fixture_id = ? AND team_norm = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (fixture_key, team_norm),
+    ).fetchone()
+    if estimate_row is not None:
+        payload = json.loads(estimate_row["source_json"] or "{}")
+        if len(payload.get("startXI") or []) >= 11:
+            return "web_estimated"
+    return None
+
+
+def _current_lineup_source(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    team_field: str,
+    team_norm_field: str,
+    fallback_source: str | None,
+) -> str | None:
+    team_norm = str(row[team_norm_field] or normalize_team_name(str(row[team_field])) or "")
+    live_source = _lineup_payload_status(
+        connection,
+        row["api_fixture_id"],
+        team_norm,
+    )
+    return live_source or fallback_source
+
+
+def _kickoff_label(row: sqlite3.Row, timezone_name: str) -> str:
+    kickoff = _as_datetime(str(row["datetime_cdmx"]), timezone_name)
+    return (
+        f"Inicio CDMX: {kickoff.strftime('%Y-%m-%d %H:%M')} "
+        f"({timezone_name})"
+    )
+
+
+def _prediction_summary_from_row(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    timezone_name: str,
+) -> dict[str, str]:
     source = json.loads(row["source_json"] or "{}")
+    home_lineup_source = _current_lineup_source(
+        connection,
+        row,
+        "home_team",
+        "home_team_norm",
+        source.get("home_lineup_source"),
+    )
+    away_lineup_source = _current_lineup_source(
+        connection,
+        row,
+        "away_team",
+        "away_team_norm",
+        source.get("away_lineup_source"),
+    )
     poisson = (
         f"{row['predicted_score']} "
         f"({_percentage(row['probability'])})"
@@ -481,15 +568,15 @@ def _prediction_summary_from_row(row: sqlite3.Row) -> dict[str, str]:
         f"2 {_percentage(row['away_win_probability'])}"
     )
     lineups = (
-        f"{row['home_team']}: {_lineup_label(source.get('home_lineup_source'))}; "
-        f"{row['away_team']}: {_lineup_label(source.get('away_lineup_source'))}"
+        f"{row['home_team']}: {_lineup_label(home_lineup_source)}; "
+        f"{row['away_team']}: {_lineup_label(away_lineup_source)}"
     )
     freshness = str(row["data_freshness_at"] or "no disponible")
     models = (
         f"{row['model_version']} / "
         f"{row['outcome_model_version'] or 'Poisson fallback'}"
     )
-    kickoff = f"Inicio: {row['time_cdmx']} (America/Mexico_City)"
+    kickoff = _kickoff_label(row, timezone_name)
     return {
         "poisson": poisson,
         "hybrid": hybrid,
@@ -498,6 +585,231 @@ def _prediction_summary_from_row(row: sqlite3.Row) -> dict[str, str]:
         "freshness": freshness,
         "models": models,
         "kickoff": kickoff,
+    }
+
+
+def _market_summary_from_source(source_json: str | None) -> str:
+    source = json.loads(source_json or "{}")
+    parts: list[str] = []
+    exact_score = source.get("odds_adjusted_exact_score")
+    exact_probability = source.get("odds_adjusted_probability")
+    if exact_score:
+        probability = (
+            f" ({float(exact_probability) * 100:.1f}%)"
+            if exact_probability is not None
+            else ""
+        )
+        parts.append(f"odds-aware {exact_score}{probability}")
+    markets = (source.get("odds_consensus") or {}).get("markets") or {}
+    one_x_two = markets.get("match_winner") or {}
+    if one_x_two:
+        values = []
+        for key, label in (("home", "1"), ("draw", "X"), ("away", "2")):
+            item = one_x_two.get(key) or {}
+            probability = item.get("probability")
+            if probability is not None:
+                values.append(f"{label} {float(probability) * 100:.1f}%")
+        if values:
+            parts.append("mercado 1-X-2 " + " | ".join(values))
+    return " | ".join(parts) if parts else "momios prepartido pendientes"
+
+
+def _latest_prediction_row_for_test(
+    connection: sqlite3.Connection,
+    match_id: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT
+            p.id AS prediction_id,
+            p.predicted_score,
+            p.probability,
+            p.hybrid_predicted_score,
+            p.hybrid_probability,
+            p.home_win_probability,
+            p.draw_probability,
+            p.away_win_probability,
+            p.model_version,
+            p.outcome_model_version,
+            p.data_freshness_at,
+            p.source_json,
+            m.home_team,
+            m.away_team,
+            m.home_team_norm,
+            m.away_team_norm,
+            m.api_fixture_id,
+            m.datetime_cdmx,
+            m.time_cdmx
+        FROM predictions p
+        INNER JOIN matches m ON m.match_id = p.match_id
+        WHERE p.match_id = ?
+        ORDER BY julianday(COALESCE(p.generated_at_utc, p.generated_at)) DESC,
+                 p.id DESC
+        LIMIT 1
+        """,
+        (match_id,),
+    ).fetchone()
+
+
+def _synthetic_starters(
+    connection: sqlite3.Connection,
+    team_norm: str,
+    team_name: str,
+) -> list[str]:
+    rows = connection.execute(
+        """
+        SELECT player, position_group
+        FROM players
+        WHERE team_norm = ?
+          AND COALESCE(is_active, 1) = 1
+        ORDER BY
+          CASE position_group
+            WHEN 'goalkeeper' THEN 0
+            WHEN 'defender' THEN 1
+            WHEN 'midfielder' THEN 2
+            WHEN 'forward' THEN 3
+            ELSE 4
+          END,
+          player
+        LIMIT 11
+        """,
+        (team_norm,),
+    ).fetchall()
+    starters = [str(row["player"]) for row in rows if row["player"]]
+    while len(starters) < 11:
+        starters.append(f"{team_name} Test Player {len(starters) + 1}")
+    return starters[:11]
+
+
+def send_isolated_lineup_test_notifications(
+    *,
+    date_str: str,
+    connection: sqlite3.Connection | None = None,
+    settings: Settings | None = None,
+    session: requests.Session | None = None,
+    send: bool = False,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    connection = connection or get_connection(settings.db_path)
+    now = datetime.now(ZoneInfo(settings.local_timezone))
+    if not settings.ntfy_enabled or not settings.ntfy_topic:
+        return {
+            "enabled": False,
+            "sent": 0,
+            "planned": 0,
+            "error_code": "ntfy_not_configured",
+        }
+
+    matches = connection.execute(
+        """
+        SELECT match_id, home_team, away_team, home_team_norm, away_team_norm,
+               time_cdmx, api_fixture_id
+        FROM matches
+        WHERE date_cdmx = ?
+        ORDER BY datetime_cdmx, home_team
+        """,
+        (date_str,),
+    ).fetchall()
+    adapter = NtfyAdapter(settings, session=session)
+    sent = 0
+    failed = 0
+    planned_payloads: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for match in matches:
+        prediction_row = _latest_prediction_row_for_test(connection, str(match["match_id"]))
+        if prediction_row is not None:
+            summary = _prediction_summary_from_row(
+                connection,
+                prediction_row,
+                settings.local_timezone,
+            )
+            market_summary = _market_summary_from_source(prediction_row["source_json"])
+        else:
+            kickoff = _as_datetime(
+                f"{date_str}T{match['time_cdmx']}:00",
+                settings.local_timezone,
+            )
+            summary = {
+                "poisson": "pendiente",
+                "hybrid": "pendiente",
+                "outcomes": "pendiente",
+                "freshness": "sin prediccion disponible",
+                "models": "n/d",
+                "kickoff": (
+                    f"Inicio CDMX: {kickoff.strftime('%Y-%m-%d %H:%M')} "
+                    f"({settings.local_timezone})"
+                ),
+            }
+            market_summary = "momios prepartido pendientes"
+
+        teams = (
+            (str(match["home_team"]), str(match["home_team_norm"]), str(match["away_team"])),
+            (str(match["away_team"]), str(match["away_team_norm"]), str(match["home_team"])),
+        )
+        fixture_note = (
+            f"Fixture API: {int(match['api_fixture_id'])}"
+            if match["api_fixture_id"] not in (None, "")
+            else "Fixture API pendiente"
+        )
+        for team_name, team_norm, opponent in teams:
+            starters = _synthetic_starters(connection, team_norm, team_name)
+            payload = {
+                "title": f"[PRUEBA AISLADA] Alineacion oficial: {team_name}",
+                "message": "\n".join(
+                    [
+                        "PRUEBA AISLADA - no corresponde a una alineacion real.",
+                        "XI sintetico de prueba; no usar como alineacion real.",
+                        summary["kickoff"],
+                        fixture_note,
+                        f"Rival: {opponent}",
+                        f"XI sintetico {team_name}: {', '.join(starters)}",
+                        f"Mini pronostico: Poisson {summary['poisson']}",
+                        f"Hibrido: {summary['hybrid']}",
+                        f"1-X-2: {summary['outcomes']}",
+                        f"Mercado: {market_summary}",
+                    ]
+                ),
+                "window_label": "isolated-lineup-test",
+                "notification_type": "isolated_lineup_test",
+                "priority": "4",
+            }
+            planned_payloads.append(
+                {
+                    "match_id": str(match["match_id"]),
+                    "team_norm": team_norm,
+                    "title": payload["title"],
+                }
+            )
+            if not send:
+                continue
+            result = adapter.send(payload, now)
+            if result.success:
+                sent += 1
+            else:
+                failed += 1
+                errors.append(
+                    {
+                        "match_id": str(match["match_id"]),
+                        "team_norm": team_norm,
+                        "status_code": result.status_code,
+                        "error_code": result.error_code,
+                        "retryable": result.retryable,
+                    }
+                )
+
+    return {
+        "enabled": True,
+        "date": date_str,
+        "mode": "synthetic_isolated",
+        "send": send,
+        "matches": len(matches),
+        "planned": len(planned_payloads),
+        "sent": sent,
+        "failed": failed,
+        "errors": errors,
+        "deliveries_mutated": False,
+        "planned_payloads": planned_payloads,
     }
 
 
@@ -511,7 +823,11 @@ def _latest_prediction_payload(
     if row is None:
         return None
 
-    summary = _prediction_summary_from_row(row)
+    summary = _prediction_summary_from_row(
+        connection,
+        row,
+        get_settings().local_timezone,
+    )
     title = (
         f"Pronostico {window_label.upper()}: "
         f"{row['home_team']} vs {row['away_team']}"
@@ -586,14 +902,22 @@ def _official_lineup_payload(
     if prediction_row is None:
         return {"status": "prediction_missing"}
 
-    if team_norm == str(match["home_team_norm"]):
+    home_norm = normalize_team_name(str(match["home_team"]))
+    away_norm = normalize_team_name(str(match["away_team"]))
+    if team_norm in {str(match["home_team_norm"]), home_norm}:
         team_name = str(match["home_team"])
         opponent = str(match["away_team"])
-    else:
+    elif team_norm in {str(match["away_team_norm"]), away_norm}:
         team_name = str(match["away_team"])
         opponent = str(match["home_team"])
+    else:
+        return {"status": "lineup_missing"}
     starters = _starting_xi_names(lineup_payload)
-    summary = _prediction_summary_from_row(prediction_row)
+    summary = _prediction_summary_from_row(
+        connection,
+        prediction_row,
+        get_settings().local_timezone,
+    )
     xi_text = ", ".join(starters)
     message = "\n".join(
         [
@@ -663,6 +987,9 @@ def dispatch_notifications(
     local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
     now_iso = _utc_iso(local_now)
     stale_sending = _utc_iso(local_now - timedelta(minutes=10))
+    official_expiry_before = _utc_iso(
+        local_now - timedelta(minutes=OFFICIAL_LINEUP_EXPIRATION_GRACE_MINUTES)
+    )
     with connection:
         connection.execute(
             """
@@ -683,9 +1010,26 @@ def dispatch_notifications(
                 error_code = 'kickoff_reached',
                 updated_at = ?
             WHERE status IN ('pending', 'waiting_prediction', 'retry', 'sending')
-              AND julianday(kickoff_at) <= julianday(?)
+              AND (
+                  (
+                      COALESCE(notification_type, ?) = ?
+                      AND julianday(kickoff_at) <= julianday(?)
+                  )
+                  OR (
+                      COALESCE(notification_type, ?) <> ?
+                      AND julianday(kickoff_at) <= julianday(?)
+                  )
+              )
             """,
-            (now_iso, now_iso),
+            (
+                now_iso,
+                PREDICTION_WINDOW_NOTIFICATION,
+                OFFICIAL_LINEUP_NOTIFICATION,
+                official_expiry_before,
+                PREDICTION_WINDOW_NOTIFICATION,
+                OFFICIAL_LINEUP_NOTIFICATION,
+                now_iso,
+            ),
         )
     expired = int(expired_cursor.rowcount)
     rows = connection.execute(
@@ -694,10 +1038,27 @@ def dispatch_notifications(
         FROM notification_deliveries
         WHERE status IN ('pending', 'waiting_prediction', 'retry')
           AND julianday(next_attempt_at) <= julianday(?)
-          AND julianday(kickoff_at) > julianday(?)
+          AND (
+              (
+                  COALESCE(notification_type, ?) = ?
+                  AND julianday(kickoff_at) > julianday(?)
+              )
+              OR (
+                  COALESCE(notification_type, ?) <> ?
+                  AND julianday(kickoff_at) > julianday(?)
+              )
+          )
         ORDER BY julianday(scheduled_for), id
         """,
-        (now_iso, now_iso),
+        (
+            now_iso,
+            PREDICTION_WINDOW_NOTIFICATION,
+            OFFICIAL_LINEUP_NOTIFICATION,
+            official_expiry_before,
+            PREDICTION_WINDOW_NOTIFICATION,
+            OFFICIAL_LINEUP_NOTIFICATION,
+            now_iso,
+        ),
     ).fetchall()
     sent = 0
     retried = 0

@@ -123,6 +123,75 @@ def test_render_predictions_html_shows_last_updated_in_cdmx() -> None:
     assert "Ultima actualizacion: 2026-06-13 18:45:00 CDMX" in html
 
 
+def test_render_predictions_html_shows_market_dashboard() -> None:
+    match_rows = [
+        {
+            "match_id": "match-market",
+            "date_cdmx": "2026-06-18",
+            "time_cdmx": "19:00",
+            "datetime_cdmx": "2026-06-18T19:00:00-06:00",
+            "home_team": "Mexico",
+            "away_team": "South Korea",
+            "home_team_norm": "mexico",
+            "away_team_norm": "south_korea",
+            "group_name": "A",
+            "stadium": "Estadio",
+            "stage": "group",
+            "status": "NS",
+            "api_fixture_id": 1489388,
+            "predicted_score": "2-1",
+            "probability": 0.19,
+            "model_version": "poisson_v1",
+            "hybrid_predicted_score": "1-1",
+            "hybrid_probability": 0.17,
+            "home_win_probability": 0.56,
+            "draw_probability": 0.25,
+            "away_win_probability": 0.19,
+            "outcome_model_version": "logit_v1",
+            "data_freshness_at": "2026-06-18T18:30:00-06:00",
+            "generated_at": "2026-06-18T18:30:00-06:00",
+            "actual_home_goals": None,
+            "actual_away_goals": None,
+            "odds_adjusted_exact_score": "2-0",
+            "odds_adjusted_probability": 0.1234,
+            "odds_consensus_full": {
+                "markets": {
+                    "match_winner": {
+                        "home": {"probability": 0.48, "median_decimal_odd": 2.05, "bookmakers": 8},
+                        "draw": {"probability": 0.28, "median_decimal_odd": 3.35, "bookmakers": 8},
+                        "away": {"probability": 0.24, "median_decimal_odd": 4.10, "bookmakers": 8},
+                    },
+                    "goals_over_under:2.5": {
+                        "over": {"probability": 0.54, "median_decimal_odd": 1.86, "bookmakers": 7},
+                        "under": {"probability": 0.46, "median_decimal_odd": 2.02, "bookmakers": 7},
+                    },
+                    "both_teams_score": {
+                        "yes": {"probability": 0.58, "median_decimal_odd": 1.78, "bookmakers": 6},
+                        "no": {"probability": 0.42, "median_decimal_odd": 2.20, "bookmakers": 6},
+                    },
+                    "exact_score": {
+                        "2-0": {"probability": 0.12, "median_decimal_odd": 8.5, "bookmakers": 5},
+                        "1-1": {"probability": 0.10, "median_decimal_odd": 7.0, "bookmakers": 5},
+                    },
+                    "cards_over_under:4.5": {
+                        "over": {"probability": 0.61, "median_decimal_odd": 1.72, "bookmakers": 4},
+                    },
+                }
+            },
+        }
+    ]
+
+    html = render_predictions_html(match_rows, {}, {})
+
+    assert "Mercados y apuestas" in html
+    assert "Formula: Poisson + fortaleza del modelo" in html
+    assert "Marcador odds-aware" in html
+    assert "momio 2.05" in html
+    assert "Ambos anotan: si" in html
+    assert "Tarjetas 4.5 over" in html
+    assert "no es recomendacion financiera" in html
+
+
 def test_render_predictions_html_labels_web_estimated_lineup() -> None:
     match_rows = [
         {

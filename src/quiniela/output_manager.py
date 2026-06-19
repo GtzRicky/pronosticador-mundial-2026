@@ -6,7 +6,9 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any
+import uuid
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -14,6 +16,7 @@ import pandas as pd
 from quiniela.config import get_settings
 from quiniela.db import fetch_dataframe, get_connection
 from quiniela.html_report import (
+    _attach_odds_consensus,
     _load_lineups_by_fixture,
     _load_prediction_impacts,
     _fill_snapshot_impacts,
@@ -39,15 +42,43 @@ STABLE_LOG_FILES = {
 
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.replace(temporary, path)
+    last_error: OSError | None = None
+    for _ in range(3):
+        temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            temporary.write_text(content, encoding="utf-8")
+            os.replace(temporary, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
+            time.sleep(0.1)
+    if last_error:
+        raise last_error
 
 
 def _atomic_write_dataframe(frame: pd.DataFrame, path: Path) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    frame.to_csv(temporary, index=False, encoding="utf-8")
-    os.replace(temporary, path)
+    last_error: OSError | None = None
+    for _ in range(3):
+        temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            frame.to_csv(temporary, index=False, encoding="utf-8")
+            os.replace(temporary, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
+            time.sleep(0.1)
+    if last_error:
+        raise last_error
 
 
 def _score_parts(value: Any) -> tuple[int | None, int | None]:
@@ -148,8 +179,14 @@ def _prediction_rows_for_evaluation(
         SELECT p.*, m.datetime_cdmx,
                ar.home_goals AS actual_home_goals,
                ar.away_goals AS actual_away_goals,
-               json_extract(p.source_json, '$.lambda_home') AS lambda_home,
-               json_extract(p.source_json, '$.lambda_away') AS lambda_away
+               CASE
+                   WHEN json_valid(p.source_json)
+                   THEN json_extract(p.source_json, '$.lambda_home')
+               END AS lambda_home,
+               CASE
+                   WHEN json_valid(p.source_json)
+                   THEN json_extract(p.source_json, '$.lambda_away')
+               END AS lambda_away
         FROM predictions p
         INNER JOIN matches m ON m.match_id = p.match_id
         INNER JOIN actual_results ar ON ar.match_id = p.match_id
@@ -260,8 +297,30 @@ def _history_frame(connection: sqlite3.Connection) -> pd.DataFrame:
             p.data_freshness_at,
             p.is_pre_kickoff,
             CASE WHEN c.prediction_id = p.id THEN 1 ELSE 0 END AS is_canonical,
-            json_extract(p.source_json, '$.home_lineup_source') AS home_lineup_source,
-            json_extract(p.source_json, '$.away_lineup_source') AS away_lineup_source,
+            CASE
+                WHEN json_valid(p.source_json)
+                THEN json_extract(p.source_json, '$.home_lineup_source')
+            END AS home_lineup_source,
+            CASE
+                WHEN json_valid(p.source_json)
+                THEN json_extract(p.source_json, '$.away_lineup_source')
+            END AS away_lineup_source,
+            CASE
+                WHEN json_valid(p.source_json)
+                THEN json_extract(p.source_json, '$.odds_consensus')
+            END AS odds_consensus,
+            CASE
+                WHEN json_valid(p.source_json)
+                THEN json_extract(p.source_json, '$.odds_adjusted_exact_score')
+            END AS odds_adjusted_exact_score,
+            CASE
+                WHEN json_valid(p.source_json)
+                THEN json_extract(p.source_json, '$.odds_adjusted_probability')
+            END AS odds_adjusted_probability,
+            CASE
+                WHEN json_valid(p.source_json)
+                THEN json_extract(p.source_json, '$.odds_model_version')
+            END AS odds_model_version,
             ar.home_goals AS actual_home_goals,
             ar.away_goals AS actual_away_goals,
             pe.goal_mae,
@@ -632,6 +691,7 @@ def rebuild_outputs(
     )
 
     all_rows = _html_rows(connection, latest, timelines)
+    _attach_odds_consensus(connection, all_rows)
     today_rows = [
         row for row in all_rows if str(row["date_cdmx"]) == local_now.date().isoformat()
     ]

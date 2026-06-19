@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import requests
@@ -21,6 +22,9 @@ class APILimitReachedError(RuntimeError):
 
 
 class APIFootballClient:
+    TRANSIENT_STATUS_CODES = {408, 500, 502, 503, 504}
+    RETRY_DELAYS_SECONDS = (0.5, 1.0)
+
     def __init__(
         self,
         settings: Settings | None = None,
@@ -47,7 +51,13 @@ class APIFootballClient:
         if not self.force_refresh:
             cached = get_cached_response(self.connection, endpoint, params)
             if cached is not None:
-                record_api_usage(self.connection, endpoint, params, cache_hit=True, status_code=200)
+                record_api_usage(
+                    self.connection,
+                    endpoint,
+                    params,
+                    cache_hit=True,
+                    status_code=200,
+                )
                 return cached
         else:
             delete_cached_response(self.connection, endpoint, params)
@@ -57,12 +67,15 @@ class APIFootballClient:
             return self._empty_response("dry_run_no_request")
 
         if not self.settings.api_football_key:
-            self.logger.warning("No hay API_FOOTBALL_KEY; devolviendo respuesta vacía para %s", endpoint)
+            self.logger.warning(
+                "No hay API_FOOTBALL_KEY; devolviendo respuesta vacia para %s",
+                endpoint,
+            )
             return self._empty_response("missing_api_key")
 
         if count_api_requests_today(self.connection) >= self.settings.api_daily_limit:
             raise APILimitReachedError(
-                f"Se alcanzó el límite diario de {self.settings.api_daily_limit} requests."
+                f"Se alcanzo el limite diario de {self.settings.api_daily_limit} requests."
             )
 
         headers = {
@@ -70,22 +83,54 @@ class APIFootballClient:
             "x-apisports-host": self.settings.api_football_host,
             "x-rapidapi-host": self.settings.api_football_host,
         }
-
         url = f"{self.base_url}{endpoint}"
-        response = self.session.get(url, params=params or {}, headers=headers, timeout=30)
-        record_api_usage(
-            self.connection,
-            endpoint,
-            params,
-            cache_hit=False,
-            status_code=response.status_code,
-        )
-        if response.status_code == 429:
-            raise APILimitReachedError("API-Football devolvió 429 Too Many Requests.")
-        response.raise_for_status()
-        payload = response.json()
-        set_cached_response(self.connection, endpoint, params, payload, status_code=response.status_code)
-        return payload
+        last_error: requests.RequestException | None = None
+        max_attempts = len(self.RETRY_DELAYS_SECONDS) + 1
+
+        for attempt in range(max_attempts):
+            try:
+                response = self.session.get(
+                    url,
+                    params=params or {},
+                    headers=headers,
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt + 1 >= max_attempts:
+                    raise
+                time.sleep(self.RETRY_DELAYS_SECONDS[attempt])
+                continue
+
+            record_api_usage(
+                self.connection,
+                endpoint,
+                params,
+                cache_hit=False,
+                status_code=response.status_code,
+            )
+            if response.status_code == 429:
+                raise APILimitReachedError("API-Football devolvio 429 Too Many Requests.")
+            if (
+                response.status_code in self.TRANSIENT_STATUS_CODES
+                and attempt + 1 < max_attempts
+            ):
+                time.sleep(self.RETRY_DELAYS_SECONDS[attempt])
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            set_cached_response(
+                self.connection,
+                endpoint,
+                params,
+                payload,
+                status_code=response.status_code,
+            )
+            return payload
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"No se pudo completar la solicitud API para {endpoint}.")
 
     def search_teams(self, team_name: str) -> dict[str, Any]:
         return self._request("/teams", {"search": team_name})
@@ -110,6 +155,24 @@ class APIFootballClient:
 
     def get_odds(self, fixture_id: int | str) -> dict[str, Any]:
         return self._request("/odds", {"fixture": fixture_id})
+
+    def get_odds_by_date(
+        self,
+        date: str,
+        *,
+        league: int | str = 1,
+        season: int | str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"date": date, "league": league}
+        if season is not None:
+            params["season"] = season
+        return self._request("/odds", params)
+
+    def get_odds_bookmakers(self) -> dict[str, Any]:
+        return self._request("/odds/bookmakers")
+
+    def get_odds_bets(self) -> dict[str, Any]:
+        return self._request("/odds/bets")
 
     def get_team_fixtures(self, team_id: int | str, from_date: str, to_date: str) -> dict[str, Any]:
         return self.get_fixtures(team=team_id, **{"from": from_date, "to": to_date})

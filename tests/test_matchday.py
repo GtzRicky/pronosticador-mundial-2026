@@ -44,6 +44,15 @@ def test_plan_post_match_uses_current_fifteen_minute_slot() -> None:
     assert post[0].run_key == "post:match-1:1"
 
 
+def test_plan_post_match_recovers_terminal_match_without_result() -> None:
+    kickoff = "2026-06-13T13:00:00-06:00"
+    now = datetime(2026, 6, 13, 15, 0, tzinfo=TZ)
+    actions = plan_matchday_actions([_match(kickoff, status="FT")], now)
+    post = [action for action in actions if action.action == "post_match"]
+    assert len(post) == 1
+    assert post[0].run_key == "post:match-1:1"
+
+
 def test_runner_is_idempotent_and_records_failures(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "runner.sqlite")
     calls = []

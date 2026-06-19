@@ -142,6 +142,64 @@ def test_canonical_prediction_uses_real_timestamp_and_exports_all_versions(
     assert not list(settings.predictions_dir.glob(".*.tmp"))
 
 
+def test_prediction_source_json_is_strict_json_when_nan_present(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "strict-json.sqlite")
+    _seed_match(connection)
+
+    insert_prediction_rows(
+        connection,
+        pd.DataFrame(
+            [
+                {
+                    **_prediction("2026-06-13T18:59:00+00:00", "0-1", pre_kickoff=1),
+                    "odds_adjusted_probability": float("nan"),
+                    "odds_adjusted_exact_score": None,
+                }
+            ]
+        ),
+    )
+
+    row = connection.execute(
+        "SELECT json_valid(source_json) AS valid, source_json FROM predictions"
+    ).fetchone()
+    assert row["valid"] == 1
+    assert "NaN" not in row["source_json"]
+
+
+def test_rebuild_outputs_tolerates_legacy_malformed_prediction_json(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(outputs, "get_settings", lambda: settings)
+    connection = get_connection(settings.db_path)
+    _seed_match(connection)
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO predictions (
+                match_id, datetime_cdmx, group_name,
+                home_team, away_team, predicted_score, probability,
+                model_version, source_json, generated_at_utc,
+                is_pre_kickoff
+            ) VALUES (
+                'match-1', '2026-06-13T13:00:00-06:00', 'B',
+                'Catar', 'Suiza', '0-1', 0.2,
+                'poisson-test', '{"odds_adjusted_probability": NaN}',
+                '2026-06-13T18:59:00+00:00', 1
+            )
+            """
+        )
+
+    summary = outputs.rebuild_outputs(
+        connection,
+        now=datetime(2026, 6, 13, 14, 0, tzinfo=TZ),
+    )
+
+    assert summary["history_rows"] == 1
+    assert (settings.predictions_dir / "today.html").exists()
+
+
 def test_impacts_are_append_only_per_prediction(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "impacts.sqlite")
     _seed_match(connection)
