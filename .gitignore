@@ -17,6 +17,8 @@ outputs/logs/*.csv
 outputs/logs/*.md
 outputs/bundles/
 data/db/*.db
+data/db/*.db*
+data/db/*-journal
 scripts/__pycache__/
 src/quiniela/__pycache__/
 tests/__pycache__/

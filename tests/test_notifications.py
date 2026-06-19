@@ -16,6 +16,7 @@ from quiniela.notifications import (
     dispatch_notifications,
     queue_official_lineup_notifications,
     schedule_due_notifications,
+    send_isolated_lineup_test_notifications,
     test_notifications as send_test_notifications,
 )
 
@@ -245,6 +246,60 @@ def test_dispatch_sends_both_channels_without_persisting_secrets(tmp_path: Path)
     assert "discord.test" not in persisted
     assert ntfy.calls[0]["headers"]["Priority"] == "4"
     assert discord.calls[0]["json"]["allowed_mentions"] == {"parse": []}
+
+
+def test_prediction_notification_uses_live_official_lineups_and_full_local_kickoff(
+    tmp_path: Path,
+) -> None:
+    connection = get_connection(tmp_path / "prediction-live-lineups.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    with connection:
+        connection.execute(
+            """
+            UPDATE predictions
+            SET source_json = ?
+            WHERE match_id = 'match-1'
+            """,
+            (
+                json.dumps(
+                    {
+                        "home_lineup_source": "recent_lineup",
+                        "away_lineup_source": "recent_lineup",
+                    }
+                ),
+            ),
+        )
+    _store_official_lineup(
+        connection,
+        team_norm="mexico",
+        payload=_official_lineup_payload("Mexico"),
+    )
+    _store_official_lineup(
+        connection,
+        team_norm="canada",
+        payload=_official_lineup_payload("Canada"),
+    )
+    settings = _settings(discord_enabled=False)
+    now = datetime(2026, 6, 13, 12, 46, tzinfo=TZ)
+    schedule_due_notifications(connection, now=now, settings=settings)
+
+    dispatch_notifications(
+        connection,
+        now=now,
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200))},
+    )
+
+    payload_json = connection.execute(
+        """
+        SELECT payload_json
+        FROM notification_deliveries
+        WHERE notification_type = 'prediction_window'
+        """
+    ).fetchone()["payload_json"]
+    assert "Inicio CDMX: 2026-06-13 13:00 (America/Mexico_City)" in payload_json
+    assert "Mexico: oficial; Canada: oficial" in payload_json
 
 
 def test_missing_prediction_waits_without_attempt_then_sends(tmp_path: Path) -> None:
@@ -523,6 +578,88 @@ def test_dispatch_sends_official_lineup_with_prediction_summary(tmp_path: Path) 
     assert "Mini pronostico" in row["payload_json"]
 
 
+def test_dispatch_sends_official_lineup_shortly_after_kickoff(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "official-dispatch-after-kickoff.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False)
+    lineup_payload = _official_lineup_payload("Mexico")
+    _store_official_lineup(
+        connection,
+        team_norm="mexico",
+        payload=lineup_payload,
+    )
+    queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload={"response": [lineup_payload]},
+        now=datetime(2026, 6, 13, 12, 40, tzinfo=TZ),
+        settings=settings,
+    )
+
+    result = dispatch_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 13, 10, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200))},
+    )
+
+    row = connection.execute(
+        "SELECT status, error_code FROM notification_deliveries"
+    ).fetchone()
+    assert result["sent"] == 1
+    assert row["status"] == "sent"
+    assert row["error_code"] is None
+
+
+def test_dispatch_official_lineup_uses_canonical_name_when_match_norm_is_legacy(
+    tmp_path: Path,
+) -> None:
+    connection = get_connection(tmp_path / "official-legacy-norm.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    with connection:
+        connection.execute(
+            """
+            UPDATE matches
+            SET home_team = 'Suiza',
+                away_team = 'Bosnia y Herzegovina',
+                home_team_norm = 'suiza',
+                away_team_norm = 'bosnia_herzegovina'
+            WHERE match_id = 'match-1'
+            """
+        )
+    settings = _settings(discord_enabled=False)
+    lineup_payload = _official_lineup_payload("Switzerland")
+    _store_official_lineup(
+        connection,
+        team_norm="switzerland",
+        payload=lineup_payload,
+    )
+    queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload={"response": [lineup_payload]},
+        now=datetime(2026, 6, 13, 12, 40, tzinfo=TZ),
+        settings=settings,
+    )
+
+    dispatch_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 12, 45, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200))},
+    )
+
+    payload = connection.execute(
+        "SELECT payload_json FROM notification_deliveries"
+    ).fetchone()["payload_json"]
+    assert "Alineacion oficial: Suiza" in payload
+    assert "Rival: Bosnia y Herzegovina" in payload
+
+
 def test_changed_official_lineup_after_sent_creates_new_delivery(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "official-changed-after-sent.sqlite")
     _seed_match(connection)
@@ -722,3 +859,44 @@ def test_manual_test_messages_do_not_require_global_switch(tmp_path: Path) -> No
 
     assert result["results"]["ntfy"]["success"] is True
     assert result["results"]["discord"]["success"] is True
+
+
+def test_isolated_lineup_test_sends_without_outbox_mutation(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "isolated-lineup-test.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO players (
+                team, team_norm, player, player_norm, position_group
+            ) VALUES
+                ('Mexico', 'mexico', 'Mexico GK', 'mexico_gk', 'goalkeeper'),
+                ('Mexico', 'mexico', 'Mexico DF', 'mexico_df', 'defender'),
+                ('Canada', 'canada', 'Canada GK', 'canada_gk', 'goalkeeper')
+            """
+        )
+    settings = _settings(discord_enabled=False)
+    ntfy = FakeSession(FakeResponse(200), FakeResponse(200))
+
+    before_count = connection.execute(
+        "SELECT COUNT(*) AS total FROM notification_deliveries"
+    ).fetchone()["total"]
+    result = send_isolated_lineup_test_notifications(
+        date_str="2026-06-13",
+        connection=connection,
+        settings=settings,
+        session=ntfy,
+        send=True,
+    )
+    after_count = connection.execute(
+        "SELECT COUNT(*) AS total FROM notification_deliveries"
+    ).fetchone()["total"]
+
+    assert result["mode"] == "synthetic_isolated"
+    assert result["sent"] == 2
+    assert result["deliveries_mutated"] is False
+    assert before_count == after_count == 0
+    assert ntfy.calls[0]["headers"]["Title"] == "[PRUEBA AISLADA] Alineacion oficial: Mexico"
+    assert "XI sintetico de prueba; no usar como alineacion real" in ntfy.calls[0]["data"].decode("utf-8")
+    assert "Mini pronostico: Poisson 2-1" in ntfy.calls[0]["data"].decode("utf-8")

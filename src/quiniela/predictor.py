@@ -19,6 +19,7 @@ from quiniela.outcome_model import (
     poisson_outcome_probabilities,
     predict_outcome_probabilities,
 )
+from quiniela.odds_loader import odds_adjusted_score_prediction, odds_consensus_summary
 from quiniela.player_model import load_player_model_artifact, persist_prediction_impacts
 from quiniela.poisson_model import PoissonScoreModel
 from quiniela.ratings import apply_ratings
@@ -101,6 +102,15 @@ class Predictor:
                 np.argmax(hybrid_matrix),
                 hybrid_matrix.shape,
             )
+            odds_adjusted = odds_adjusted_score_prediction(
+                self.connection,
+                fixture_id=row.get("api_fixture_id"),
+                poisson_matrix=score.matrix,
+            )
+            odds_consensus = odds_consensus_summary(
+                self.connection,
+                row.get("api_fixture_id"),
+            )
             data_freshness_at = self._data_freshness_at(row.get("api_fixture_id"), generated_at)
             home_impacts = row.get("home_player_impacts") or []
             away_impacts = row.get("away_player_impacts") or []
@@ -132,6 +142,16 @@ class Predictor:
                     "hybrid_probability": float(
                         hybrid_matrix[hybrid_home_goals, hybrid_away_goals]
                     ),
+                    "odds_adjusted_exact_score": (
+                        odds_adjusted.get("score") if odds_adjusted else None
+                    ),
+                    "odds_adjusted_probability": (
+                        odds_adjusted.get("probability") if odds_adjusted else None
+                    ),
+                    "odds_model_version": (
+                        odds_adjusted.get("model_version") if odds_adjusted else None
+                    ),
+                    "odds_consensus": odds_consensus,
                     "home_win_probability": outcome_probabilities["home"],
                     "draw_probability": outcome_probabilities["draw"],
                     "away_win_probability": outcome_probabilities["away"],
@@ -189,12 +209,14 @@ class Predictor:
                 UNION ALL
                 SELECT fetched_at FROM odds_snapshots WHERE fixture_id = ?
                 UNION ALL
+                SELECT calculated_at AS fetched_at FROM odds_market_consensus WHERE fixture_id = ?
+                UNION ALL
                 SELECT fetched_at FROM historical_team_stats WHERE fixture_id = ?
                 UNION ALL
                 SELECT fetched_at FROM fixture_player_stats WHERE fixture_id = ?
             )
             """,
-            (fixture_key, fixture_key, fixture_key, fixture_key, fixture_key),
+            (fixture_key, fixture_key, fixture_key, fixture_key, fixture_key, fixture_key),
         )
         if freshness_df.empty or pd.isna(freshness_df.iloc[0]["freshness_at"]):
             return fallback

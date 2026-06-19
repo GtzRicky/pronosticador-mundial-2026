@@ -1,5 +1,5 @@
 param(
-    [string]$TaskName = "Quiniela Mundial 2026 Matchday",
+    [string]$TaskName = "Quiniela Mundial 2026 Notifications",
     [switch]$DryRun
 )
 
@@ -14,7 +14,7 @@ if (Test-Path $VenvPython) {
     $Python = $PythonCommand.Source
     $PythonSource = "PATH"
 }
-$Runner = Join-Path $Root "scripts\15_run_matchday.py"
+$Runner = Join-Path $Root "scripts\27_run_notification_cycle.py"
 $Arguments = "`"$Runner`""
 $EnvPath = Join-Path $Root ".env"
 
@@ -23,7 +23,7 @@ if (-not (Test-Path $Runner)) {
 }
 
 if (-not (Test-Path $EnvPath)) {
-    Write-Warning "No se encontro .env en $Root. Copia .env.example a .env y configura API_FOOTBALL_KEY/ntfy antes de depender de la tarea."
+    Write-Warning "No se encontro .env en $Root. Configura ntfy antes de depender de la tarea."
 }
 
 if ($DryRun) {
@@ -38,9 +38,7 @@ if ($DryRun) {
         WakeToRun = $true
         StartWhenAvailable = $true
         MultipleInstances = "IgnoreNew"
-        AllowStartIfOnBatteries = $true
-        DontStopIfGoingOnBatteries = $true
-        ExecutionTimeLimitMinutes = 60
+        ExecutionTimeLimitMinutes = 3
     } | Format-List
     exit 0
 }
@@ -60,14 +58,14 @@ $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 60)
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
 
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Description "Actualiza fixtures, alineaciones, odds, resultados, predicciones, HTML y notificaciones del Mundial 2026." `
+    -Description "Despacha notificaciones pendientes y programa ventanas T-15/T-5 sin depender del refresh pesado." `
     -Force | Out-Null
 
 Write-Host "Tarea instalada: $TaskName"

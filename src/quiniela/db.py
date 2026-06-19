@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import math
 import sqlite3
 from typing import Any, Iterable
 
@@ -245,6 +246,63 @@ SCHEMA_STATEMENTS = [
         market TEXT,
         source_json TEXT NOT NULL,
         fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS odds_market_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id TEXT NOT NULL,
+        match_id TEXT,
+        bookmaker_id INTEGER,
+        bookmaker TEXT,
+        bet_id INTEGER,
+        market_key TEXT NOT NULL,
+        market_name TEXT NOT NULL,
+        selection_key TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        selection_team_norm TEXT,
+        line_key TEXT NOT NULL DEFAULT '',
+        handicap TEXT,
+        decimal_odd REAL NOT NULL,
+        implied_probability REAL NOT NULL,
+        suspended INTEGER NOT NULL DEFAULT 0,
+        source_update TEXT NOT NULL DEFAULT '',
+        source_json TEXT NOT NULL,
+        fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(fixture_id, bookmaker_id, market_key, selection_key, line_key, source_update)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS odds_market_consensus (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id TEXT NOT NULL,
+        match_id TEXT,
+        market_key TEXT NOT NULL,
+        market_name TEXT NOT NULL,
+        selection_key TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        line_key TEXT NOT NULL DEFAULT '',
+        consensus_probability REAL NOT NULL,
+        median_decimal_odd REAL,
+        bookmaker_count INTEGER NOT NULL,
+        overround_method TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        calculated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(fixture_id, market_key, selection_key, line_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS odds_model_predictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id TEXT NOT NULL,
+        match_id TEXT,
+        model_version TEXT NOT NULL,
+        market_key TEXT NOT NULL,
+        prediction_key TEXT NOT NULL,
+        probability REAL NOT NULL,
+        source_json TEXT NOT NULL,
+        calculated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(fixture_id, model_version, market_key, prediction_key)
     )
     """,
     """
@@ -525,8 +583,9 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     settings = get_settings()
     path = db_path or settings.db_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=30)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 30000")
     create_schema(connection)
     return connection
 
@@ -641,6 +700,18 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
             ON notification_deliveries(notification_type, match_id, team_norm, status, created_at)
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_odds_market_snapshots_fixture
+            ON odds_market_snapshots(fixture_id, market_key, line_key)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_odds_consensus_fixture
+            ON odds_market_consensus(fixture_id, market_key, line_key)
+            """
+        )
 
 
 def _executemany(connection: sqlite3.Connection, query: str, rows: Iterable[tuple[Any, ...]]) -> None:
@@ -663,8 +734,8 @@ def load_matches(connection: sqlite3.Connection, matches_df: pd.DataFrame) -> in
             row["datetime_cdmx"],
             row["home_team"],
             row["away_team"],
-            row["home_team_norm"],
-            row["away_team_norm"],
+            normalize_team_name(str(row["home_team"]), strict=True),
+            normalize_team_name(str(row["away_team"]), strict=True),
             row["group"],
             row["stadium"],
             row["stage"],
@@ -722,11 +793,17 @@ def load_teams(connection: sqlite3.Connection, matches_df: pd.DataFrame, rosters
     teams: dict[str, str] = {}
 
     for row in matches_df.to_dict(orient="records"):
-        teams.setdefault(row["home_team_norm"], row["home_team"])
-        teams.setdefault(row["away_team_norm"], row["away_team"])
+        teams.setdefault(
+            normalize_team_name(str(row["home_team"]), strict=True),
+            row["home_team"],
+        )
+        teams.setdefault(
+            normalize_team_name(str(row["away_team"]), strict=True),
+            row["away_team"],
+        )
 
     for row in rosters_df.to_dict(orient="records"):
-        teams.setdefault(row["team_norm"], row["team"])
+        teams.setdefault(normalize_team_name(str(row["team"]), strict=True), row["team"])
 
     rows = [(name, norm) for norm, name in sorted(teams.items())]
     _executemany(
@@ -1348,6 +1425,25 @@ def insert_prediction_player_impacts(
             )
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
 def insert_prediction_rows(
     connection: sqlite3.Connection,
     predictions_df: pd.DataFrame,
@@ -1355,6 +1451,7 @@ def insert_prediction_rows(
     inserted_ids: list[int] = []
     with connection:
         for row in predictions_df.to_dict(orient="records"):
+            safe_row = _json_safe(row)
             cursor = connection.execute(
                 """
                 INSERT INTO predictions (
@@ -1391,7 +1488,7 @@ def insert_prediction_rows(
                     else None,
                     row.get("outcome_model_version"),
                     row.get("data_freshness_at"),
-                    json.dumps(row, ensure_ascii=False),
+                    json.dumps(safe_row, ensure_ascii=False, allow_nan=False),
                     row.get("prediction_context", "manual"),
                     row.get("window_label"),
                     row.get("generated_at_utc") or row.get("generated_at"),
@@ -1416,7 +1513,7 @@ def claim_automation_run(
     with connection:
         existing = connection.execute(
             """
-            SELECT status
+            SELECT status, details_json
             FROM automation_runs
             WHERE run_key = ?
             """,
@@ -1424,6 +1521,38 @@ def claim_automation_run(
         ).fetchone()
         if existing is not None:
             if str(existing["status"]) != "running":
+                try:
+                    existing_details = json.loads(existing["details_json"] or "{}")
+                except json.JSONDecodeError:
+                    existing_details = {}
+                if (
+                    str(existing["status"]) == "failed"
+                    and existing_details.get("error_code")
+                    == "stale_automation_run_recovered"
+                ):
+                    cursor = connection.execute(
+                        """
+                        UPDATE automation_runs
+                        SET action = ?,
+                            match_id = ?,
+                            scheduled_for = ?,
+                            status = 'running',
+                            details_json = ?,
+                            started_at = CURRENT_TIMESTAMP,
+                            finished_at = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE run_key = ?
+                          AND status = 'failed'
+                        """,
+                        (
+                            action,
+                            match_id,
+                            scheduled_for,
+                            details_payload,
+                            run_key,
+                        ),
+                    )
+                    return cursor.rowcount == 1
                 return False
             cursor = connection.execute(
                 """
@@ -1492,6 +1621,71 @@ def finish_automation_run(
                 run_key,
             ),
         )
+
+
+def recover_stale_automation_runs(
+    connection: sqlite3.Connection,
+    *,
+    stale_after_minutes: int = 25,
+    apply: bool = False,
+) -> dict[str, Any]:
+    stale_modifier = f"-{int(stale_after_minutes)} minutes"
+    rows = connection.execute(
+        """
+        SELECT run_key, action, match_id, scheduled_for, details_json, started_at
+        FROM automation_runs
+        WHERE status = 'running'
+          AND finished_at IS NULL
+          AND julianday(started_at) <= julianday('now', ?)
+        ORDER BY started_at
+        """,
+        (stale_modifier,),
+    ).fetchall()
+    recovered: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            original_details = json.loads(row["details_json"] or "{}")
+        except json.JSONDecodeError:
+            original_details = {"raw_details_json": row["details_json"]}
+        details = {
+            **original_details,
+            "error": "stale_automation_run_recovered",
+            "error_code": "stale_automation_run_recovered",
+            "reason": "stale_automation_run_recovered",
+            "stale_after_minutes": int(stale_after_minutes),
+            "original_started_at": row["started_at"],
+        }
+        recovered.append(
+            {
+                "run_key": row["run_key"],
+                "action": row["action"],
+                "match_id": row["match_id"],
+                "started_at": row["started_at"],
+            }
+        )
+        if apply:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE automation_runs
+                    SET status = 'failed',
+                        details_json = ?,
+                        finished_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE run_key = ?
+                      AND status = 'running'
+                    """,
+                    (
+                        json.dumps(details, ensure_ascii=False),
+                        row["run_key"],
+                    ),
+                )
+    return {
+        "apply": bool(apply),
+        "stale_after_minutes": int(stale_after_minutes),
+        "recovered": len(recovered),
+        "runs": recovered,
+    }
 
 
 def insert_pre_match_snapshot(
