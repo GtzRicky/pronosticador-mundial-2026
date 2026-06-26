@@ -19,6 +19,7 @@ from quiniela.notifications import (
     notification_status,
     queue_official_lineup_notifications,
     retry_failed_notifications,
+    run_notification_watchdog,
     schedule_due_notifications,
     send_isolated_lineup_test_notifications,
     test_notifications as send_test_notifications,
@@ -396,6 +397,48 @@ def test_retry_after_and_channel_failures_are_independent(tmp_path: Path) -> Non
     assert ntfy["error_code"] == "http_429"
     assert ntfy["payload_hash"]
     assert discord["status"] == "sent"
+
+
+def test_official_lineup_retry_uses_expiration_not_kickoff(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "official-retry.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False)
+    lineup = _official_lineup_payload("Mexico")
+    _store_official_lineup(
+        connection,
+        team_norm="mexico",
+        payload=lineup,
+    )
+    queue_official_lineup_notifications(
+        connection,
+        match_id="match-1",
+        kickoff_at="2026-06-13T13:00:00-06:00",
+        lineups_payload={"response": [lineup]},
+        now=datetime(2026, 6, 13, 13, 5, tzinfo=TZ),
+        settings=settings,
+    )
+
+    result = dispatch_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 13, 10, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(429, {"Retry-After": "120"}))},
+    )
+
+    row = connection.execute(
+        """
+        SELECT status, error_code, next_attempt_at, attempt_count
+        FROM notification_deliveries
+        """
+    ).fetchone()
+    assert result["retry"] == 1
+    assert dict(row) == {
+        "status": "retry",
+        "error_code": "http_429",
+        "next_attempt_at": "2026-06-13T19:12:00Z",
+        "attempt_count": 1,
+    }
 
 
 def test_permanent_client_error_and_kickoff_expiration(tmp_path: Path) -> None:
@@ -942,6 +985,143 @@ def test_notification_status_dry_run_explain_and_retry_failed(tmp_path: Path) ->
     assert applied_retry["updated"] == 1
     assert retried["status"] == "retry"
     assert retried["error_code"] == "manual_retry_requested"
+
+
+def test_notification_watchdog_dispatches_outbox_without_refresh(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "watchdog.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False, logs_dir=tmp_path / "logs")
+    schedule_due_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 12, 56, tzinfo=TZ),
+        settings=settings,
+    )
+    ntfy = FakeSession(FakeResponse(200))
+
+    result = run_notification_watchdog(
+        connection,
+        now=datetime(2026, 6, 13, 12, 57, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": ntfy},
+    )
+
+    row = connection.execute(
+        "SELECT status FROM notification_deliveries"
+    ).fetchone()
+    assert result["sent"] == 1
+    assert result["open_due"] == 0
+    assert row["status"] == "sent"
+    assert (settings.logs_dir / "notification_watchdog_runs.jsonl").exists()
+    health = json.loads(
+        (settings.logs_dir / "notification_health.json").read_text(encoding="utf-8")
+    )
+    assert health["last_success_at"] == "2026-06-13T18:57:00Z"
+
+
+def test_notification_watchdog_recovers_failed_non_expired_only(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "watchdog-retry.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False, logs_dir=tmp_path / "logs")
+    schedule_due_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 12, 56, tzinfo=TZ),
+        settings=settings,
+    )
+    with connection:
+        connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = 'failed',
+                error_code = 'network_error',
+                expires_at = '2026-06-13T19:00:00Z'
+            """
+        )
+
+    result = run_notification_watchdog(
+        connection,
+        now=datetime(2026, 6, 13, 12, 57, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200))},
+    )
+
+    assert result["recovered_failed"] == 1
+    assert result["sent"] == 1
+
+
+def test_notification_watchdog_dedupes_ops_alerts(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "watchdog-alerts.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False, logs_dir=tmp_path / "logs")
+    schedule_due_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 12, 56, tzinfo=TZ),
+        settings=settings,
+    )
+    with connection:
+        connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = 'sending',
+                updated_at = '2026-06-13T18:40:00Z'
+            """
+        )
+    ops = FakeSession(FakeResponse(200))
+
+    first = run_notification_watchdog(
+        connection,
+        now=datetime(2026, 6, 13, 12, 57, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200)), "ntfy_ops": ops},
+    )
+    with connection:
+        connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = 'sending',
+                updated_at = '2026-06-13T18:41:00Z'
+            """
+        )
+    second = run_notification_watchdog(
+        connection,
+        now=datetime(2026, 6, 13, 13, 0, tzinfo=TZ),
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(200)), "ntfy_ops": ops},
+    )
+
+    assert first["alerts_sent"] == 1
+    assert second["alerts_sent"] == 0
+    assert len(ops.calls) == 1
+
+
+def test_notification_watchdog_records_sqlite_lock_on_connect(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _settings(discord_enabled=False, logs_dir=tmp_path / "logs")
+    monkeypatch.setattr(
+        notifications_module,
+        "get_connection",
+        lambda _path: (_ for _ in ()).throw(
+            notifications_module.sqlite3.OperationalError("database is locked")
+        ),
+    )
+
+    result = run_notification_watchdog(
+        connection=None,
+        now=datetime(2026, 6, 13, 12, 57, tzinfo=TZ),
+        settings=settings,
+    )
+
+    assert result["failed"] == 1
+    assert result["error"] == "database is locked"
+    assert (settings.logs_dir / "notification_watchdog_runs.jsonl").exists()
+    health = json.loads(
+        (settings.logs_dir / "notification_health.json").read_text(encoding="utf-8")
+    )
+    assert health["last_error"] == "database is locked"
 
 
 def test_retry_failed_notifications_skips_expired_failures(tmp_path: Path) -> None:

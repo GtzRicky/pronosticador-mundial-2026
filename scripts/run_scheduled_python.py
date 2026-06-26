@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import runpy
@@ -28,12 +29,43 @@ def _rotate_error_log(path: Path) -> None:
 
 
 def _record_failure(path: Path, script_path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _rotate_error_log(path)
-    with path.open("a", encoding="utf-8") as handle:
-        timestamp = datetime.now(timezone.utc).isoformat()
-        handle.write(f"\n[{timestamp}] Scheduled script failed: {script_path}\n")
-        traceback.print_exc(file=handle)
+    candidates = [
+        path,
+        Path(tempfile.gettempdir()) / "quiniela_notification_watchdog" / path.name,
+    ]
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_error_log(candidate)
+            with candidate.open("a", encoding="utf-8") as handle:
+                timestamp = datetime.now(timezone.utc).isoformat()
+                handle.write(f"\n[{timestamp}] Scheduled script failed: {script_path}\n")
+                traceback.print_exc(file=handle)
+            return
+        except OSError:
+            continue
+
+
+def _record_skip(path: Path, script_path: Path, lock_file: Path) -> None:
+    payload = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "script": str(script_path),
+        "lock_file": str(lock_file),
+        "reason": "lock_busy",
+        "pid": os.getpid(),
+    }
+    candidates = [
+        path,
+        Path(tempfile.gettempdir()) / "quiniela_notification_watchdog" / path.name,
+    ]
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            with candidate.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            return
+        except OSError:
+            continue
 
 
 def _default_lock_file(working_directory: Path) -> Path:
@@ -127,6 +159,12 @@ def main() -> int:
     parser.add_argument("--working-directory", required=True)
     parser.add_argument("--error-log", required=True)
     parser.add_argument("--lock-file")
+    parser.add_argument("--skip-log")
+    parser.add_argument(
+        "--skip-if-lock-busy",
+        action="store_true",
+        help="Exit successfully instead of logging a failure when the scheduler lock is busy.",
+    )
     parser.add_argument(
         "--lock-timeout-seconds",
         type=float,
@@ -141,6 +179,11 @@ def main() -> int:
         Path(args.lock_file).resolve()
         if args.lock_file
         else _default_lock_file(working_directory)
+    )
+    skip_log = (
+        Path(args.skip_log).resolve()
+        if args.skip_log
+        else working_directory / "outputs" / "logs" / "scheduler_skips.jsonl"
     )
     if not script_path.is_file():
         raise FileNotFoundError(f"Scheduled script not found: {script_path}")
@@ -160,6 +203,12 @@ def main() -> int:
                 timeout_seconds=args.lock_timeout_seconds,
             ):
                 runpy.run_path(str(script_path), run_name="__main__")
+        except TimeoutError:
+            if args.skip_if_lock_busy:
+                _record_skip(skip_log, script_path, lock_file)
+                return 0
+            _record_failure(error_log, script_path)
+            return 1
         except SystemExit as exc:
             if exc.code in (None, 0):
                 return 0

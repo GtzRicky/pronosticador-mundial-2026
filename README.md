@@ -832,6 +832,7 @@ python -m quiniela.cli fetch-today --help
 | `29_fetch_odds.py` | `fetch-odds` | Obtener odds por fecha. |
 | `30_build_odds_consensus.py` | `build-odds-consensus` | Construir consenso. |
 | `31_send_lineup_test_notifications.py` | `send-lineup-test-notifications` | Probar push de lineup. |
+| `33_run_notification_watchdog.py` | `notification-watchdog` | Watchdog liviano de outbox. |
 
 ### Comandos operativos adicionales
 
@@ -872,6 +873,26 @@ python scripts\15_run_matchday.py
 python scripts\15_run_matchday.py --now 2026-06-13T12:59:00-06:00
 python -m quiniela.cli notifications-status
 ```
+
+### Watchdog de notificaciones
+
+El watchdog es la ruta primaria para despachar el outbox. Corre trabajo liviano:
+programa ventanas vencidas, recupera fallos recuperables, despacha pendientes y
+registra salud sin refrescar API, predicciones ni HTML.
+
+```powershell
+python -m quiniela.cli notification-watchdog --dry-run
+python -m quiniela.cli notification-watchdog
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_notification_watchdog_task.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_notification_watchdog_task.ps1
+```
+
+La tarea `Quiniela Mundial 2026 Notification Watchdog` corre cada 2 minutos con
+lock propio y `--skip-if-lock-busy`. Sus artefactos principales son
+`outputs/logs/notification_watchdog_runs.jsonl`,
+`outputs/logs/notification_health.json`,
+`outputs/logs/scheduler_skips.jsonl` y
+`outputs/logs/notification_watchdog_errors.log`.
 
 ### Instalar automatización
 

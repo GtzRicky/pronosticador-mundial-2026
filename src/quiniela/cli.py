@@ -39,6 +39,7 @@ from quiniela.notifications import (
     notification_status,
     retry_failed_notifications,
     run_notification_cycle,
+    run_notification_watchdog,
     send_isolated_lineup_test_notifications,
     test_notifications,
 )
@@ -612,6 +613,29 @@ def dispatch_notifications_command(
         competition_context=context,
     )
     write_automation_status(connection, competition_context=context)
+    console.print(result)
+
+
+@app.command("notification-watchdog")
+def notification_watchdog_command(
+    dry_run: bool = typer.Option(False, "--dry-run/--apply"),
+    now: Optional[str] = typer.Option(
+        None,
+        help="Fecha/hora ISO opcional para pruebas reproducibles.",
+    ),
+    competition: str = typer.Option("world_cup_2026", "--competition"),
+    season: Optional[str] = typer.Option(None, "--season"),
+) -> None:
+    context = _competition_context(competition, season)
+    settings = get_settings()
+    parsed_now = datetime.fromisoformat(now) if now else None
+    result = run_notification_watchdog(
+        connection=None,
+        now=parsed_now,
+        settings=settings,
+        competition_context=context,
+        dry_run=dry_run,
+    )
     console.print(result)
 
 

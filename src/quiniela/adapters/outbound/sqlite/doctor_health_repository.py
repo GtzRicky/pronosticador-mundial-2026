@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import time
 
 from quiniela.ports.doctor_health import (
     DatabaseInspection,
@@ -12,6 +13,8 @@ from quiniela.ports.doctor_health import (
 
 
 class SQLiteDoctorHealthRepository:
+    QUICK_CHECK_MAX_BYTES = 1_000_000_000
+
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
 
@@ -23,14 +26,30 @@ class SQLiteDoctorHealthRepository:
     ) -> DatabaseInspection:
         if not self._db_path.exists():
             return DatabaseInspection(exists=False)
+        started = time.monotonic()
+        db_size_bytes = self._db_path.stat().st_size
         try:
             with closing(self._connect_readonly()) as connection:
+                connect_ms = int((time.monotonic() - started) * 1000)
+                if db_size_bytes <= self.QUICK_CHECK_MAX_BYTES:
+                    quick_check_row = connection.execute("PRAGMA quick_check(1)").fetchone()
+                    quick_check = str(quick_check_row[0]) if quick_check_row else None
+                else:
+                    quick_check = "skipped_db_too_large"
+                journal_row = connection.execute("PRAGMA journal_mode").fetchone()
                 rows = connection.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 ).fetchall()
                 tables = frozenset(str(row["name"]) for row in rows)
                 if "seasons" not in tables:
-                    return DatabaseInspection(exists=True, tables=tables)
+                    return DatabaseInspection(
+                        exists=True,
+                        tables=tables,
+                        quick_check=quick_check,
+                        journal_mode=str(journal_row[0]) if journal_row else None,
+                        db_size_bytes=db_size_bytes,
+                        connect_ms=connect_ms,
+                    )
                 scope = connection.execute(
                     """
                     SELECT COUNT(*) AS total
@@ -45,6 +64,10 @@ class SQLiteDoctorHealthRepository:
             exists=True,
             tables=tables,
             scope_initialized=scope is not None and int(scope["total"]) > 0,
+            quick_check=quick_check,
+            journal_mode=str(journal_row[0]) if journal_row else None,
+            db_size_bytes=db_size_bytes,
+            connect_ms=connect_ms,
         )
 
     def inspect_outbox(
@@ -110,6 +133,6 @@ class SQLiteDoctorHealthRepository:
 
     def _connect_readonly(self) -> sqlite3.Connection:
         uri = self._db_path.resolve().as_uri() + "?mode=ro"
-        connection = sqlite3.connect(uri, uri=True)
+        connection = sqlite3.connect(uri, uri=True, timeout=1)
         connection.row_factory = sqlite3.Row
         return connection

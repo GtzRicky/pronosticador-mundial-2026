@@ -9,6 +9,10 @@ class DatabaseInspection:
     exists: bool
     tables: frozenset[str] = frozenset()
     scope_initialized: bool = False
+    quick_check: str | None = None
+    journal_mode: str | None = None
+    db_size_bytes: int | None = None
+    connect_ms: int | None = None
     error: str | None = None
 
 

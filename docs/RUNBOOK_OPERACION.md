@@ -71,6 +71,43 @@ python -m quiniela.cli doctor --format json
 
 El doctor no consume API, no repara automaticamente y no imprime secretos.
 
+## Watchdog de notificaciones
+
+El watchdog de notificaciones debe correr separado del refresh pesado. Su tarea
+principal es mantener vivo el outbox: programar ventanas T-15/T-5 ya vencidas,
+reabrir fallos recuperables que aun no expiran, despachar pendientes y escribir
+salud operativa.
+
+Comandos manuales:
+
+```powershell
+python -m quiniela.cli notification-watchdog --dry-run
+python -m quiniela.cli notification-watchdog
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_notification_watchdog_task.ps1 -DryRun
+```
+
+Instalacion o reparacion de la tarea:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_notification_watchdog_task.ps1
+Get-ScheduledTask -TaskName "Quiniela Mundial 2026 Notification Watchdog"
+```
+
+Logs esperados:
+
+- `outputs/logs/notification_watchdog_runs.jsonl`
+- `outputs/logs/notification_health.json`
+- `outputs/logs/scheduler_skips.jsonl`
+- `outputs/logs/notification_watchdog_errors.log`
+
+Si `outputs/logs` no esta escribible, el watchdog conserva un fallback en
+`$env:TEMP\quiniela_notification_watchdog\`. Esto permite que un problema de
+permisos del reporte no revierta el despacho de notificaciones.
+
+La tarea usa un lock independiente del matchday y sale rapido si el lock esta
+ocupado. Los skips se registran como JSONL para auditar que no hubo cola
+acumulada.
+
 ## Operacion diaria
 
 Flujo recomendado:

@@ -11,7 +11,7 @@ $Pythonw = (Resolve-Path (Join-Path $Root ".venv\Scripts\pythonw.exe")).Path
 $Bootstrap = Join-Path $Root "scripts\run_scheduled_python.py"
 $Runner = Join-Path $Root "scripts\15_run_matchday.py"
 $ErrorLog = Join-Path $Root "outputs\logs\matchday_scheduler_errors.log"
-$Arguments = "`"$Bootstrap`" --script `"$Runner`" --working-directory `"$Root`" --error-log `"$ErrorLog`""
+$Arguments = "`"$Bootstrap`" --script `"$Runner`" --working-directory `"$Root`" --error-log `"$ErrorLog`" --lock-timeout-seconds 1 --skip-if-lock-busy"
 
 Get-ScheduledTask -TaskName "$TaskPrefix*" -ErrorAction SilentlyContinue |
     Unregister-ScheduledTask -Confirm:$false

@@ -136,6 +136,30 @@ def test_schema_migration_is_idempotent(tmp_path: Path) -> None:
     assert connection.execute("SELECT COUNT(*) FROM seasons").fetchone()[0] == 1
 
 
+def test_fresh_schema_marks_default_scope_backfill_without_scanning_again(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import quiniela.db as db
+
+    connection = get_connection(tmp_path / "fresh-scope.sqlite")
+
+    def fail_backfill(_connection):
+        raise AssertionError("default scope backfill should already be marked")
+
+    monkeypatch.setattr(db, "_backfill_default_scope", fail_backfill)
+    create_schema(connection)
+
+    migration = connection.execute(
+        """
+        SELECT migration_key
+        FROM schema_migrations
+        WHERE migration_key = 'default_scope_backfilled_v1'
+        """
+    ).fetchone()
+    assert migration is not None
+
+
 def test_load_teams_syncs_default_competition_participants(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "participants.sqlite")
     matches_df = pd.DataFrame(

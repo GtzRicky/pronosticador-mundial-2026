@@ -658,11 +658,17 @@ def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row["name"]) for row in rows}
 
 
-def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_def: str) -> None:
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_def: str,
+) -> bool:
     if column_name in _table_columns(connection, table_name):
-        return
+        return False
     with connection:
         connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
+    return True
 
 
 def _create_index_if_columns(
@@ -677,7 +683,8 @@ def _create_index_if_columns(
     connection.execute(statement)
 
 
-def _ensure_multi_tournament_columns(connection: sqlite3.Connection) -> None:
+def _ensure_multi_tournament_columns(connection: sqlite3.Connection) -> bool:
+    changed = False
     scoped_tables = {
         "players",
         "matches",
@@ -700,17 +707,55 @@ def _ensure_multi_tournament_columns(connection: sqlite3.Connection) -> None:
         "model_releases",
     }
     for table_name in scoped_tables:
-        _ensure_column(
-            connection,
-            table_name,
-            "competition_id",
-            f"competition_id TEXT NOT NULL DEFAULT '{DEFAULT_COMPETITION_ID}'",
+        changed = (
+            _ensure_column(
+                connection,
+                table_name,
+                "competition_id",
+                f"competition_id TEXT NOT NULL DEFAULT '{DEFAULT_COMPETITION_ID}'",
+            )
+            or changed
         )
-        _ensure_column(
-            connection,
-            table_name,
-            "season_id",
-            f"season_id TEXT NOT NULL DEFAULT '{DEFAULT_SEASON_ID}'",
+        changed = (
+            _ensure_column(
+                connection,
+                table_name,
+                "season_id",
+                f"season_id TEXT NOT NULL DEFAULT '{DEFAULT_SEASON_ID}'",
+            )
+            or changed
+        )
+    return changed
+
+
+def _ensure_migration_table(connection: sqlite3.Connection) -> None:
+    with connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_key TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+
+def _migration_applied(connection: sqlite3.Connection, migration_key: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_key = ?",
+        (migration_key,),
+    ).fetchone()
+    return row is not None
+
+
+def _mark_migration_applied(connection: sqlite3.Connection, migration_key: str) -> None:
+    with connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (migration_key)
+            VALUES (?)
+            """,
+            (migration_key,),
         )
 
 
@@ -830,9 +875,15 @@ def _sync_default_competition_participants(connection: sqlite3.Connection) -> No
 
 
 def _migrate_schema(connection: sqlite3.Connection) -> None:
+    _ensure_migration_table(connection)
     _seed_default_competition(connection)
-    _ensure_multi_tournament_columns(connection)
-    _backfill_default_scope(connection)
+    multi_tournament_columns_added = _ensure_multi_tournament_columns(connection)
+    default_scope_migration = "default_scope_backfilled_v1"
+    if multi_tournament_columns_added:
+        _backfill_default_scope(connection)
+        _mark_migration_applied(connection, default_scope_migration)
+    elif not _migration_applied(connection, default_scope_migration):
+        _mark_migration_applied(connection, default_scope_migration)
     _sync_default_competition_participants(connection)
 
     player_columns = {
@@ -864,8 +915,12 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "generated_at_utc": "generated_at_utc TEXT",
         "is_pre_kickoff": "is_pre_kickoff INTEGER",
     }
+    prediction_columns_added = False
     for column_name, column_def in prediction_columns.items():
-        _ensure_column(connection, "predictions", column_name, column_def)
+        prediction_columns_added = (
+            _ensure_column(connection, "predictions", column_name, column_def)
+            or prediction_columns_added
+        )
 
     notification_columns = {
         "notification_type": "notification_type TEXT NOT NULL DEFAULT 'prediction_window'",
@@ -879,46 +934,71 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "last_error_message": "last_error_message TEXT",
         "channel_priority": "channel_priority TEXT",
     }
+    notification_columns_added = False
     for column_name, column_def in notification_columns.items():
-        _ensure_column(connection, "notification_deliveries", column_name, column_def)
+        notification_columns_added = (
+            _ensure_column(connection, "notification_deliveries", column_name, column_def)
+            or notification_columns_added
+        )
 
-    _ensure_column(
+    impact_prediction_id_added = _ensure_column(
         connection,
         "prediction_player_impacts",
         "prediction_id",
         "prediction_id INTEGER REFERENCES predictions(id)",
     )
+    prediction_audit_migration = "prediction_audit_backfilled_v1"
+    notification_contract_migration = "notification_contract_backfilled_v1"
     with connection:
-        connection.execute(
-            """
-            UPDATE predictions
-            SET generated_at_utc = COALESCE(
-                    generated_at_utc,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', generated_at)
-                ),
-                is_pre_kickoff = COALESCE(
-                    is_pre_kickoff,
-                    CASE
-                        WHEN julianday(generated_at) < julianday(datetime_cdmx) THEN 1
-                        ELSE 0
-                    END
-                )
-            WHERE generated_at_utc IS NULL OR is_pre_kickoff IS NULL
-            """
-        )
-        connection.execute(
-            """
-            UPDATE prediction_player_impacts
-            SET prediction_id = (
-                SELECT p.id
-                FROM predictions p
-                WHERE p.match_id = prediction_player_impacts.match_id
-                ORDER BY p.id DESC
-                LIMIT 1
+        if (
+            (prediction_columns_added or impact_prediction_id_added)
+            and not _migration_applied(connection, prediction_audit_migration)
+        ):
+            connection.execute(
+                """
+                UPDATE predictions
+                SET generated_at_utc = COALESCE(
+                        generated_at_utc,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', generated_at)
+                    ),
+                    is_pre_kickoff = COALESCE(
+                        is_pre_kickoff,
+                        CASE
+                            WHEN julianday(generated_at) < julianday(datetime_cdmx) THEN 1
+                            ELSE 0
+                        END
+                    )
+                WHERE generated_at_utc IS NULL OR is_pre_kickoff IS NULL
+                """
             )
-            WHERE prediction_id IS NULL
-            """
-        )
+            connection.execute(
+                """
+                UPDATE prediction_player_impacts
+                SET prediction_id = (
+                    SELECT p.id
+                    FROM predictions p
+                    WHERE p.match_id = prediction_player_impacts.match_id
+                    ORDER BY p.id DESC
+                    LIMIT 1
+                )
+                WHERE prediction_id IS NULL
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (migration_key)
+                VALUES (?)
+                """,
+                (prediction_audit_migration,),
+            )
+        elif not _migration_applied(connection, prediction_audit_migration):
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (migration_key)
+                VALUES (?)
+                """,
+                (prediction_audit_migration,),
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_predictions_match_generated ON predictions(match_id, generated_at_utc)"
         )
@@ -931,23 +1011,42 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
             ON notification_deliveries(status, next_attempt_at, kickoff_at)
             """
         )
-        connection.execute(
-            """
-            UPDATE notification_deliveries
-            SET dedupe_key = COALESCE(
-                    dedupe_key,
-                    COALESCE(notification_type, 'prediction_window') || ':' ||
-                    match_id || ':' || kickoff_at || ':' || window_label || ':' || channel
-                ),
-                expires_at = COALESCE(expires_at, kickoff_at),
-                max_attempts = COALESCE(max_attempts, 5),
-                template_version = COALESCE(template_version, 'notification_v1')
-            WHERE dedupe_key IS NULL
-               OR expires_at IS NULL
-               OR max_attempts IS NULL
-               OR template_version IS NULL
-            """
-        )
+        if notification_columns_added and not _migration_applied(
+            connection,
+            notification_contract_migration,
+        ):
+            connection.execute(
+                """
+                UPDATE notification_deliveries
+                SET dedupe_key = COALESCE(
+                        dedupe_key,
+                        COALESCE(notification_type, 'prediction_window') || ':' ||
+                        match_id || ':' || kickoff_at || ':' || window_label || ':' || channel
+                    ),
+                    expires_at = COALESCE(expires_at, kickoff_at),
+                    max_attempts = COALESCE(max_attempts, 5),
+                    template_version = COALESCE(template_version, 'notification_v1')
+                WHERE dedupe_key IS NULL
+                   OR expires_at IS NULL
+                   OR max_attempts IS NULL
+                   OR template_version IS NULL
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (migration_key)
+                VALUES (?)
+                """,
+                (notification_contract_migration,),
+            )
+        elif not _migration_applied(connection, notification_contract_migration):
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (migration_key)
+                VALUES (?)
+                """,
+                (notification_contract_migration,),
+            )
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_dedupe_key

@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import tempfile
 import time
 from typing import Any
 import uuid
@@ -84,6 +85,31 @@ def _atomic_write_dataframe(frame: pd.DataFrame, path: Path) -> None:
             time.sleep(0.1)
     if last_error:
         raise last_error
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
 
 
 def _prediction_output_paths(
@@ -634,6 +660,20 @@ def _write_automation_status(
     path: Path,
     competition_context: CompetitionContext,
 ) -> None:
+    settings = get_settings()
+    logs_dir = (
+        settings.logs_dir
+        if competition_context.is_default
+        else settings.logs_dir / competition_context.namespace
+    )
+    watchdog_health = _read_json_file(logs_dir / "notification_health.json")
+    if not watchdog_health:
+        watchdog_health = _read_json_file(
+            Path(tempfile.gettempdir())
+            / "quiniela_notification_watchdog"
+            / "notification_health.json"
+        )
+    scheduler_skips = _tail_jsonl(settings.logs_dir / "scheduler_skips.jsonl", 5)
     runs = connection.execute(
         """
         SELECT run_key, action, status, scheduled_for, finished_at, details_json
@@ -709,6 +749,10 @@ def _write_automation_status(
         f"- Notifications pending: {int(notification_counts['pending'] or 0)}",
         f"- Notifications sent: {int(notification_counts['sent'] or 0)}",
         f"- Notifications failed: {int(notification_counts['failed'] or 0)}",
+        f"- Notification watchdog last OK: {watchdog_health.get('last_success_at') or 'n/a'}",
+        f"- Notification dispatch last OK: {watchdog_health.get('last_dispatch_ok_at') or 'n/a'}",
+        f"- Notification watchdog open due: {watchdog_health.get('open_due', 'n/a')}",
+        f"- Notification watchdog expired open: {watchdog_health.get('expired_open', 'n/a')}",
         "",
         "## Recent runs",
     ]
@@ -757,6 +801,15 @@ def _write_automation_status(
             failed_issues.append("- " + " | ".join(parts))
     lines.extend(["", "## Recent retrieval failures"])
     lines.extend(failed_issues or ["- No retrieval failures recorded."])
+    lines.extend(["", "## Recent scheduler skips"])
+    if scheduler_skips:
+        for row in scheduler_skips:
+            lines.append(
+                f"- `{row.get('script', 'unknown')}`: {row.get('reason', 'unknown')} "
+                f"at {row.get('at', 'n/a')}"
+            )
+    else:
+        lines.append("- No scheduler skips recorded.")
     lines.extend(["", "## Recent notifications"])
     lines.extend(
         (

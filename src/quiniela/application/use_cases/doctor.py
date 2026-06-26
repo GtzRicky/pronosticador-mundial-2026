@@ -146,6 +146,13 @@ class DoctorUseCase:
         missing = sorted(set(self.REQUIRED_TABLES) - inspection.tables)
         if missing:
             return DoctorCheck("database", "error", "DB accesible pero faltan tablas requeridas.", {"missing": missing})
+        details = {
+            "tables_checked": list(self.REQUIRED_TABLES),
+            "quick_check": inspection.quick_check,
+            "journal_mode": inspection.journal_mode,
+            "db_size_bytes": inspection.db_size_bytes,
+            "connect_ms": inspection.connect_ms,
+        }
         if not inspection.scope_initialized:
             return DoctorCheck(
                 "database",
@@ -154,9 +161,20 @@ class DoctorUseCase:
                 {
                     "competition_id": self.competition_context.competition_id,
                     "season_id": self.competition_context.season_id,
+                    **details,
                 },
             )
-        return DoctorCheck("database", "ok", "DB accesible y migraciones base presentes.", {"tables_checked": list(self.REQUIRED_TABLES)})
+        status = (
+            "ok"
+            if inspection.quick_check in {None, "ok", "skipped_db_too_large"}
+            else "error"
+        )
+        message = (
+            "DB accesible y migraciones base presentes."
+            if status == "ok"
+            else "DB accesible, pero quick_check reporto problemas."
+        )
+        return DoctorCheck("database", status, message, details)
 
     def _check_outputs(self) -> DoctorCheck:
         predictions_dir = (
