@@ -31,6 +31,10 @@ from quiniela.db import (
 )
 from quiniela.features import build_match_feature_row
 from quiniela.name_maps import normalize_text
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.outcome_model import OUTCOME_CLASSES
 from quiniela.player_model import PLAYER_MODEL_FEATURE_COLUMNS
 
@@ -162,16 +166,21 @@ def capture_pre_match_snapshot(
     connection: sqlite3.Connection,
     source_kind: str = "live",
     captured_at: str | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
+    context = competition_context or resolve_competition_context()
     match_df = fetch_dataframe(
         connection,
         """
         SELECT match_id, date_cdmx, datetime_cdmx, group_name AS "group",
                home_team, away_team, home_team_norm, away_team_norm,
                stage, api_fixture_id
-        FROM matches WHERE match_id = ?
+        FROM matches
+        WHERE match_id = ?
+          AND competition_id = ?
+          AND season_id = ?
         """,
-        (match_id,),
+        (match_id, context.competition_id, context.season_id),
     )
     if match_df.empty:
         return {"created": False, "reason": "match_not_found", "match_id": match_id}
@@ -190,6 +199,8 @@ def capture_pre_match_snapshot(
         source_kind,
         timestamp,
     )
+    snapshot["competition_id"] = context.competition_id
+    snapshot["season_id"] = context.season_id
     snapshot_id, created = insert_pre_match_snapshot(connection, snapshot, players)
     return {
         "snapshot_id": snapshot_id,
@@ -204,7 +215,9 @@ def capture_pre_match_snapshot(
 def reconstruct_historical_snapshots(
     connection: sqlite3.Connection,
     limit: int | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, int]:
+    context = competition_context or resolve_competition_context()
     query = """
         SELECT fixture_id, match_date, home_team, away_team,
                home_team_norm, away_team_norm
@@ -249,6 +262,8 @@ def reconstruct_historical_snapshots(
             "reconstructed",
             captured_at,
         )
+        snapshot["competition_id"] = context.competition_id
+        snapshot["season_id"] = context.season_id
         _, was_created = insert_pre_match_snapshot(connection, snapshot, players)
         created += int(was_created)
         skipped += int(not was_created)
@@ -267,12 +282,14 @@ def _target_value(row: dict[str, Any] | None, column: str) -> float | None:
 def build_player_targets(
     connection: sqlite3.Connection,
     match_ids: list[str] | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
-    params: list[Any] = []
-    where = ""
+    context = competition_context or resolve_competition_context()
+    params: list[Any] = [context.competition_id, context.season_id]
+    where = "WHERE s.competition_id = ? AND s.season_id = ?"
     if match_ids:
         placeholders = ",".join("?" for _ in match_ids)
-        where = f"WHERE s.match_id IN ({placeholders})"
+        where += f" AND s.match_id IN ({placeholders})"
         params.extend(match_ids)
     snapshots = fetch_dataframe(
         connection,

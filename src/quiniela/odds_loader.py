@@ -15,6 +15,10 @@ import numpy as np
 from quiniela.api_football_client import APIFootballClient
 from quiniela.config import get_settings
 from quiniela.db import fetch_dataframe, get_connection
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.name_maps import normalize_team_name, normalize_text
 
 
@@ -62,16 +66,26 @@ def _fixture_id(odds_row: dict[str, Any]) -> str | None:
     return str(value)
 
 
-def _match_metadata(connection: sqlite3.Connection, fixture_id: str) -> MatchMetadata:
+def _match_metadata(
+    connection: sqlite3.Connection,
+    fixture_id: str,
+    competition_context: CompetitionContext,
+) -> MatchMetadata:
     row = connection.execute(
         """
         SELECT match_id, home_team_norm, away_team_norm, home_team, away_team
         FROM matches
         WHERE CAST(api_fixture_id AS TEXT) = ?
+          AND competition_id = ?
+          AND season_id = ?
         ORDER BY datetime_cdmx
         LIMIT 1
         """,
-        (fixture_id,),
+        (
+            fixture_id,
+            competition_context.competition_id,
+            competition_context.season_id,
+        ),
     ).fetchone()
     if row is None:
         return MatchMetadata(None, None, None, None, None)
@@ -157,15 +171,17 @@ def _selection_key(
 def store_odds_payload(
     connection: sqlite3.Connection,
     odds_payload: dict[str, Any],
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, int]:
-    inserted = 0
+    context = competition_context or resolve_competition_context()
     skipped = 0
+    rows_to_insert: list[tuple[Any, ...]] = []
     for odds_row in odds_payload.get("response", []):
         fixture_id = _fixture_id(odds_row)
         if not fixture_id:
             skipped += 1
             continue
-        metadata = _match_metadata(connection, fixture_id)
+        metadata = _match_metadata(connection, fixture_id, context)
         source_update = str(odds_row.get("update") or "")
         for bookmaker in odds_row.get("bookmakers") or []:
             bookmaker_id = bookmaker.get("id")
@@ -197,38 +213,45 @@ def store_odds_payload(
                         "league": odds_row.get("league"),
                         "update": source_update,
                     }
-                    with connection:
-                        cursor = connection.execute(
-                            """
-                            INSERT OR IGNORE INTO odds_market_snapshots (
-                                fixture_id, match_id, bookmaker_id, bookmaker,
-                                bet_id, market_key, market_name, selection_key,
-                                selection_name, selection_team_norm, line_key,
-                                handicap, decimal_odd, implied_probability,
-                                suspended, source_update, source_json
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                fixture_id,
-                                metadata.match_id,
-                                bookmaker_id,
-                                bookmaker_name,
-                                bet_id,
-                                market_key,
-                                market_name,
-                                selection_key,
-                                value_name,
-                                selection_team_norm,
-                                line_key,
-                                handicap,
-                                decimal_odd,
-                                1.0 / decimal_odd,
-                                int(bool(value.get("suspended"))),
-                                source_update,
-                                json.dumps(source_json, ensure_ascii=False),
-                            ),
+                    rows_to_insert.append(
+                        (
+                            context.competition_id,
+                            context.season_id,
+                            fixture_id,
+                            metadata.match_id,
+                            bookmaker_id,
+                            bookmaker_name,
+                            bet_id,
+                            market_key,
+                            market_name,
+                            selection_key,
+                            value_name,
+                            selection_team_norm,
+                            line_key,
+                            handicap,
+                            decimal_odd,
+                            1.0 / decimal_odd,
+                            int(bool(value.get("suspended"))),
+                            source_update,
+                            json.dumps(source_json, ensure_ascii=False),
                         )
-                    inserted += int(cursor.rowcount == 1)
+                    )
+    before_changes = connection.total_changes
+    with connection:
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO odds_market_snapshots (
+                competition_id, season_id,
+                fixture_id, match_id, bookmaker_id, bookmaker,
+                bet_id, market_key, market_name, selection_key,
+                selection_name, selection_team_norm, line_key,
+                handicap, decimal_odd, implied_probability,
+                suspended, source_update, source_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows_to_insert,
+        )
+    inserted = connection.total_changes - before_changes
     return {"inserted": inserted, "skipped": skipped}
 
 
@@ -265,11 +288,13 @@ def build_odds_consensus(
     *,
     date_str: str | None = None,
     fixture_id: str | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, int]:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
     connection = connection or get_connection(settings.db_path)
-    where = ["suspended = 0"]
-    params: list[Any] = []
+    where = ["suspended = 0", "competition_id = ?", "season_id = ?"]
+    params: list[Any] = [context.competition_id, context.season_id]
     if fixture_id:
         where.append("fixture_id = ?")
         params.append(str(fixture_id))
@@ -277,11 +302,16 @@ def build_odds_consensus(
         where.append(
             """
             match_id IN (
-                SELECT match_id FROM matches WHERE date_cdmx = ?
+                SELECT match_id FROM matches
+                WHERE date_cdmx = ?
+                  AND competition_id = ?
+                  AND season_id = ?
             )
             """
         )
-        params.append(date_str)
+        params.extend(
+            [date_str, context.competition_id, context.season_id]
+        )
     rows = connection.execute(
         f"""
         SELECT *
@@ -344,11 +374,12 @@ def build_odds_consensus(
             cursor = connection.execute(
                 """
                 INSERT INTO odds_market_consensus (
+                    competition_id, season_id,
                     fixture_id, match_id, market_key, market_name,
                     selection_key, selection_name, line_key,
                     consensus_probability, median_decimal_odd,
                     bookmaker_count, overround_method, source_json, calculated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fixture_id, market_key, selection_key, line_key)
                 DO UPDATE SET
                     match_id = excluded.match_id,
@@ -362,6 +393,8 @@ def build_odds_consensus(
                     calculated_at = excluded.calculated_at
                 """,
                 (
+                    context.competition_id,
+                    context.season_id,
                     row["fixture_id"],
                     row["match_id"],
                     row["market_key"],
@@ -385,8 +418,14 @@ def fetch_odds_by_date(
     date_str: str,
     dry_run: bool = False,
     force_refresh: bool = False,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, int]:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
+    if not dry_run and not context.config.api_football.enabled:
+        raise ValueError(
+            f"API-Football is disabled for competition {context.selector!r}"
+        )
     connection = get_connection(settings.db_path)
     client = APIFootballClient(
         settings=settings,
@@ -395,11 +434,19 @@ def fetch_odds_by_date(
     )
     payload = client.get_odds_by_date(
         date_str,
-        league=1,
-        season=int(date_str[:4]),
+        league=context.config.api_football.league_id or 1,
+        season=context.config.api_football.season or int(date_str[:4]),
     )
-    stored = store_odds_payload(connection, payload)
-    consensus = build_odds_consensus(connection, date_str=date_str)
+    stored = store_odds_payload(
+        connection,
+        payload,
+        competition_context=context,
+    )
+    consensus = build_odds_consensus(
+        connection,
+        date_str=date_str,
+        competition_context=context,
+    )
     return {
         "fixtures": int(payload.get("results") or 0),
         "inserted": stored["inserted"],

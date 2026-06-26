@@ -2,18 +2,70 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
-import math
 import sqlite3
 from typing import Any, Iterable
 
 import pandas as pd
 
+from quiniela.adapters.outbound.sqlite.connection import connect_sqlite
+from quiniela.adapters.outbound.sqlite.migrations import apply_schema
+from quiniela.adapters.outbound.sqlite.prediction_repository import SQLitePredictionRepository
+from quiniela.adapters.outbound.sqlite.snapshot_repository import SQLiteSnapshotRepository
 from quiniela.cache import canonical_json, hash_params
 from quiniela.config import get_settings
+from quiniela.infrastructure.competition_config import CompetitionContext
 from quiniela.name_maps import normalize_team_name, normalize_text
 
 
+DEFAULT_COMPETITION_ID = "fifa_world_cup"
+DEFAULT_SEASON_ID = "world_cup_2026"
+
+
 SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS competitions (
+        competition_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        sport TEXT NOT NULL,
+        organizer TEXT NOT NULL,
+        competition_type TEXT NOT NULL,
+        default_timezone TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS seasons (
+        season_id TEXT PRIMARY KEY,
+        competition_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(competition_id) REFERENCES competitions(competition_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS competition_participants (
+        participant_id TEXT PRIMARY KEY,
+        competition_id TEXT NOT NULL,
+        season_id TEXT NOT NULL,
+        team_norm TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        short_name TEXT,
+        group_key TEXT,
+        seed INTEGER,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(season_id, team_norm),
+        FOREIGN KEY(competition_id) REFERENCES competitions(competition_id),
+        FOREIGN KEY(season_id) REFERENCES seasons(season_id)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS teams (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -323,6 +375,11 @@ SCHEMA_STATEMENTS = [
         away_win_probability REAL,
         outcome_model_version TEXT,
         data_freshness_at TEXT,
+        audit_snapshot_id INTEGER,
+        audit_lineup_sources_json TEXT,
+        audit_odds_source_json TEXT,
+        audit_degradation_reasons_json TEXT NOT NULL DEFAULT '[]',
+        not_evaluable_reason TEXT,
         source_json TEXT,
         generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -403,6 +460,13 @@ SCHEMA_STATEMENTS = [
         notification_type TEXT NOT NULL DEFAULT 'prediction_window',
         team_norm TEXT,
         lineup_hash TEXT,
+        dedupe_key TEXT,
+        max_attempts INTEGER NOT NULL DEFAULT 5,
+        template_version TEXT NOT NULL DEFAULT 'notification_v1',
+        payload_hash TEXT,
+        expires_at TEXT,
+        last_error_message TEXT,
+        channel_priority TEXT,
         prediction_id INTEGER,
         scheduled_for TEXT NOT NULL,
         payload_json TEXT,
@@ -582,19 +646,11 @@ SCHEMA_STATEMENTS = [
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     settings = get_settings()
     path = db_path or settings.db_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
-    create_schema(connection)
-    return connection
+    return connect_sqlite(path, schema_initializer=create_schema)
 
 
 def create_schema(connection: sqlite3.Connection) -> None:
-    with connection:
-        for statement in SCHEMA_STATEMENTS:
-            connection.execute(statement)
-    _migrate_schema(connection)
+    apply_schema(connection, SCHEMA_STATEMENTS, migrate=_migrate_schema)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -609,7 +665,176 @@ def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name:
         connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
 
 
+def _create_index_if_columns(
+    connection: sqlite3.Connection,
+    *,
+    table_name: str,
+    required_columns: set[str],
+    statement: str,
+) -> None:
+    if not required_columns.issubset(_table_columns(connection, table_name)):
+        return
+    connection.execute(statement)
+
+
+def _ensure_multi_tournament_columns(connection: sqlite3.Connection) -> None:
+    scoped_tables = {
+        "players",
+        "matches",
+        "lineup_estimates",
+        "odds_snapshots",
+        "odds_market_snapshots",
+        "odds_market_consensus",
+        "odds_model_predictions",
+        "predictions",
+        "actual_results",
+        "prediction_player_impacts",
+        "prediction_evaluations",
+        "notification_deliveries",
+        "pre_match_snapshots",
+        "pre_match_player_snapshots",
+        "player_match_targets",
+        "player_evidence_evaluations",
+        "player_prediction_evaluations",
+        "model_training_runs",
+        "model_releases",
+    }
+    for table_name in scoped_tables:
+        _ensure_column(
+            connection,
+            table_name,
+            "competition_id",
+            f"competition_id TEXT NOT NULL DEFAULT '{DEFAULT_COMPETITION_ID}'",
+        )
+        _ensure_column(
+            connection,
+            table_name,
+            "season_id",
+            f"season_id TEXT NOT NULL DEFAULT '{DEFAULT_SEASON_ID}'",
+        )
+
+
+def _seed_default_competition(connection: sqlite3.Connection) -> None:
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO competitions (
+                competition_id, name, sport, organizer, competition_type, default_timezone
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(competition_id) DO UPDATE SET
+                name = excluded.name,
+                sport = excluded.sport,
+                organizer = excluded.organizer,
+                competition_type = excluded.competition_type,
+                default_timezone = excluded.default_timezone,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                DEFAULT_COMPETITION_ID,
+                "FIFA World Cup",
+                "football",
+                "FIFA",
+                "national_teams",
+                "America/Mexico_City",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO seasons (
+                season_id, competition_id, name, start_date, end_date, timezone, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(season_id) DO UPDATE SET
+                competition_id = excluded.competition_id,
+                name = excluded.name,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                timezone = excluded.timezone,
+                status = excluded.status,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                DEFAULT_SEASON_ID,
+                DEFAULT_COMPETITION_ID,
+                "FIFA World Cup 2026",
+                "2026-06-11",
+                "2026-07-19",
+                "America/Mexico_City",
+                "planned",
+            ),
+        )
+
+
+def _backfill_default_scope(connection: sqlite3.Connection) -> None:
+    with connection:
+        for table_name in {
+            "players",
+            "matches",
+            "lineup_estimates",
+            "odds_snapshots",
+            "odds_market_snapshots",
+            "odds_market_consensus",
+            "odds_model_predictions",
+            "predictions",
+            "actual_results",
+            "prediction_player_impacts",
+            "prediction_evaluations",
+            "notification_deliveries",
+            "pre_match_snapshots",
+            "pre_match_player_snapshots",
+            "player_match_targets",
+            "player_evidence_evaluations",
+            "player_prediction_evaluations",
+            "model_training_runs",
+            "model_releases",
+        }:
+            connection.execute(
+                f"""
+                UPDATE {table_name}
+                SET competition_id = COALESCE(NULLIF(competition_id, ''), ?),
+                    season_id = COALESCE(NULLIF(season_id, ''), ?)
+                WHERE competition_id IS NULL
+                   OR competition_id = ''
+                   OR season_id IS NULL
+                   OR season_id = ''
+                """,
+                (DEFAULT_COMPETITION_ID, DEFAULT_SEASON_ID),
+            )
+
+
+def _sync_default_competition_participants(connection: sqlite3.Connection) -> None:
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO competition_participants (
+                participant_id, competition_id, season_id, team_norm, display_name, short_name, group_key, active
+            )
+            SELECT
+                ? || ':' || team_norm,
+                ?,
+                ?,
+                team_norm,
+                team_name,
+                team_name,
+                NULL,
+                1
+            FROM teams
+            WHERE team_norm IS NOT NULL AND team_norm != ''
+            ON CONFLICT(season_id, team_norm) DO UPDATE SET
+                display_name = excluded.display_name,
+                short_name = excluded.short_name,
+                active = excluded.active,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (DEFAULT_SEASON_ID, DEFAULT_COMPETITION_ID, DEFAULT_SEASON_ID),
+        )
+
+
 def _migrate_schema(connection: sqlite3.Connection) -> None:
+    _seed_default_competition(connection)
+    _ensure_multi_tournament_columns(connection)
+    _backfill_default_scope(connection)
+    _sync_default_competition_participants(connection)
+
     player_columns = {
         "api_player_id": "api_player_id INTEGER",
         "api_player_name": "api_player_name TEXT",
@@ -629,6 +854,11 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "away_win_probability": "away_win_probability REAL",
         "outcome_model_version": "outcome_model_version TEXT",
         "data_freshness_at": "data_freshness_at TEXT",
+        "audit_snapshot_id": "audit_snapshot_id INTEGER",
+        "audit_lineup_sources_json": "audit_lineup_sources_json TEXT",
+        "audit_odds_source_json": "audit_odds_source_json TEXT",
+        "audit_degradation_reasons_json": "audit_degradation_reasons_json TEXT NOT NULL DEFAULT '[]'",
+        "not_evaluable_reason": "not_evaluable_reason TEXT",
         "prediction_context": "prediction_context TEXT NOT NULL DEFAULT 'legacy'",
         "window_label": "window_label TEXT",
         "generated_at_utc": "generated_at_utc TEXT",
@@ -641,6 +871,13 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "notification_type": "notification_type TEXT NOT NULL DEFAULT 'prediction_window'",
         "team_norm": "team_norm TEXT",
         "lineup_hash": "lineup_hash TEXT",
+        "dedupe_key": "dedupe_key TEXT",
+        "max_attempts": "max_attempts INTEGER NOT NULL DEFAULT 5",
+        "template_version": "template_version TEXT NOT NULL DEFAULT 'notification_v1'",
+        "payload_hash": "payload_hash TEXT",
+        "expires_at": "expires_at TEXT",
+        "last_error_message": "last_error_message TEXT",
+        "channel_priority": "channel_priority TEXT",
     }
     for column_name, column_def in notification_columns.items():
         _ensure_column(connection, "notification_deliveries", column_name, column_def)
@@ -696,6 +933,30 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         )
         connection.execute(
             """
+            UPDATE notification_deliveries
+            SET dedupe_key = COALESCE(
+                    dedupe_key,
+                    COALESCE(notification_type, 'prediction_window') || ':' ||
+                    match_id || ':' || kickoff_at || ':' || window_label || ':' || channel
+                ),
+                expires_at = COALESCE(expires_at, kickoff_at),
+                max_attempts = COALESCE(max_attempts, 5),
+                template_version = COALESCE(template_version, 'notification_v1')
+            WHERE dedupe_key IS NULL
+               OR expires_at IS NULL
+               OR max_attempts IS NULL
+               OR template_version IS NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_dedupe_key
+            ON notification_deliveries(dedupe_key)
+            WHERE dedupe_key IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_notification_official_open
             ON notification_deliveries(notification_type, match_id, team_norm, status, created_at)
             """
@@ -712,6 +973,48 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
             ON odds_market_consensus(fixture_id, market_key, line_key)
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_competition_participants_season_team
+            ON competition_participants(season_id, team_norm)
+            """
+        )
+        _create_index_if_columns(
+            connection,
+            table_name="matches",
+            required_columns={"season_id", "date_cdmx"},
+            statement="""
+                CREATE INDEX IF NOT EXISTS idx_matches_season_date
+                ON matches(season_id, date_cdmx)
+            """,
+        )
+        _create_index_if_columns(
+            connection,
+            table_name="predictions",
+            required_columns={"season_id", "match_id", "generated_at_utc"},
+            statement="""
+                CREATE INDEX IF NOT EXISTS idx_predictions_season_match
+                ON predictions(season_id, match_id, generated_at_utc)
+            """,
+        )
+        _create_index_if_columns(
+            connection,
+            table_name="odds_market_consensus",
+            required_columns={"season_id", "fixture_id", "market_key", "line_key"},
+            statement="""
+                CREATE INDEX IF NOT EXISTS idx_odds_consensus_season_fixture
+                ON odds_market_consensus(season_id, fixture_id, market_key, line_key)
+            """,
+        )
+        _create_index_if_columns(
+            connection,
+            table_name="notification_deliveries",
+            required_columns={"season_id", "status", "next_attempt_at", "kickoff_at"},
+            statement="""
+                CREATE INDEX IF NOT EXISTS idx_notification_season_due
+                ON notification_deliveries(season_id, status, next_attempt_at, kickoff_at)
+            """,
+        )
 
 
 def _executemany(connection: sqlite3.Connection, query: str, rows: Iterable[tuple[Any, ...]]) -> None:
@@ -722,7 +1025,67 @@ def _executemany(connection: sqlite3.Connection, query: str, rows: Iterable[tupl
         connection.executemany(query, rows)
 
 
-def load_matches(connection: sqlite3.Connection, matches_df: pd.DataFrame) -> int:
+def ensure_competition_scope(
+    connection: sqlite3.Connection,
+    context: CompetitionContext,
+) -> None:
+    config = context.config
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO competitions (
+                competition_id, name, sport, organizer, competition_type, default_timezone
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(competition_id) DO UPDATE SET
+                name = excluded.name,
+                sport = excluded.sport,
+                organizer = excluded.organizer,
+                competition_type = excluded.competition_type,
+                default_timezone = excluded.default_timezone,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                context.competition_id,
+                config.competition.name,
+                config.competition.sport,
+                config.competition.organizer,
+                config.competition.competition_type,
+                config.competition.default_timezone,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO seasons (
+                season_id, competition_id, name, start_date, end_date, timezone, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(season_id) DO UPDATE SET
+                competition_id = excluded.competition_id,
+                name = excluded.name,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                timezone = excluded.timezone,
+                status = excluded.status,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                context.season_id,
+                context.competition_id,
+                config.season.name,
+                config.season.start_date.isoformat(),
+                config.season.end_date.isoformat(),
+                config.season.timezone,
+                config.season.status,
+            ),
+        )
+
+
+def load_matches(
+    connection: sqlite3.Connection,
+    matches_df: pd.DataFrame,
+    context: CompetitionContext | None = None,
+) -> int:
+    competition_id = context.competition_id if context else DEFAULT_COMPETITION_ID
+    season_id = context.season_id if context else DEFAULT_SEASON_ID
     rows = [
         (
             row["match_id"],
@@ -740,6 +1103,8 @@ def load_matches(connection: sqlite3.Connection, matches_df: pd.DataFrame) -> in
             row["stadium"],
             row["stage"],
             row["status"],
+            competition_id,
+            season_id,
         )
         for row in matches_df.to_dict(orient="records")
     ]
@@ -748,15 +1113,22 @@ def load_matches(connection: sqlite3.Connection, matches_df: pd.DataFrame) -> in
         """
         INSERT OR REPLACE INTO matches (
             match_id, date_et, time_et, datetime_et, date_cdmx, time_cdmx, datetime_cdmx,
-            home_team, away_team, home_team_norm, away_team_norm, group_name, stadium, stage, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            home_team, away_team, home_team_norm, away_team_norm, group_name, stadium, stage, status,
+            competition_id, season_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     return len(rows)
 
 
-def load_players(connection: sqlite3.Connection, rosters_df: pd.DataFrame) -> int:
+def load_players(
+    connection: sqlite3.Connection,
+    rosters_df: pd.DataFrame,
+    context: CompetitionContext | None = None,
+) -> int:
+    competition_id = context.competition_id if context else DEFAULT_COMPETITION_ID
+    season_id = context.season_id if context else DEFAULT_SEASON_ID
     rows = [
         (
             row["team"],
@@ -773,6 +1145,8 @@ def load_players(connection: sqlite3.Connection, rosters_df: pd.DataFrame) -> in
             row.get("nationality"),
             row.get("last_resolved_at"),
             int(row.get("is_active", 1)),
+            competition_id,
+            season_id,
         )
         for row in rosters_df.to_dict(orient="records")
     ]
@@ -781,15 +1155,21 @@ def load_players(connection: sqlite3.Connection, rosters_df: pd.DataFrame) -> in
         """
         INSERT OR REPLACE INTO players (
             team, team_norm, player, player_norm, position_group, club, coach,
-            api_player_id, api_player_name, api_position, height_cm, nationality, last_resolved_at, is_active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            api_player_id, api_player_name, api_position, height_cm, nationality, last_resolved_at, is_active,
+            competition_id, season_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     return len(rows)
 
 
-def load_teams(connection: sqlite3.Connection, matches_df: pd.DataFrame, rosters_df: pd.DataFrame) -> int:
+def load_teams(
+    connection: sqlite3.Connection,
+    matches_df: pd.DataFrame,
+    rosters_df: pd.DataFrame,
+    context: CompetitionContext | None = None,
+) -> int:
     teams: dict[str, str] = {}
 
     for row in matches_df.to_dict(orient="records"):
@@ -811,6 +1191,32 @@ def load_teams(connection: sqlite3.Connection, matches_df: pd.DataFrame, rosters
         "INSERT OR IGNORE INTO teams (team_name, team_norm) VALUES (?, ?)",
         rows,
     )
+    if context is None:
+        _sync_default_competition_participants(connection)
+    else:
+        ensure_competition_scope(connection, context)
+        with connection:
+            connection.executemany(
+                """
+                INSERT INTO competition_participants (
+                    participant_id, competition_id, season_id, team_norm, display_name, active
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(season_id, team_norm) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [
+                    (
+                        f"{context.season_id}:{norm}",
+                        context.competition_id,
+                        context.season_id,
+                        norm,
+                        name,
+                    )
+                    for norm, name in sorted(teams.items())
+                ],
+            )
     return len(rows)
 
 
@@ -818,20 +1224,34 @@ def seed_from_processed(
     connection: sqlite3.Connection,
     calendar_path: Path | None = None,
     rosters_path: Path | None = None,
+    context: CompetitionContext | None = None,
 ) -> dict[str, int]:
     settings = get_settings()
     calendar_path = calendar_path or settings.processed_dir / "calendar.csv"
     rosters_path = rosters_path or settings.processed_dir / "rosters.csv"
     matches_df = pd.read_csv(calendar_path)
     rosters_df = pd.read_csv(rosters_path)
+    competition_id = context.competition_id if context else DEFAULT_COMPETITION_ID
+    season_id = context.season_id if context else DEFAULT_SEASON_ID
+    if context is not None:
+        ensure_competition_scope(connection, context)
     with connection:
-        connection.execute("DELETE FROM players")
-        connection.execute("DELETE FROM matches")
-        connection.execute("DELETE FROM teams")
+        connection.execute(
+            "DELETE FROM players WHERE competition_id = ? AND season_id = ?",
+            (competition_id, season_id),
+        )
+        connection.execute(
+            "DELETE FROM matches WHERE competition_id = ? AND season_id = ?",
+            (competition_id, season_id),
+        )
+        connection.execute(
+            "DELETE FROM competition_participants WHERE season_id = ?",
+            (season_id,),
+        )
     return {
-        "teams": load_teams(connection, matches_df, rosters_df),
-        "players": load_players(connection, rosters_df),
-        "matches": load_matches(connection, matches_df),
+        "teams": load_teams(connection, matches_df, rosters_df, context=context),
+        "players": load_players(connection, rosters_df, context=context),
+        "matches": load_matches(connection, matches_df, context=context),
     }
 
 
@@ -1425,78 +1845,11 @@ def insert_prediction_player_impacts(
             )
 
 
-def _json_safe(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, tuple):
-        return [_json_safe(item) for item in value]
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return value
-
-
 def insert_prediction_rows(
     connection: sqlite3.Connection,
     predictions_df: pd.DataFrame,
 ) -> list[int]:
-    inserted_ids: list[int] = []
-    with connection:
-        for row in predictions_df.to_dict(orient="records"):
-            safe_row = _json_safe(row)
-            cursor = connection.execute(
-                """
-                INSERT INTO predictions (
-                    match_id, datetime_cdmx, group_name, home_team, away_team,
-                    predicted_score, probability, model_version,
-                    hybrid_predicted_score, hybrid_probability,
-                    home_win_probability, draw_probability, away_win_probability,
-                    outcome_model_version, data_freshness_at, source_json,
-                    prediction_context, window_label, generated_at_utc,
-                    is_pre_kickoff
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row.get("match_id"),
-                    row.get("datetime_cdmx"),
-                    row.get("group"),
-                    row.get("home_team"),
-                    row.get("away_team"),
-                    row.get("predicted_score"),
-                    float(row.get("probability", 0.0)),
-                    row.get("model_version"),
-                    row.get("hybrid_predicted_score"),
-                    float(row.get("hybrid_probability", 0.0))
-                    if row.get("hybrid_probability") is not None
-                    else None,
-                    float(row.get("home_win_probability", 0.0))
-                    if row.get("home_win_probability") is not None
-                    else None,
-                    float(row.get("draw_probability", 0.0))
-                    if row.get("draw_probability") is not None
-                    else None,
-                    float(row.get("away_win_probability", 0.0))
-                    if row.get("away_win_probability") is not None
-                    else None,
-                    row.get("outcome_model_version"),
-                    row.get("data_freshness_at"),
-                    json.dumps(safe_row, ensure_ascii=False, allow_nan=False),
-                    row.get("prediction_context", "manual"),
-                    row.get("window_label"),
-                    row.get("generated_at_utc") or row.get("generated_at"),
-                    int(row.get("is_pre_kickoff", 0)),
-                ),
-            )
-            inserted_ids.append(int(cursor.lastrowid))
-    return inserted_ids
+    return SQLitePredictionRepository(connection).insert_prediction_rows(predictions_df)
 
 
 def claim_automation_run(
@@ -1605,6 +1958,20 @@ def finish_automation_run(
     status: str,
     details: dict[str, Any] | None = None,
 ) -> None:
+    def json_default(value: Any) -> Any:
+        if isinstance(value, pd.DataFrame):
+            return value.to_dict(orient="records")
+        if isinstance(value, pd.Series):
+            return value.to_dict()
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if isinstance(value, Path):
+            return str(value)
+        item = getattr(value, "item", None)
+        if callable(item):
+            return item()
+        return str(value)
+
     with connection:
         connection.execute(
             """
@@ -1617,7 +1984,7 @@ def finish_automation_run(
             """,
             (
                 status,
-                json.dumps(details or {}, ensure_ascii=False),
+                json.dumps(details or {}, ensure_ascii=False, default=json_default),
                 run_key,
             ),
         )
@@ -1693,74 +2060,7 @@ def insert_pre_match_snapshot(
     snapshot: dict[str, Any],
     player_rows: list[dict[str, Any]],
 ) -> tuple[int, bool]:
-    with connection:
-        cursor = connection.execute(
-            """
-            INSERT OR IGNORE INTO pre_match_snapshots (
-                match_id, fixture_id, window_label, source_kind,
-                kickoff_at, captured_at, features_json, prediction_json,
-                home_lineup_source, away_lineup_source,
-                model_version, outcome_model_version, data_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                snapshot["match_id"],
-                snapshot.get("fixture_id"),
-                snapshot["window_label"],
-                snapshot["source_kind"],
-                snapshot["kickoff_at"],
-                snapshot["captured_at"],
-                snapshot["features_json"],
-                snapshot["prediction_json"],
-                snapshot.get("home_lineup_source"),
-                snapshot.get("away_lineup_source"),
-                snapshot.get("model_version"),
-                snapshot.get("outcome_model_version"),
-                snapshot["data_hash"],
-            ),
-        )
-        created = cursor.rowcount == 1
-        row = connection.execute(
-            """
-            SELECT id FROM pre_match_snapshots
-            WHERE match_id = ? AND window_label = ? AND source_kind = ?
-            """,
-            (
-                snapshot["match_id"],
-                snapshot["window_label"],
-                snapshot["source_kind"],
-            ),
-        ).fetchone()
-        snapshot_id = int(row["id"])
-        if created:
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO pre_match_player_snapshots (
-                    snapshot_id, team_norm, api_player_id, player_name, player_norm,
-                    lineup_role, role_bucket, attack_impact, defense_impact,
-                    discipline_impact, availability_impact, net_impact, features_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        snapshot_id,
-                        player["team_norm"],
-                        player.get("api_player_id"),
-                        player["player_name"],
-                        player.get("player_norm"),
-                        player.get("lineup_role", "unknown"),
-                        player.get("role_bucket", "unknown"),
-                        float(player.get("attack_impact", 0.0)),
-                        float(player.get("defense_impact", 0.0)),
-                        float(player.get("discipline_impact", 0.0)),
-                        float(player.get("availability_impact", 0.0)),
-                        float(player.get("net_impact", 0.0)),
-                        json.dumps(player, ensure_ascii=False, default=str),
-                    )
-                    for player in player_rows
-                ],
-            )
-    return snapshot_id, created
+    return SQLiteSnapshotRepository(connection).insert_pre_match_snapshot(snapshot, player_rows)
 
 
 def get_latest_pre_match_snapshot(
@@ -1768,13 +2068,7 @@ def get_latest_pre_match_snapshot(
     match_id: str,
     before_kickoff: str | None = None,
 ) -> sqlite3.Row | None:
-    query = "SELECT * FROM pre_match_snapshots WHERE match_id = ?"
-    params: list[Any] = [match_id]
-    if before_kickoff:
-        query += " AND julianday(captured_at) < julianday(?)"
-        params.append(before_kickoff)
-    query += " ORDER BY julianday(captured_at) DESC, id DESC LIMIT 1"
-    return connection.execute(query, params).fetchone()
+    return SQLiteSnapshotRepository(connection).get_latest_pre_match_snapshot(match_id, before_kickoff)
 
 
 def insert_player_targets(

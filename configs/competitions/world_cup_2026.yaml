@@ -1,0 +1,43 @@
+# Default competition for the current project. It keeps all existing scripts
+# and data flows centered on FIFA World Cup 2026 until DB namespacing lands.
+competition:
+  slug: fifa_world_cup
+  name: FIFA World Cup
+  sport: football
+  organizer: FIFA
+  competition_type: national_teams
+  default_timezone: America/Mexico_City
+
+season:
+  slug: world_cup_2026
+  name: FIFA World Cup 2026
+  start_date: 2026-06-11
+  end_date: 2026-07-19
+  timezone: America/Mexico_City
+  status: planned
+
+rules:
+  profile: fifa_world_cup_group_knockout
+  points_win: 3
+  points_draw: 1
+  points_loss: 0
+  neutral_venue_policy: required
+  extra_time_policy: knockout_only
+  penalties_policy: knockout_only
+
+data_sources:
+  calendar:
+    parser: world_cup_markdown
+    input: data/raw/calendario_mundial.md
+  rosters:
+    parser: national_team_markdown
+    input: data/raw/seleccionados_mundialistas.md
+
+api_football:
+  enabled: true
+  league_id: 1
+  season: 2026
+
+outputs:
+  namespace: world-cup-2026
+  stable_aliases: true

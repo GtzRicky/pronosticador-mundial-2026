@@ -14,7 +14,11 @@ import quiniela.notifications as notifications_module
 from quiniela.db import get_connection
 from quiniela.notifications import (
     dispatch_notifications,
+    dry_run_notifications,
+    explain_notification,
+    notification_status,
     queue_official_lineup_notifications,
+    retry_failed_notifications,
     schedule_due_notifications,
     send_isolated_lineup_test_notifications,
     test_notifications as send_test_notifications,
@@ -174,6 +178,28 @@ def test_late_restart_schedules_only_latest_due_window(tmp_path: Path) -> None:
         ("t-5", "ntfy"),
         ("t-5", "discord"),
     }
+
+
+def test_notification_outbox_contract_columns_are_migrated(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "notification-contract.sqlite")
+
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(notification_deliveries)"
+        ).fetchall()
+    }
+
+    assert {
+        "dedupe_key",
+        "max_attempts",
+        "template_version",
+        "payload_hash",
+        "expires_at",
+        "last_error_message",
+        "channel_priority",
+        "season_id",
+    }.issubset(columns)
 
 
 def test_newer_window_supersedes_only_unsent_delivery(tmp_path: Path) -> None:
@@ -354,7 +380,7 @@ def test_retry_after_and_channel_failures_are_independent(tmp_path: Path) -> Non
 
     ntfy = connection.execute(
         """
-        SELECT status, attempt_count, next_attempt_at, error_code
+        SELECT status, attempt_count, next_attempt_at, error_code, payload_hash
         FROM notification_deliveries
         WHERE channel = 'ntfy'
         """
@@ -368,6 +394,7 @@ def test_retry_after_and_channel_failures_are_independent(tmp_path: Path) -> Non
     assert ntfy["attempt_count"] == 1
     assert ntfy["next_attempt_at"] == "2026-06-13T18:48:00Z"
     assert ntfy["error_code"] == "http_429"
+    assert ntfy["payload_hash"]
     assert discord["status"] == "sent"
 
 
@@ -472,7 +499,7 @@ def test_queue_official_lineup_deduplicates_same_hash(tmp_path: Path) -> None:
 
     rows = connection.execute(
         """
-        SELECT notification_type, team_norm, window_label, channel
+        SELECT notification_type, team_norm, window_label, channel, dedupe_key
         FROM notification_deliveries
         ORDER BY channel
         """
@@ -484,6 +511,8 @@ def test_queue_official_lineup_deduplicates_same_hash(tmp_path: Path) -> None:
         ("official_lineup", "mexico", "ntfy"),
     }
     assert all(str(row["window_label"]).startswith("official:mexico:") for row in rows)
+    assert len({row["dedupe_key"] for row in rows}) == 2
+    assert all("official_lineup:match-1:" in row["dedupe_key"] for row in rows)
 
 
 def test_queue_official_lineup_supersedes_pending_hash(tmp_path: Path) -> None:
@@ -859,6 +888,89 @@ def test_manual_test_messages_do_not_require_global_switch(tmp_path: Path) -> No
 
     assert result["results"]["ntfy"]["success"] is True
     assert result["results"]["discord"]["success"] is True
+
+
+def test_notification_status_dry_run_explain_and_retry_failed(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "notification-ops.sqlite")
+    _seed_match(connection)
+    _seed_prediction(connection)
+    settings = _settings(discord_enabled=False)
+    now = datetime(2026, 6, 13, 12, 46, tzinfo=TZ)
+    schedule_due_notifications(connection, now=now, settings=settings)
+
+    status = notification_status(connection, settings=settings)
+    dry_run = dry_run_notifications(connection, now=now, settings=settings)
+    assert status["counts"]
+    assert dry_run["due_count"] == 1
+    assert dry_run["would_send"][0]["channel"] == "ntfy"
+
+    dispatch_notifications(
+        connection,
+        now=now,
+        settings=settings,
+        sessions={"ntfy": FakeSession(FakeResponse(401))},
+    )
+    failed_row = connection.execute(
+        "SELECT id, status FROM notification_deliveries"
+    ).fetchone()
+    explanation = explain_notification(
+        int(failed_row["id"]),
+        connection,
+        settings=settings,
+    )
+    dry_retry = retry_failed_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 12, 47, tzinfo=TZ),
+        settings=settings,
+        apply=False,
+    )
+    applied_retry = retry_failed_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 12, 47, tzinfo=TZ),
+        settings=settings,
+        apply=True,
+    )
+    retried = connection.execute(
+        "SELECT status, error_code FROM notification_deliveries"
+    ).fetchone()
+
+    assert explanation["found"] is True
+    assert explanation["payload_summary"]["has_message"] is True
+    assert explanation["secrets_included"] is False
+    assert dry_retry["matched"] == 1
+    assert dry_retry["updated"] == 0
+    assert applied_retry["updated"] == 1
+    assert retried["status"] == "retry"
+    assert retried["error_code"] == "manual_retry_requested"
+
+
+def test_retry_failed_notifications_skips_expired_failures(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "notification-expired-retry.sqlite")
+    _seed_match(connection)
+    settings = _settings(discord_enabled=False)
+    now = datetime(2026, 6, 13, 12, 56, tzinfo=TZ)
+    schedule_due_notifications(connection, now=now, settings=settings)
+    with connection:
+        connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = 'failed',
+                error_code = 'http_401',
+                expires_at = '2026-06-13T18:59:00Z'
+            """
+        )
+
+    result = retry_failed_notifications(
+        connection,
+        now=datetime(2026, 6, 13, 13, 0, tzinfo=TZ),
+        settings=settings,
+        apply=True,
+    )
+
+    assert result["matched"] == 0
+    assert connection.execute(
+        "SELECT status FROM notification_deliveries"
+    ).fetchone()["status"] == "failed"
 
 
 def test_isolated_lineup_test_sends_without_outbox_mutation(tmp_path: Path) -> None:

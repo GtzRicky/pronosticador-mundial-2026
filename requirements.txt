@@ -10,3 +10,8 @@ rich
 unidecode
 rapidfuzz
 pytest
+ruff
+mypy
+pytest-cov
+pre-commit
+pre-commit-hooks

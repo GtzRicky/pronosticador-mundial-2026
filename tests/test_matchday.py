@@ -3,7 +3,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from quiniela.db import get_connection
-from quiniela.matchday import MatchdayRunner, plan_matchday_actions
+from quiniela.matchday import MatchdayAction, MatchdayRunner, plan_matchday_actions
 
 
 TZ = ZoneInfo("America/Mexico_City")
@@ -193,6 +193,47 @@ def test_hourly_run_does_not_refetch_known_final_result(tmp_path: Path) -> None:
 
     assert fetch_modes.count("hourly") == 1
     assert fetch_modes.count("full") == 1
+
+
+def test_post_match_defers_heavy_final_refresh_to_hourly(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "post-final.sqlite")
+    fetch_modes = []
+
+    runner = MatchdayRunner(
+        connection=connection,
+        refresh=lambda *args, **kwargs: (
+            fetch_modes.append(kwargs["fetch_mode"]) or {"fixtures": 1}
+        ),
+        predict=lambda date: None,
+        render=lambda dates: tmp_path / "index.html",
+        sync_results=lambda *args, **kwargs: {
+            "updated": 1,
+            "match_ids": ["match-final"],
+            "new_match_ids": ["match-final"],
+        },
+        finalize_evidence=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("post-match polling must defer heavy evidence refresh")
+        ),
+        notification_cycle=lambda **kwargs: {},
+    )
+
+    result = runner._execute(
+        MatchdayAction(
+            run_key="post:match-final:0",
+            action="post_match",
+            scheduled_for="2026-06-13T14:45:00-06:00",
+            date_cdmx="2026-06-13",
+            match_id="match-final",
+            fetch_mode="post_status",
+        )
+    )
+
+    assert fetch_modes == ["post_status"]
+    assert result["final_refresh"] == {
+        "skipped": True,
+        "reason": "deferred_to_hourly",
+        "new_match_ids": ["match-final"],
+    }
 
 
 def test_pre_match_run_captures_window_after_prediction(tmp_path: Path) -> None:

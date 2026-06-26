@@ -1,0 +1,43 @@
+# Documentation example only. It captures the intended shape for a domestic
+# league season without changing the World Cup default.
+competition:
+  slug: liga_mx
+  name: Liga MX
+  sport: football
+  organizer: FMF
+  competition_type: clubs
+  default_timezone: America/Mexico_City
+
+season:
+  slug: liga_mx_apertura_2026
+  name: Liga MX Apertura 2026
+  start_date: 2026-07-01
+  end_date: 2026-12-31
+  timezone: America/Mexico_City
+  status: example
+
+rules:
+  profile: liga_mx_apertura_playoffs
+  points_win: 3
+  points_draw: 1
+  points_loss: 0
+  neutral_venue_policy: not_expected
+  extra_time_policy: playoffs_only
+  penalties_policy: playoffs_only
+
+data_sources:
+  calendar:
+    parser: api_football_fixtures
+    input: data/raw/examples/liga_mx_apertura_2026_fixtures.json
+  rosters:
+    parser: api_football_squads
+    input: data/raw/examples/liga_mx_apertura_2026_squads.json
+
+api_football:
+  enabled: false
+  league_id: 262
+  season: 2026
+
+outputs:
+  namespace: liga-mx-apertura-2026
+  stable_aliases: false

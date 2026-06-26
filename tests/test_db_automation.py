@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pandas as pd
 
 from quiniela.db import (
     claim_automation_run,
@@ -90,6 +93,38 @@ def test_claim_automation_run_is_idempotent(tmp_path: Path) -> None:
     assert duplicate is False
     assert row["status"] == "completed"
     assert '"fixtures": 3' in row["details_json"]
+
+
+def test_finish_automation_run_serializes_dataframe_details(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "automation-dataframe.sqlite")
+    run_key = "daily:2026-06-24"
+    claim_automation_run(
+        connection,
+        run_key=run_key,
+        action="daily",
+        scheduled_for="2026-06-24T00:00:00-06:00",
+    )
+
+    finish_automation_run(
+        connection,
+        run_key=run_key,
+        status="completed",
+        details={
+            "predictions": pd.DataFrame(
+                [{"match_id": "match-1", "home_goals": 2, "away_goals": 0}]
+            )
+        },
+    )
+
+    row = connection.execute(
+        "SELECT status, details_json FROM automation_runs WHERE run_key = ?",
+        (run_key,),
+    ).fetchone()
+    details = json.loads(row["details_json"])
+    assert row["status"] == "completed"
+    assert details["predictions"] == [
+        {"match_id": "match-1", "home_goals": 2, "away_goals": 0}
+    ]
 
 
 def test_claim_automation_run_recovers_stale_running_claim(tmp_path: Path) -> None:

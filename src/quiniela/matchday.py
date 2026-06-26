@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+import inspect
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,10 @@ from quiniela.db import (
     recover_stale_automation_runs,
 )
 from quiniela.historical_loader import fetch_today_data, sync_finished_results_for_date
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.output_manager import rebuild_outputs
 from quiniela.predictor import Predictor
 
@@ -26,6 +31,26 @@ POST_MATCH_INTERVAL_MINUTES = 15
 POST_MATCH_MAX_MINUTES = 360
 TERMINAL_STATUSES = {"FT", "AET", "PEN"}
 INACTIVE_STATUSES = {"PST", "CANC", "ABD", "AWD", "WO"}
+
+
+def _rebuild_scoped_outputs(
+    *,
+    connection: Any,
+    competition_context: CompetitionContext,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    parameters = inspect.signature(rebuild_outputs).parameters.values()
+    accepts_context = any(
+        parameter.name == "competition_context"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    kwargs: dict[str, Any] = {"connection": connection}
+    if now is not None:
+        kwargs["now"] = now
+    if accepts_context:
+        kwargs["competition_context"] = competition_context
+    return rebuild_outputs(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -130,6 +155,7 @@ class MatchdayRunner:
         lineup_fallback: Callable[..., dict[str, Any]] | None = None,
         notification_cycle: Callable[..., dict[str, Any]] | None = None,
         timezone_name: str | None = None,
+        competition_context: CompetitionContext | None = None,
     ) -> None:
         from quiniela.player_evidence import (
             capture_pre_match_snapshot,
@@ -139,6 +165,9 @@ class MatchdayRunner:
         from quiniela.notifications import run_notification_cycle
 
         settings = get_settings()
+        self.competition_context = (
+            competition_context or resolve_competition_context()
+        )
         self.connection = connection or get_connection(settings.db_path)
         self.refresh = refresh
         self.predict = predict
@@ -148,7 +177,9 @@ class MatchdayRunner:
         self.finalize_evidence = finalize_evidence or finalize_player_evidence
         self.lineup_fallback = lineup_fallback or refresh_web_lineup_fallback
         self.notification_cycle = notification_cycle or run_notification_cycle
-        self.timezone_name = timezone_name or settings.local_timezone
+        self.timezone_name = (
+            timezone_name or self.competition_context.config.season.timezone
+        )
         self._web_fallback_run_keys: set[str] = set()
 
     def _run_notifications(self, local_now: datetime) -> dict[str, Any]:
@@ -156,6 +187,7 @@ class MatchdayRunner:
             return self.notification_cycle(
                 connection=self.connection,
                 now=local_now,
+                competition_context=self.competition_context,
             )
         except Exception:
             return {
@@ -168,7 +200,9 @@ class MatchdayRunner:
         prediction_context: str,
         window_label: str | None,
     ) -> Any:
-        return Predictor().predict_by_date(
+        return Predictor(
+            competition_context=self.competition_context
+        ).predict_by_date(
             date_str,
             prediction_context=prediction_context,
             window_label=window_label,
@@ -188,9 +222,15 @@ class MatchdayRunner:
             FROM matches m
             LEFT JOIN actual_results ar ON ar.match_id = m.match_id
             WHERE m.date_cdmx IN (?, ?)
+              AND m.competition_id = ?
+              AND m.season_id = ?
             ORDER BY m.datetime_cdmx
             """,
-            dates,
+            [
+                *dates,
+                self.competition_context.competition_id,
+                self.competition_context.season_id,
+            ],
         )
         return rows.to_dict(orient="records")
 
@@ -201,6 +241,7 @@ class MatchdayRunner:
             action.date_cdmx,
             force_refresh=force_refresh,
             fetch_mode=fetch_mode,
+            competition_context=self.competition_context,
         )
         result: dict[str, Any] = {"refresh": refresh_result}
         if action.action == "pre_match" and action.match_id:
@@ -211,11 +252,13 @@ class MatchdayRunner:
                     action.match_id,
                     window_label=window_label,
                     connection=self.connection,
+                    competition_context=self.competition_context,
                 )
         if action.action in {"hourly", "post_match"}:
             result["results"] = self.sync_results(
                 action.date_cdmx,
                 connection=self.connection,
+                competition_context=self.competition_context,
             )
             newly_finished = set(
                 result["results"].get(
@@ -229,16 +272,24 @@ class MatchdayRunner:
                 else bool(newly_finished)
             )
             if should_fetch_final_data:
-                final_refresh = self.refresh(
-                    action.date_cdmx,
-                    force_refresh=True,
-                    fetch_mode="full",
-                )
-                result["final_refresh"] = final_refresh
-                result["evidence"] = self.finalize_evidence(
-                    sorted(newly_finished),
-                    connection=self.connection,
-                )
+                if action.action == "post_match":
+                    result["final_refresh"] = {
+                        "skipped": True,
+                        "reason": "deferred_to_hourly",
+                        "new_match_ids": sorted(newly_finished),
+                    }
+                else:
+                    final_refresh = self.refresh(
+                        action.date_cdmx,
+                        force_refresh=True,
+                        fetch_mode="full",
+                        competition_context=self.competition_context,
+                    )
+                    result["final_refresh"] = final_refresh
+                    result["evidence"] = self.finalize_evidence(
+                        sorted(newly_finished),
+                        connection=self.connection,
+                    )
         window_label = (
             action.run_key.rsplit(":", 1)[-1]
             if action.action == "pre_match"
@@ -258,10 +309,12 @@ class MatchdayRunner:
                 window_label=action.run_key.rsplit(":", 1)[-1],
                 connection=self.connection,
                 source_kind="live",
+                competition_context=self.competition_context,
             )
         if self.render is None:
-            result["outputs"] = rebuild_outputs(
+            result["outputs"] = _rebuild_scoped_outputs(
                 connection=self.connection,
+                competition_context=self.competition_context,
             )
         else:
             result["html"] = str(self.render([action.date_cdmx]))
@@ -276,6 +329,18 @@ class MatchdayRunner:
             local_now,
             self.timezone_name,
         )
+        if not self.competition_context.is_default:
+            actions = [
+                MatchdayAction(
+                    run_key=f"{self.competition_context.namespace}:{action.run_key}",
+                    action=action.action,
+                    scheduled_for=action.scheduled_for,
+                    date_cdmx=action.date_cdmx,
+                    match_id=action.match_id,
+                    fetch_mode=action.fetch_mode,
+                )
+                for action in actions
+            ]
         fallback_actions: dict[str, tuple[int, str]] = {}
         for action in actions:
             if action.action != "pre_match" or not action.match_id:
@@ -323,9 +388,10 @@ class MatchdayRunner:
                 if hasattr(exc, "issues"):
                     error_details["retrieval_issues"] = getattr(exc, "issues")
                 try:
-                    error_details["degraded_outputs"] = rebuild_outputs(
+                    error_details["degraded_outputs"] = _rebuild_scoped_outputs(
                         connection=self.connection,
                         now=local_now,
+                        competition_context=self.competition_context,
                     )
                 except Exception as rebuild_exc:
                     error_details["degraded_outputs_error"] = str(rebuild_exc)
@@ -351,7 +417,10 @@ class MatchdayRunner:
         try:
             from quiniela.output_manager import write_automation_status
 
-            write_automation_status(self.connection)
+            write_automation_status(
+                self.connection,
+                competition_context=self.competition_context,
+            )
         except Exception:
             pass
         return {

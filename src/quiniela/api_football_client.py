@@ -5,6 +5,7 @@ from typing import Any
 
 import requests
 
+from quiniela.adapters.outbound.api_football.policies import CircuitBreakerPolicy, RateLimitPolicy
 from quiniela.config import Settings, get_settings
 from quiniela.db import (
     count_api_requests_today,
@@ -39,10 +40,15 @@ class APIFootballClient:
         self.session = session or requests.Session()
         self.logger = get_logger(self.__class__.__name__)
         self.base_url = f"https://{self.settings.api_football_host}"
+        self.rate_limit_policy = RateLimitPolicy(
+            daily_limit=self.settings.api_daily_limit,
+            critical_reserve=self.settings.api_critical_reserve,
+        )
+        self._circuit_breakers: dict[str, CircuitBreakerPolicy] = {}
 
     def requests_remaining(self) -> int:
         used = count_api_requests_today(self.connection)
-        return max(self.settings.api_daily_limit - used, 0)
+        return self.rate_limit_policy.requests_remaining(used)
 
     def _empty_response(self, reason: str) -> dict[str, Any]:
         return {"response": [], "results": 0, "errors": [reason]}
@@ -73,10 +79,18 @@ class APIFootballClient:
             )
             return self._empty_response("missing_api_key")
 
-        if count_api_requests_today(self.connection) >= self.settings.api_daily_limit:
+        used_requests = count_api_requests_today(self.connection)
+        rate_limit_decision = self.rate_limit_policy.can_make_request(used_requests)
+        if not rate_limit_decision.allowed:
             raise APILimitReachedError(
                 f"Se alcanzo el limite diario de {self.settings.api_daily_limit} requests."
             )
+
+        circuit_breaker = self._circuit_breakers.setdefault(endpoint, CircuitBreakerPolicy())
+        circuit_decision = circuit_breaker.before_request()
+        if not circuit_decision.allowed:
+            self.logger.warning("Circuit breaker abierto para %s; respuesta degradada.", endpoint)
+            return self._empty_response(circuit_decision.reason or "circuit_open")
 
         headers = {
             "x-apisports-key": self.settings.api_football_key,
@@ -98,6 +112,7 @@ class APIFootballClient:
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt + 1 >= max_attempts:
+                    circuit_breaker.record_failure()
                     raise
                 time.sleep(self.RETRY_DELAYS_SECONDS[attempt])
                 continue
@@ -115,10 +130,12 @@ class APIFootballClient:
                 response.status_code in self.TRANSIENT_STATUS_CODES
                 and attempt + 1 < max_attempts
             ):
+                circuit_breaker.record_failure()
                 time.sleep(self.RETRY_DELAYS_SECONDS[attempt])
                 continue
             response.raise_for_status()
             payload = response.json()
+            circuit_breaker.record_success()
             set_cached_response(
                 self.connection,
                 endpoint,

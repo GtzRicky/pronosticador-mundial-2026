@@ -36,6 +36,7 @@ def test_name_normalization_tolerates_mojibake_and_console_damage() -> None:
     assert normalize_team_name("Rep?blica de Corea") == "south_korea"
     assert normalize_team_name("Pa?ses Bajos") == "netherlands"
     assert normalize_team_name("Cura?ao") == "curacao"
+    assert normalize_team_name("Cape Verde Islands") == "cape_verde"
     assert preferred_team_search_name("M?xico") == "Mexico"
 
 
@@ -89,6 +90,8 @@ def test_name_normalization_maps_world_cup_aliases_without_false_matches() -> No
         "Sudáfrica": "south_africa",
         "Suecia": "sweden",
         "Suiza": "switzerland",
+        "Turkiye": "turkey",
+        "Türkiye": "turkey",
         "Turquía": "turkey",
         "Túnez": "tunisia",
         "Uruguay": "uruguay",

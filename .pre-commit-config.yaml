@@ -1,0 +1,25 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check .
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy gradual
+        entry: mypy src/quiniela
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+      - id: check-yaml
+        name: check yaml
+        entry: python -m pre_commit_hooks.check_yaml
+        language: system
+        types: [yaml]
+      - id: check-toml
+        name: check toml
+        entry: python -m pre_commit_hooks.check_toml
+        language: system
+        types: [toml]

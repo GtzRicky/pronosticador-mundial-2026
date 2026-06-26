@@ -13,6 +13,7 @@ from quiniela.db import (
     insert_prediction_rows,
 )
 import quiniela.output_manager as outputs
+from quiniela.infrastructure.competition_config import resolve_competition_context
 
 
 TZ = ZoneInfo("America/Mexico_City")
@@ -127,17 +128,28 @@ def test_canonical_prediction_uses_real_timestamp_and_exports_all_versions(
     assert summary["history_rows"] == 2
     assert summary["latest_rows"] == 1
     assert summary["generated_at_cdmx"] == "2026-06-13 14:00:00 CDMX"
+    assert summary["namespace"] == "world-cup-2026"
+    assert summary["stable_aliases"] is True
     latest = pd.read_csv(settings.predictions_dir / "predictions_latest.csv")
     history = pd.read_csv(settings.predictions_dir / "predictions_history.csv")
     assert latest.iloc[0]["predicted_score"] == "0-1"
+    assert latest.iloc[0]["competition_id"] == "fifa_world_cup"
+    assert latest.iloc[0]["season_id"] == "world_cup_2026"
+    assert "audit_degradation_reasons_json" in latest.columns
+    assert "evidence_release_id" in latest.columns
     assert int(latest.iloc[0]["is_canonical"]) == 1
     assert len(history) == 2
     assert history["is_canonical"].sum() == 1
     assert (settings.predictions_dir / "index.html").exists()
     assert (settings.predictions_dir / "today.html").exists()
+    namespaced = settings.predictions_dir / "world-cup-2026"
+    assert (namespaced / "index.html").exists()
+    assert (namespaced / "today.html").exists()
+    assert (namespaced / "predictions_latest.json").exists()
     html = (settings.predictions_dir / "index.html").read_text(encoding="utf-8")
     assert "Historial prepartido (1)" in html
     assert "MAE goles" in html
+    assert "Auditoria del pronostico" in html
     assert "Ultima actualizacion: 2026-06-13 14:00:00 CDMX" in html
     assert not list(settings.predictions_dir.glob(".*.tmp"))
 
@@ -164,6 +176,60 @@ def test_prediction_source_json_is_strict_json_when_nan_present(tmp_path: Path) 
     ).fetchone()
     assert row["valid"] == 1
     assert "NaN" not in row["source_json"]
+
+
+def test_non_default_outputs_are_namespaced_without_overwriting_world_cup_aliases(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(outputs, "get_settings", lambda: settings)
+    connection = get_connection(settings.db_path)
+    context = resolve_competition_context("champions_league_2026_2027")
+    root_alias = settings.predictions_dir / "predictions_latest.csv"
+    root_alias.write_text("world-cup-sentinel\n", encoding="utf-8")
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO matches (
+                match_id, competition_id, season_id,
+                date_et, time_et, datetime_et,
+                date_cdmx, time_cdmx, datetime_cdmx,
+                home_team, away_team, home_team_norm, away_team_norm,
+                group_name, stadium, stage, status
+            ) VALUES (
+                'ucl-1', ?, ?,
+                '2026-09-15', '16:00', '2026-09-15T16:00:00-04:00',
+                '2026-09-15', '14:00',
+                '2026-09-15T14:00:00-06:00',
+                'Club A', 'Club B', 'club a', 'club b',
+                'league', 'Arena', 'league', 'NS'
+            )
+            """,
+            (context.competition_id, context.season_id),
+        )
+    row = {
+        **_prediction("2026-09-15T18:00:00+00:00", "2-1", pre_kickoff=1),
+        "match_id": "ucl-1",
+        "competition_id": context.competition_id,
+        "season_id": context.season_id,
+        "datetime_cdmx": "2026-09-15T14:00:00-06:00",
+        "home_team": "Club A",
+        "away_team": "Club B",
+    }
+    insert_prediction_rows(connection, pd.DataFrame([row]))
+
+    summary = outputs.rebuild_outputs(
+        connection,
+        now=datetime(2026, 9, 15, 13, 0, tzinfo=TZ),
+        competition_context=context,
+    )
+
+    namespace = settings.predictions_dir / context.namespace
+    latest = pd.read_csv(namespace / "predictions_latest.csv")
+    assert summary["stable_aliases"] is False
+    assert latest["match_id"].tolist() == ["ucl-1"]
+    assert root_alias.read_text(encoding="utf-8") == "world-cup-sentinel\n"
 
 
 def test_rebuild_outputs_tolerates_legacy_malformed_prediction_json(

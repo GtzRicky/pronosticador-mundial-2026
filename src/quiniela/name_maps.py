@@ -84,7 +84,7 @@ TEAM_SPECS: tuple[TeamSpec, ...] = (
     TeamSpec("portugal", "Portugal", ("Portugal",)),
     TeamSpec("senegal", "Senegal", ("Senegal",)),
     TeamSpec("tunisia", "Tunisia", ("Tunisia", "TÃºnez")),
-    TeamSpec("turkey", "Turkey", ("Turkey", "TurquÃ­a")),
+    TeamSpec("turkey", "Turkey", ("Turkey", "Turkiye", "Türkiye", "TurquÃ­a")),
     TeamSpec("australia", "Australia", ("Australia",)),
     TeamSpec("morocco", "Morocco", ("Morocco", "Marruecos")),
     TeamSpec("haiti", "Haiti", ("Haiti", "HaitÃ­")),
@@ -94,7 +94,11 @@ TEAM_SPECS: tuple[TeamSpec, ...] = (
         "Saudi Arabia",
         ("Saudi Arabia", "Arabia SaudÃ­", "Arabia Saudita"),
     ),
-    TeamSpec("cape_verde", "Cape Verde", ("Cape Verde", "Cabo Verde")),
+    TeamSpec(
+        "cape_verde",
+        "Cape Verde",
+        ("Cape Verde", "Cape Verde Islands", "Cabo Verde"),
+    ),
     TeamSpec(
         "dr_congo",
         "DR Congo",

@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 
 from quiniela.config import get_settings
 from quiniela.db import fetch_dataframe, get_connection
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.name_maps import normalize_team_name
 
 
@@ -257,7 +261,12 @@ def _render_impact_summary(impacts: list[dict[str, Any]]) -> str:
     )
 
 
-def _load_match_rows(connection: sqlite3.Connection, dates: list[str]) -> list[dict[str, Any]]:
+def _load_match_rows(
+    connection: sqlite3.Connection,
+    dates: list[str],
+    competition_context: CompetitionContext | None = None,
+) -> list[dict[str, Any]]:
+    context = competition_context or resolve_competition_context()
     placeholders = ",".join("?" for _ in dates)
     query = f"""
         WITH latest_predictions AS (
@@ -266,12 +275,15 @@ def _load_match_rows(connection: sqlite3.Connection, dates: list[str]) -> list[d
             INNER JOIN (
                 SELECT match_id, MAX(id) AS max_id
                 FROM predictions
+                WHERE competition_id = ? AND season_id = ?
                 GROUP BY match_id
             ) latest
             ON p.match_id = latest.match_id AND p.id = latest.max_id
         )
         SELECT
             m.match_id,
+            m.competition_id,
+            m.season_id,
             m.date_cdmx,
             m.time_cdmx,
             m.datetime_cdmx,
@@ -295,6 +307,11 @@ def _load_match_rows(connection: sqlite3.Connection, dates: list[str]) -> list[d
             lp.outcome_model_version,
             lp.data_freshness_at,
             lp.generated_at,
+            lp.audit_snapshot_id,
+            lp.audit_lineup_sources_json,
+            lp.audit_odds_source_json,
+            lp.audit_degradation_reasons_json,
+            lp.not_evaluable_reason,
             json_extract(lp.source_json, '$.odds_consensus') AS odds_consensus,
             json_extract(lp.source_json, '$.odds_adjusted_exact_score') AS odds_adjusted_exact_score,
             json_extract(lp.source_json, '$.odds_adjusted_probability') AS odds_adjusted_probability,
@@ -318,10 +335,19 @@ def _load_match_rows(connection: sqlite3.Connection, dates: list[str]) -> list[d
             ON lp.match_id = m.match_id
         LEFT JOIN actual_results ar
             ON ar.match_id = m.match_id
-        WHERE m.date_cdmx IN ({placeholders})
+        WHERE m.competition_id = ?
+          AND m.season_id = ?
+          AND m.date_cdmx IN ({placeholders})
         ORDER BY m.datetime_cdmx, m.home_team
     """
-    df = fetch_dataframe(connection, query, dates)
+    params = [
+        context.competition_id,
+        context.season_id,
+        context.competition_id,
+        context.season_id,
+        *dates,
+    ]
+    df = fetch_dataframe(connection, query, params)
     return df.to_dict(orient="records")
 
 
@@ -450,6 +476,20 @@ def _json_field(value: Any) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except (TypeError, json.JSONDecodeError):
         return {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if not value or (isinstance(value, float) and math.isnan(value)):
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return [value]
+    if parsed in (None, ""):
+        return []
+    return parsed if isinstance(parsed, list) else [parsed]
 
 
 def _format_probability(value: Any) -> str:
@@ -599,7 +639,7 @@ def _render_market_section(match: dict[str, Any]) -> str:
     if exact_score:
         headline_tags.append(
             '<span class="market-tag gold featured">'
-            "<strong>Marcador odds-aware</strong>"
+            "<strong>Marcador odds-aware formal</strong>"
             f"<b>{escape(str(exact_score))}</b>"
             f"<em>{escape(_format_probability(exact_probability))} · ajuste de mercado</em>"
             "</span>"
@@ -702,6 +742,57 @@ def _render_market_section(match: dict[str, Any]) -> str:
         "</div>"
         + "".join(group for group in groups if group)
         + '<p class="market-disclaimer">Informacion analitica para comparar senales; no es recomendacion financiera ni garantia de apuesta.</p>'
+        "</section>"
+    )
+
+
+def _render_audit_section(match: dict[str, Any]) -> str:
+    degradation_reasons = [
+        str(reason)
+        for reason in _json_list(match.get("audit_degradation_reasons_json"))
+        if str(reason).strip()
+    ]
+    lineup_sources = _json_field(match.get("audit_lineup_sources_json"))
+    odds_source = _json_field(match.get("audit_odds_source_json"))
+    chips = [
+        f"<span>Competencia: {escape(str(match.get('competition_id') or 'n/d'))}</span>",
+        f"<span>Temporada: {escape(str(match.get('season_id') or 'n/d'))}</span>",
+    ]
+    if match.get("audit_snapshot_id") not in (None, ""):
+        chips.append(f"<span>Snapshot: {escape(str(match.get('audit_snapshot_id')))}</span>")
+    if lineup_sources:
+        home = lineup_sources.get("home") or "n/d"
+        away = lineup_sources.get("away") or "n/d"
+        chips.append(f"<span>Alineaciones: {escape(str(home))} / {escape(str(away))}</span>")
+    if odds_source:
+        consensus = odds_source.get("consensus_available")
+        if consensus is True:
+            consensus_label = "si"
+        elif consensus is False:
+            consensus_label = "no"
+        else:
+            consensus_label = "n/d"
+        chips.append(f"<span>Odds consenso: {escape(consensus_label)}</span>")
+    if match.get("not_evaluable_reason"):
+        chips.append(
+            f"<span>No evaluable: {escape(str(match.get('not_evaluable_reason')))}</span>"
+        )
+    if degradation_reasons:
+        reason_items = "".join(
+            f"<li>{escape(reason)}</li>" for reason in degradation_reasons
+        )
+        reasons_html = f"<ul>{reason_items}</ul>"
+    else:
+        reasons_html = "<p>Sin degradacion registrada.</p>"
+    return (
+        '<section class="audit-panel">'
+        "<div>"
+        "<h4>Auditoria del pronostico</h4>"
+        f"{reasons_html}"
+        "</div>"
+        '<div class="audit-chips">'
+        + "".join(chips)
+        + "</div>"
         "</section>"
     )
 
@@ -809,6 +900,7 @@ def _match_card_html(
         "</div>"
         f"{outcome_html}"
         f"{_render_market_section(match)}"
+        f"{_render_audit_section(match)}"
         f"{_render_evaluation(match)}"
         '<div class="impact-grid">'
         '<section class="impact-team">'
@@ -831,6 +923,7 @@ def _match_card_html(
         '<div class="match-footer">'
         f"<span>Modelo: {escape(str(match.get('model_version') or 'n/d'))}</span>"
         f"<span>Logit: {escape(str(match.get('outcome_model_version') or 'n/d'))}</span>"
+        f"<span>Odds: {escape(str(match.get('odds_model_version') or 'n/d'))}</span>"
         f"<span>Evidencia: {escape(evidence_label)}</span>"
         f"<span>Datos: {escape(str(freshness))}</span>"
         f"<span>Generado: {escape(str(match.get('generated_at') or 'n/d'))}</span>"
@@ -1201,6 +1294,42 @@ def render_predictions_html(
       margin: 0 0 14px;
       color: var(--muted);
     }}
+    .audit-panel {{
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) minmax(240px, 1.3fr);
+      gap: 12px;
+      margin: 0 0 14px;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255,255,255,0.62);
+    }}
+    .audit-panel h4 {{
+      margin: 0 0 8px;
+      font-size: 0.98rem;
+    }}
+    .audit-panel p, .audit-panel ul {{
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .audit-panel ul {{
+      padding-left: 18px;
+    }}
+    .audit-chips {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-content: flex-start;
+    }}
+    .audit-chips span {{
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(17,24,39,0.10);
+      background: rgba(255,255,255,0.75);
+      color: var(--muted);
+      font-size: 0.84rem;
+    }}
     .evaluation-box {{
       display: flex;
       flex-wrap: wrap;
@@ -1408,7 +1537,7 @@ def render_predictions_html(
       justify-content: flex-start;
     }}
     @media (max-width: 820px) {{
-      .score-grid, .lineup-grid, .impact-grid, .outcome-probabilities {{
+      .score-grid, .lineup-grid, .impact-grid, .outcome-probabilities, .audit-panel {{
         grid-template-columns: 1fr;
       }}
       .timeline-list li {{
@@ -1457,10 +1586,15 @@ def render_predictions_html(
 """
 
 
-def build_predictions_html_report(dates: list[str], output_path: Path | None = None) -> Path:
+def build_predictions_html_report(
+    dates: list[str],
+    output_path: Path | None = None,
+    competition_context: CompetitionContext | None = None,
+) -> Path:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
     connection = get_connection(settings.db_path)
-    match_rows = _load_match_rows(connection, dates)
+    match_rows = _load_match_rows(connection, dates, context)
     _attach_odds_consensus(connection, match_rows)
     fixture_ids = []
     for row in match_rows:
@@ -1477,11 +1611,16 @@ def build_predictions_html_report(dates: list[str], output_path: Path | None = N
     )
     if output_path is None:
         date_label = dates[0] if len(dates) == 1 else f"{dates[0]}_a_{dates[-1]}"
-        output_path = settings.predictions_dir / f"predicciones_{date_label}.html"
+        output_path = context.prediction_path(
+            settings,
+            f"predicciones_{date_label}.html",
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
     today = datetime.now(ZoneInfo(settings.local_timezone)).date().isoformat()
     if (
-        output_path.parent.resolve() == settings.predictions_dir.resolve()
+        context.stable_aliases
+        and output_path.parent.resolve() == settings.predictions_dir.resolve()
         and today in dates
     ):
         (settings.predictions_dir / "index.html").write_text(html, encoding="utf-8")

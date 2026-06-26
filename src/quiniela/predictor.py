@@ -9,8 +9,17 @@ import numpy as np
 import pandas as pd
 
 from quiniela.config import get_settings
-from quiniela.db import fetch_dataframe, get_connection, insert_prediction_rows
+from quiniela.db import (
+    fetch_dataframe,
+    get_connection,
+    get_latest_pre_match_snapshot,
+    insert_prediction_rows,
+)
 from quiniela.features import build_features_for_matches
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.logging_utils import get_logger
 from quiniela.name_maps import normalize_team_name
 from quiniela.outcome_model import (
@@ -28,9 +37,19 @@ from quiniela.ratings import apply_ratings
 logger = get_logger(__name__)
 
 
+def _audit_json_value(value: Any) -> Any:
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
 class Predictor:
-    def __init__(self) -> None:
+    def __init__(self, competition_context: CompetitionContext | None = None) -> None:
         self.settings = get_settings()
+        self.competition_context = competition_context or resolve_competition_context()
         self.connection = get_connection(self.settings.db_path)
         trained_bundle = load_player_model_artifact()
         self.model = PoissonScoreModel(trained_bundle=trained_bundle)
@@ -41,13 +60,20 @@ class Predictor:
             self.connection,
             """
             SELECT
-                match_id, date_cdmx, datetime_cdmx, group_name AS "group", home_team, away_team,
+                competition_id, season_id, match_id, date_cdmx, datetime_cdmx,
+                group_name AS "group", home_team, away_team,
                 home_team_norm, away_team_norm, stage, status, api_fixture_id
             FROM matches
             WHERE date_cdmx = ?
+              AND competition_id = ?
+              AND season_id = ?
             ORDER BY datetime_cdmx, home_team
             """,
-            (date_str,),
+            (
+                date_str,
+                self.competition_context.competition_id,
+                self.competition_context.season_id,
+            ),
         )
 
     def _match_for_teams(self, home_team: str, away_team: str) -> pd.DataFrame:
@@ -55,20 +81,30 @@ class Predictor:
             self.connection,
             """
             SELECT
-                match_id, date_cdmx, datetime_cdmx, group_name AS "group", home_team, away_team,
+                competition_id, season_id, match_id, date_cdmx, datetime_cdmx,
+                group_name AS "group", home_team, away_team,
                 home_team_norm, away_team_norm, stage, status, api_fixture_id
             FROM matches
             WHERE home_team_norm = ? AND away_team_norm = ?
+              AND competition_id = ?
+              AND season_id = ?
             ORDER BY datetime_cdmx
             LIMIT 1
             """,
-            (normalize_team_name(home_team), normalize_team_name(away_team)),
+            (
+                normalize_team_name(home_team),
+                normalize_team_name(away_team),
+                self.competition_context.competition_id,
+                self.competition_context.season_id,
+            ),
         )
 
     def _synthetic_match(self, home_team: str, away_team: str) -> pd.DataFrame:
         now = datetime.now().astimezone().isoformat()
         row = {
             "match_id": f"manual_{normalize_team_name(home_team)}_{normalize_team_name(away_team)}",
+            "competition_id": self.competition_context.competition_id,
+            "season_id": self.competition_context.season_id,
             "date_cdmx": now[:10],
             "datetime_cdmx": now,
             "group": "manual",
@@ -119,8 +155,19 @@ class Predictor:
             if kickoff.tzinfo is None:
                 kickoff = kickoff.tz_localize(self.settings.local_timezone)
             is_pre_kickoff = int(generated_timestamp < kickoff.tz_convert("UTC"))
+            audit_fields = self._audit_fields(
+                row=row,
+                kickoff=kickoff,
+                generated_at=generated_at,
+                is_pre_kickoff=is_pre_kickoff,
+                odds_adjusted=odds_adjusted,
+                odds_consensus=odds_consensus,
+                data_freshness_at=data_freshness_at,
+            )
             rows.append(
                 {
+                    "competition_id": self.competition_context.competition_id,
+                    "season_id": self.competition_context.season_id,
                     "match_id": row["match_id"],
                     "datetime_cdmx": row["datetime_cdmx"],
                     "group": row["group"],
@@ -175,6 +222,7 @@ class Predictor:
                         sorted(away_impacts, key=lambda impact: float(impact.get("net_impact", 0.0)), reverse=True)[:3],
                         ensure_ascii=False,
                     ),
+                    **audit_fields,
                 }
             )
         predictions_df = pd.DataFrame(rows)
@@ -222,15 +270,92 @@ class Predictor:
             return fallback
         return str(freshness_df.iloc[0]["freshness_at"])
 
-    def save_predictions_csv(self, predictions_df: pd.DataFrame, file_name: str) -> Path:
-        path = self.settings.predictions_dir / file_name
-        predictions_df.to_csv(path, index=False, encoding="utf-8")
-        json_path = path.with_suffix(".json")
-        json_path.write_text(
-            predictions_df.to_json(orient="records", force_ascii=False, indent=2),
-            encoding="utf-8",
+    def _audit_fields(
+        self,
+        *,
+        row: dict[str, Any],
+        kickoff: pd.Timestamp,
+        generated_at: str,
+        is_pre_kickoff: int,
+        odds_adjusted: dict[str, Any] | None,
+        odds_consensus: dict[str, Any] | None,
+        data_freshness_at: str,
+    ) -> dict[str, Any]:
+        fixture_id = _audit_json_value(row.get("api_fixture_id"))
+        home_lineup_source = _audit_json_value(row.get("home_lineup_source"))
+        away_lineup_source = _audit_json_value(row.get("away_lineup_source"))
+        degradation_reasons: list[str] = []
+        if is_pre_kickoff == 0:
+            degradation_reasons.append("post_kickoff_prediction")
+        if not home_lineup_source or not away_lineup_source:
+            degradation_reasons.append("lineup_source_missing")
+        if odds_adjusted is None and odds_consensus is None:
+            degradation_reasons.append("odds_source_missing")
+        if data_freshness_at == generated_at:
+            degradation_reasons.append("freshness_fallback")
+
+        return {
+            "audit_snapshot_id": self._latest_snapshot_id(
+                str(row["match_id"]),
+                str(kickoff),
+            ),
+            "audit_lineup_sources_json": json.dumps(
+                {
+                    "home": home_lineup_source,
+                    "away": away_lineup_source,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            "audit_odds_source_json": json.dumps(
+                {
+                    "fixture_id": fixture_id,
+                    "adjusted_model_version": (
+                        odds_adjusted.get("model_version") if odds_adjusted else None
+                    ),
+                    "consensus_available": odds_consensus is not None,
+                    "freshness_at": data_freshness_at,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                default=str,
+            ),
+            "audit_degradation_reasons_json": json.dumps(
+                degradation_reasons,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            "not_evaluable_reason": (
+                "post_kickoff_prediction" if is_pre_kickoff == 0 else None
+            ),
+        }
+
+    def _latest_snapshot_id(self, match_id: str, before_kickoff: str) -> int | None:
+        snapshot = get_latest_pre_match_snapshot(
+            self.connection,
+            match_id,
+            before_kickoff=before_kickoff,
         )
-        return path
+        if snapshot is None:
+            return None
+        return int(snapshot["id"])
+
+    def save_predictions_csv(self, predictions_df: pd.DataFrame, file_name: str) -> Path:
+        namespaced_path = self.competition_context.prediction_path(
+            self.settings,
+            file_name,
+        )
+        paths = [namespaced_path]
+        if self.competition_context.stable_aliases:
+            paths.insert(0, self.settings.predictions_dir / file_name)
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            predictions_df.to_csv(path, index=False, encoding="utf-8")
+            path.with_suffix(".json").write_text(
+                predictions_df.to_json(orient="records", force_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return paths[0]
 
     def predict_by_date(
         self,

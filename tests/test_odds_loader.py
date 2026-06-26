@@ -117,6 +117,18 @@ def test_store_odds_payload_normalizes_markets_and_consensus(tmp_path: Path) -> 
     assert abs(sum(item["probability"] for item in one_x_two.values()) - 1.0) < 1e-6
 
 
+def test_store_odds_payload_commits_once_per_payload(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "odds-transaction.sqlite")
+    _seed_match(connection)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    store_odds_payload(connection, _odds_payload())
+
+    commits = [statement for statement in statements if statement == "COMMIT"]
+    assert len(commits) == 1
+
+
 def test_odds_adjusted_score_prediction_uses_market_constraints(tmp_path: Path) -> None:
     connection = get_connection(tmp_path / "odds-score.sqlite")
     _seed_match(connection)

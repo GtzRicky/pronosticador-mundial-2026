@@ -1,850 +1,662 @@
-# pronosticador-mundial-2026
+# Quiniela Mundial 2026
 
-Pronosticador local-first en Python para estimar marcadores exactos del Mundial 2026. El proyecto combina una base SQLite, fuentes manuales, cache local de API-Football, señales colectivas por selección y señales individuales por jugador para producir predicciones reproducibles, auditables y actualizables el mismo día del partido.
+Pronosticador de fútbol local-first, auditable y multi-competencia para estimar
+marcadores exactos, probabilidades `1-X-2`, impacto de alineaciones y señales de
+mercado. La V1 conserva el Mundial 2026 como experiencia predeterminada y añade
+una arquitectura hexagonal incremental, operación automatizada, aprendizaje
+controlado, notificaciones robustas y aislamiento por competencia/temporada.
 
-## Features
+> **Estado:** V1 solidificada. El backlog de solidificación `TASK-000` a
+> `TASK-041` está cerrado y la suite offline registra 156 tests.
 
-- Predicciones prepartido con enfoque local-first y trazabilidad completa.
-- Modelo híbrido que combina Poisson para marcadores exactos y Logit para probabilidades `1-X-2`.
-- Ajuste dinámico por alineaciones oficiales, alineaciones estimadas y datos individuales de jugadores.
-- Automatización de jornada con ventanas `T-60`, `T-30`, `T-15`, `T-5`, `T-1` y seguimiento postpartido.
-- Actualización horaria de fixtures, estados, odds, lineups, resultados y outputs estables.
-- Snapshots inmutables antes del kickoff para comparar inferencias contra lo que realmente ocurrió.
-- Aprendizaje continuo con evaluación temporal, gates estrictos y versionado de artefactos.
-- HTML, CSV y JSON acumulativos pensados para operación diaria, revisión humana y auditoría.
-- Fallback web de alineaciones cuando la API publica tarde los titulares.
-- Notificaciones push prepartido por `ntfy` y soporte opcional para `Discord Webhook`.
-- Base SQLite portable, bundle público sanitizado y flujo seguro para publicar el repositorio sin secretos.
+## Contenido
 
-## Resumen Corporativo
+- [Resumen corporativo](#resumen-corporativo)
+- [Qué integra la V1](#qué-integra-la-v1)
+- [Estado de implementación](#estado-de-implementación)
+- [Arquitectura del sistema](#arquitectura-del-sistema)
+- [Pipeline de datos y predicción](#pipeline-de-datos-y-predicción)
+- [Modelos y auditabilidad](#modelos-y-auditabilidad)
+- [Operación matchday](#operación-matchday)
+- [Notificaciones](#notificaciones)
+- [Multi-competencia](#multi-competencia)
+- [Base de datos](#base-de-datos)
+- [Instalación y onboarding](#instalación-y-onboarding)
+- [CLI y scripts](#cli-y-scripts)
+- [Workflows operativos](#workflows-operativos)
+- [Outputs y bundle público](#outputs-y-bundle-público)
+- [Testing y quality gates](#testing-y-quality-gates)
+- [Agentes de IA](#agentes-de-ia)
+- [Migración a otros torneos](#migración-a-otros-torneos)
+- [Contribuciones](#contribuciones)
+- [Seguridad, datos y licencias](#seguridad-datos-y-licencias)
+- [Documentación técnica](#documentación-técnica)
 
-Esta solución toma el calendario oficial y las convocatorias iniciales, crea una base de datos local y la enriquece con información en vivo e histórica de API-Football. Con esos datos calcula la fortaleza reciente de cada selección, la calidad esperada de su alineación titular, el impacto colectivo del banco y la influencia de cada jugador en ataque, defensa, disciplina y disponibilidad. Después estima los goles esperados de local y visitante y genera un marcador exacto probable.
+## Resumen corporativo
 
-En términos no técnicos, el sistema responde tres preguntas:
+### Problema
 
-1. Qué tan bien llega cada selección.
-2. Qué tanto cambia el partido por los jugadores que sí estarán disponibles ese día.
-3. Qué marcador es más consistente con ese balance total.
+Una predicción deportiva operativa no consiste únicamente en calcular un
+marcador. También debe resolver:
 
-La solución está pensada para operar localmente:
+- qué datos estaban disponibles antes del kickoff;
+- si las alineaciones eran oficiales, estimadas o desconocidas;
+- cuánto influyeron los jugadores, el mercado y la forma reciente;
+- qué modelo y release produjo el resultado;
+- si la predicción puede evaluarse de forma justa;
+- cómo actualizar datos y avisar al usuario sin duplicar trabajo;
+- cómo operar con una API limitada, interrupciones de red y datos incompletos.
 
-- la base principal vive en SQLite
-- la API se consulta sólo cuando hace falta
-- cada respuesta útil queda cacheada
-- las predicciones y reportes se exportan a archivos simples (`CSV`, `JSON`, `HTML`)
+### Solución
 
-### Costos y requerimientos operativos
+Quiniela Mundial 2026 mantiene una fuente operativa SQLite local, consume
+API-Football con políticas de caché y cuota, combina modelos estadísticos con
+evidencia de jugadores y odds, captura snapshots prepartido y publica resultados
+en HTML, CSV, JSON y notificaciones.
 
-Requisitos mínimos:
+El sistema está diseñado para continuar funcionando de manera degradada cuando
+faltan datos externos. La trazabilidad se conserva en la base, los outputs y los
+reportes, de modo que una persona pueda explicar por qué cambió una predicción.
 
-- Python `3.11+`
-- una API key de API-Football
-- espacio local para SQLite y artefactos
-- conectividad a internet para backfill y refresh del día
+### Valor de la V1
 
-Dependencias principales:
+- **Local-first:** la base SQLite es la fuente operativa.
+- **Auditable:** cada predicción conserva contexto, freshness, release y razones
+  de degradación.
+- **Automatizable:** Task Scheduler despierta workflows idempotentes.
+- **Resiliente:** caché, presupuestos, reintentos y modos degradados.
+- **Odds-aware:** el mercado complementa, no sustituye, los modelos internos.
+- **Player-aware:** alineaciones y evidencia individual alteran las features.
+- **Multi-competencia:** datos y outputs se aíslan por competition/season.
+- **Agent-ready:** backlog, handoffs, contratos y gates permiten continuidad
+  segura entre desarrolladores y agentes de IA.
 
-- `pandas`, `numpy`, `scipy` y `scikit-learn` para features, matrices y modelos
-- `requests` para API-Football, RSS/noticias, ntfy y Discord
-- `python-dotenv` y `pydantic` para configuración
-- `typer` y `rich` para CLI
-- `unidecode` y `rapidfuzz` para normalización/matching de nombres
-- `pytest` para la suite offline
+### Audiencia
 
-Costos de API-Football verificados el `11 de junio de 2026`:
+- operadores que ejecutan el pronosticador en Windows;
+- analistas que inspeccionan predicciones y métricas;
+- desarrolladores que extienden adapters, casos de uso o modelos;
+- equipos que quieren migrar el sistema a otra competencia;
+- agentes de IA que trabajan con tareas acotadas y evidencia verificable.
 
-- `Free`: `100` requests/día, `US$0/mes`
-- `Pro`: `7,500` requests/día, `US$19/mes`
-- `Ultra`: `75,000` requests/día, `US$29/mes`
-- `Mega`: `150,000` requests/día, `US$39/mes`
+## Qué integra la V1
 
-Para un uso serio del proyecto, el plan recomendado es `Pro` o superior, porque:
+### Producto y predicción
 
-- el backfill histórico con datos por jugador consume bastante más cuota que el modelo básico
-- el plan free puede servir para pruebas ligeras y algunas alineaciones del día, pero no para poblar una base histórica rica
+- Predicción exacta mediante matriz Poisson.
+- Probabilidades de resultado `1-X-2` mediante modelo Logit.
+- Ajuste por forma reciente, ratings y localía.
+- Features individuales de jugadores y agregados por alineación.
+- Once oficial, estimado por noticias, reciente o inferido por uso histórico.
+- Odds normalizadas, de-vig por bookmaker, consenso y ajuste odds-aware.
+- Outputs humanos con Poisson, híbrido, odds-aware, freshness y degradaciones.
 
-### Cómo influye la alineación del día
+### Datos y operación
 
-La alineación ya no se usa sólo como una confirmación binaria de “hay once confirmado”. Ahora influye así:
+- Calendario y convocatorias desde fuentes locales.
+- Backfill histórico y refresh del día mediante API-Football.
+- Caché local, registro de cuota, reintentos y clasificación de errores.
+- Ventanas `T-60`, `T-30`, `T-15`, `T-5` y `T-1`.
+- Sondeo postpartido desde `T+105`, cada 15 minutos, hasta `T+360`.
+- Automatización idempotente mediante `automation_runs`.
+- Doctor CLI read-only para revisar entorno, DB, outputs, outbox y release.
 
-- titulares confirmados pesan al `100%`
-- suplentes confirmados pesan al `25%`
-- si no existe alineación oficial, el sistema infiere un once probable desde alineaciones recientes
-- si tampoco hay alineaciones recientes, usa los jugadores con más minutos y titularidades acumuladas
+### Aprendizaje controlado
 
-Eso significa que el modelo cambia si:
+- Snapshots prepartido inmutables.
+- Targets posteriores al partido.
+- Evaluación temporal sin mezclar futuro con entrenamiento.
+- Champion/challenger para releases de evidencia de jugadores.
+- Gates de MAE, devianza Poisson, log-loss, Brier y calibración.
+- Rollback al release anterior si falla la activación.
 
-- falta un delantero con alto volumen de tiro y gol
-- un mediocampista clave mejora el control y progresión
-- el portero titular ofrece mejor prevención de gol
-- una defensa acumula mala disciplina o riesgo de roja/penal
+### Canales y publicación
 
-## Qué hace el proyecto
+- Notificaciones ntfy.
+- Notificaciones Discord por webhook.
+- Outbox persistente con deduplicación, expiración y reintentos.
+- HTML, CSV y JSON estables.
+- Outputs namespaced por competencia.
+- Bundle público sanitizado para bootstrap offline.
+- Política explícita: outputs, DB, modelos y secretos no se versionan.
 
-- Ingiera calendario y convocados desde archivos Markdown.
-- Normaliza selecciones y jugadores.
-- Construye y mantiene una base SQLite local.
-- Consulta API-Football con estrategia `cache-first`.
-- Hace backfill histórico por selección.
-- Descarga lineups, stats por fixture, stats por jugador y odds.
-- Entrena un modelo estadístico local con señales colectivas e individuales.
-- Predice marcador exacto por fecha o por partido.
-- Genera `CSV`, `JSON` y `HTML` listos para inspección.
+## Estado de implementación
 
-## Mapa de módulos
+| Superficie | Estado V1 | Nota |
+| --- | --- | --- |
+| Mundial 2026 | Implementado y default | Conserva aliases estables. |
+| Arquitectura hexagonal | Implementada incrementalmente | Convive con facades legacy. |
+| SQLite multi-competencia | Implementado | Tablas operativas usan competition/season. |
+| CLI multi-competencia | Implementado | `--competition` y `--season`. |
+| Champions League | Config de ejemplo | API y parsers deshabilitados. |
+| Liga MX | Config de ejemplo | No ejecutar live sin adapters/datos. |
+| Poisson + Logit | Implementado | Componentes canónicos actuales. |
+| Odds-aware | Implementado como señal auxiliar | No reemplaza el modelo interno. |
+| Evidence releases | Implementado | Gates y activación controlada. |
+| ntfy y Discord | Implementado, apagado por default | Requiere secretos locales. |
+| Bundle público | Implementado | Sanitizado, no implica licencia. |
+| Quality gates | Implementados gradualmente | Pytest, Ruff, mypy, pre-commit. |
 
-- `src/quiniela/config.py`: rutas locales, `.env` y settings operativos.
-- `src/quiniela/db.py`: esquema SQLite, migraciones, inserts idempotentes,
-  cache API, automatización y releases.
-- `src/quiniela/calendar_parser.py` y `src/quiniela/roster_parser.py`:
-  ingestan `calendario_mundial.md` y `seleccionados_mundialistas.md`.
-- `src/quiniela/name_maps.py`: normalización estricta de selecciones,
-  aliases y reparación de mojibake común.
-- `src/quiniela/api_football_client.py`: cliente cache-first para
-  API-Football, cuotas y reintentos.
-- `src/quiniela/historical_loader.py`: resolución de equipos, backfill,
-  refresh del día, validación de fixtures y resultados oficiales.
-- `src/quiniela/player_model.py`: features individuales, agregados por
-  alineación, entrenamiento Poisson v1 y artefactos.
-- `src/quiniela/outcome_model.py`: modelo Logit `1-X-2` y reporte de
-  interpretación.
-- `src/quiniela/player_evidence.py`: snapshots prepartido, targets reales,
-  evaluación temporal, gates y releases v2.
-- `src/quiniela/features.py`, `ratings.py`, `poisson_model.py` y
-  `predictor.py`: ensamblaje de features, ratings, matriz Poisson e inserción
-  de predicciones.
-- `src/quiniela/odds_loader.py`: normalización de mercados, consenso y ajuste
-  odds-aware.
-- `src/quiniela/web_lineup_fallback.py`: RSS de noticias, matching de nombres
-  y once estimado auditable.
-- `src/quiniela/matchday.py`: planificación idempotente de jornada, ventanas
-  prepartido y seguimiento postpartido.
-- `src/quiniela/notifications.py`: outbox, ntfy, Discord, reintentos y pruebas.
-- `src/quiniela/output_manager.py` y `html_report.py`: CSV/JSON/HTML,
-  métricas, logs y limpieza de outputs.
-- `src/quiniela/public_bundle.py`: exportación/importación de bundle offline
-  sanitizado.
-- `src/quiniela/cli.py`: CLI Typer que usan los scripts `scripts/XX_*.py`.
+### Compatibilidad legacy
 
-## Cómo funciona
+La migración no reescribió el sistema completo. Los módulos planos
+`db.py`, `predictor.py`, `matchday.py`, `notifications.py`,
+`historical_loader.py` y otros continúan funcionando como facades o workflows
+compatibles. El código nuevo introduce contratos alrededor de ellos y desplaza
+dependencias concretas de forma gradual.
+
+Esto es deliberado:
+
+- protege los scripts existentes;
+- evita migraciones destructivas;
+- permite rollback por task;
+- reduce el riesgo de mover módulos grandes de una sola vez.
+
+## Arquitectura del sistema
+
+### Contexto general
 
 ```mermaid
 flowchart LR
-    A[calendario_mundial.md] --> B[Parser de calendario]
-    C[seleccionados_mundialistas.md] --> D[Parser de convocados]
-    B --> E[SQLite local]
-    D --> E
-    F[API-Football] --> G[Cliente con cache local]
-    G --> E
-    E --> H[Features por selección]
-    E --> I[Features por jugador]
-    H --> J[Agregación colectiva]
-    I --> J
-    J --> K[PoissonRegressor local]
-    K --> L[Lambdas de gol]
-    L --> M[Matriz Poisson de marcador exacto]
-    M --> N[CSV / JSON / HTML]
+    Operator[Operador / Task Scheduler]
+    Agent[Desarrollador o agente de IA]
+    CLI[CLI Typer y scripts]
+    App[Casos de uso y workflows]
+    Models[Poisson / Logit / Evidence / Odds-aware]
+    DB[(SQLite local)]
+    API[API-Football]
+    News[Google News y Bing RSS]
+    Ntfy[ntfy]
+    Discord[Discord]
+    Files[HTML / CSV / JSON / Bundles]
+
+    Operator --> CLI
+    Agent --> CLI
+    CLI --> App
+    App --> Models
+    App --> DB
+    App --> API
+    App --> News
+    App --> Ntfy
+    App --> Discord
+    App --> Files
+    API --> DB
+    News --> DB
+    Models --> DB
 ```
 
-## Cómo se calcula el resultado
-
-### 1. Señales por selección
-
-Para cada equipo se calcula una ventana reciente con indicadores como:
-
-- goles a favor promedio
-- goles en contra promedio
-- diferencia de gol
-- tasa de victoria
-- porterías a cero
-- forma reciente
-- localía
-- ajuste de mercado vía odds
-
-Estas señales siguen siendo importantes porque describen el comportamiento colectivo reciente de una selección.
-
-### 2. Señales por jugador
-
-El sistema consulta y consolida dos tipos de datos individuales:
-
-- `season prior`: lo acumulado por jugador en la temporada o competencia
-- `recent form`: lo hecho por ese jugador en sus últimos partidos disponibles
-
-Se construyen sub-scores individuales a partir de métricas reales disponibles en API-Football:
-
-- `attack_score`
-  - goles por 90
-  - tiros a puerta por 90
-  - asistencias por 90
-  - pases clave por 90
-  - regates exitosos por 90
-- `defense_score`
-  - tackles por 90
-  - intercepciones por 90
-  - porcentaje de duelos ganados
-  - duelos ganados por 90
-- `discipline_risk`
-  - faltas cometidas por 90
-  - amarillas por 90
-  - rojas por 90
-  - penales cometidos
-- `availability_score`
-  - minutos recientes
-  - titularidades recientes
-  - apariciones acumuladas
-- `goalkeeper_score`
-  - atajadas
-  - goles concedidos
-  - rating
-  - minutos
-
-Cuando una métrica no existe literalmente en la API, se usa un proxy explícito. Por ejemplo:
-
-- juego aéreo: `altura + duelos ganados + posición`
-- recuperación de balón: `tackles + intercepciones + duelos`
-
-### 3. Cómo se convierten esos datos en fuerza colectiva
-
-Los sub-scores de jugador se agregan a nivel equipo para producir:
-
-- `starter_attack_strength`
-- `starter_defense_strength`
-- `starter_midfield_control`
-- `goalkeeper_strength`
-- `bench_impact`
-- `discipline_risk_penalty`
-
-Estos agregados se combinan con las señales tradicionales del equipo. Así, la predicción final ya no depende sólo del histórico de la selección, sino también de qué jugadores concretos llegan, juegan y con qué perfil.
+### Arquitectura hexagonal incremental
 
 ```mermaid
-flowchart TD
-    A[Datos por jugador] --> B[Sub-scores individuales]
-    B --> C[Titulares]
-    B --> D[Banca]
-    C --> E[Fuerza ofensiva del once]
-    C --> F[Fuerza defensiva del once]
-    C --> G[Control del mediocampo]
-    C --> H[Fuerza del portero]
-    D --> I[Impacto del banco]
-    B --> J[Riesgo disciplinario]
-    E --> K[Features finales del equipo]
-    F --> K
-    G --> K
-    H --> K
-    I --> K
-    J --> K
+flowchart TB
+    subgraph Inbound["Entrada / composition root"]
+        Scripts["scripts/XX_*.py"]
+        Typer["quiniela.cli"]
+        Scheduler["Windows Task Scheduler"]
+    end
+
+    subgraph Application["Application"]
+        Generate["GeneratePredictionUseCase"]
+        Refresh["RefreshMatchdayUseCase"]
+        Consensus["BuildOddsConsensusUseCase"]
+        Doctor["DoctorUseCase"]
+    end
+
+    subgraph Domain["Domain"]
+        IDs["MatchId / TeamId / PlayerId / PredictionId"]
+        Odds["DecimalOdds / MarketOdds / MarketProbabilities"]
+        Errors["DomainError hierarchy"]
+    end
+
+    subgraph Ports["Ports"]
+        Repos["Match / Prediction / Odds repositories"]
+        Providers["FootballData / Odds providers"]
+        Clock["Clock"]
+        Health["DoctorHealthRepository"]
+        Gateway["OddsConsensusGateway"]
+    end
+
+    subgraph Adapters["Outbound adapters"]
+        SQLite["SQLite repositories y health"]
+        APIF["API-Football provider y policies"]
+        External["ntfy / Discord / RSS / filesystem legacy"]
+    end
+
+    subgraph Legacy["Facades legacy compatibles"]
+        DBFacade["db.py"]
+        Predictor["predictor.py"]
+        Matchday["matchday.py"]
+        Notifications["notifications.py"]
+    end
+
+    Inbound --> Application
+    Application --> Domain
+    Application --> Ports
+    Adapters --> Ports
+    Application -. delegación temporal .-> Legacy
+    Legacy --> Adapters
 ```
 
-### 4. Modelo estadístico
+### Dirección de dependencias
 
-Con esas features se entrena un modelo local con dos `PoissonRegressor`:
+Reglas protegidas por tests de arquitectura:
 
-- uno para estimar goles del local
-- uno para estimar goles del visitante
+- `domain` no importa adapters, infraestructura, SQLite, HTTP ni UI.
+- `ports` no importa adapters ni el facade `db.py`.
+- `application` no importa SQLite, requests, Typer, Rich ni providers
+  concretos.
+- adapters implementan puertos y conocen tecnologías externas.
+- CLI funciona como composition root y construye dependencias concretas.
+- el legacy plano queda fuera del guardrail inicial, pero no debe contaminar
+  código hexagonal nuevo.
 
-El modelo aprende a transformar la combinación de señales colectivas e individuales en:
+### Paquetes V1
 
-- `lambda_home`
-- `lambda_away`
+| Paquete | Responsabilidad |
+| --- | --- |
+| `domain/` | Value objects, errores y lógica pura de odds. |
+| `application/` | Comandos, resultados y casos de uso. |
+| `ports/` | Protocols para repositorios, providers, clock y health. |
+| `adapters/` | Implementaciones SQLite y API-Football. |
+| `infrastructure/` | Clock del sistema y configuración de competencia. |
+| módulos legacy | Workflows completos conservados durante la migración. |
 
-Luego esas lambdas alimentan una matriz Poisson `0..5 x 0..5`. Finalmente se aplica un prior ligero a marcadores muy comunes en torneos cortos y se elige el score exacto más probable.
+### Casos de uso explícitos
+
+- `GeneratePredictionUseCase`: genera por fecha o por partido delegando al
+  predictor compatible.
+- `RefreshMatchdayUseCase`: ejecuta el workflow de jornada mediante una facade
+  inyectable.
+- `BuildOddsConsensusUseCase`: consume `OddsConsensusGateway` sin conocer
+  SQLite.
+- `DoctorUseCase`: inspecciona salud mediante `DoctorHealthRepository` y
+  produce salidas human, JSON o Markdown.
+
+Los detalles normativos están en:
+
+- [Architecture Target](docs/ARCHITECTURE_TARGET.md)
+- [Hexagonal Migration Plan](docs/HEXAGONAL_MIGRATION_PLAN.md)
+- [Coding Standards](docs/CODING_STANDARDS.md)
+- [Architecture Audit](docs/ARCHITECTURE_AUDIT.md)
+
+## Pipeline de datos y predicción
 
 ```mermaid
-flowchart TD
-    A[Features de equipo y jugador] --> B[PoissonRegressor local]
-    B --> C[lambda_home]
-    B --> D[lambda_away]
-    C --> E[Matriz Poisson]
-    D --> E
-    E --> F[Marcador exacto más probable]
-    E --> G[Probabilidad del score]
+flowchart LR
+    Calendar[Calendario local]
+    Rosters[Convocatorias]
+    API[API-Football]
+    RSS[RSS de noticias]
+    Cache[API cache y usage]
+    SQLite[(SQLite)]
+    Team[Features de equipo]
+    Player[Features de jugador]
+    Lineup[Alineación y disponibilidad]
+    Odds[Odds y consenso]
+    Poisson[Poisson score model]
+    Logit[Logit 1-X-2]
+    Ensemble[Predicción híbrida y odds-aware]
+    Snapshot[Snapshot auditable]
+    Outputs[HTML / CSV / JSON / Push]
+
+    Calendar --> SQLite
+    Rosters --> SQLite
+    API --> Cache --> SQLite
+    RSS --> Lineup --> SQLite
+    SQLite --> Team
+    SQLite --> Player
+    SQLite --> Lineup
+    SQLite --> Odds
+    Team --> Poisson
+    Player --> Poisson
+    Lineup --> Poisson
+    Team --> Logit
+    Poisson --> Ensemble
+    Logit --> Ensemble
+    Odds --> Ensemble
+    Ensemble --> Snapshot
+    Snapshot --> SQLite
+    SQLite --> Outputs
 ```
 
-## Arquitectura operativa
+### Fuentes
 
-Principios del sistema:
+1. **Locales:** calendario, convocatorias y configuraciones YAML.
+2. **API-Football:** fixtures, lineups, estadísticas, eventos, jugadores y
+   odds.
+3. **RSS:** noticias recientes para fallback de alineación.
+4. **SQLite:** histórico, caché, predicciones, evaluaciones y releases.
 
-- `local-first`: SQLite es la fuente operativa
-- `cache-first`: primero se busca en `api_cache`
-- `live-on-miss`: sólo se consulta red si falta cache
-- `degraded-but-functional`: sin API key o sin ciertos datos, el pipeline sigue corriendo con fallback controlado
+### Modos de refresh
 
-Endpoints usados actualmente:
+| Modo | Uso |
+| --- | --- |
+| `full` | Carga amplia de fixtures, lineups, eventos, stats, jugadores y odds. |
+| `hourly` | Refresh ligero durante el día. |
+| `pre_match` | Datos cercanos al kickoff, lineups, odds y fallback. |
+| `post_status` | Sondeo de estado y resultado posterior al partido. |
+| `lineups` | Sólo alineaciones. |
 
-- `/teams`
-- `/fixtures`
-- `/fixtures/lineups`
-- `/fixtures/statistics`
-- `/fixtures/events`
-- `/fixtures/players`
-- `/players`
-- `/players/seasons`
-- `/odds`
-- `/odds/bookmakers`
-- `/odds/bets`
+### Política API
 
-### Comunicación con API-Football
+El cliente y los adapters aplican:
 
-El cliente `APIFootballClient` centraliza toda la comunicación externa:
+- cache-first;
+- registro de cache hits y llamadas live;
+- límite diario configurable;
+- reserva crítica de cuota;
+- presupuestos por endpoint/modo;
+- retry para fallos transitorios;
+- bloqueo ante cuota agotada o `429`;
+- circuit breaker y decisiones de policy en adapters nuevos;
+- degradación segura si falta API key;
+- `--dry-run` sin tráfico live;
+- `--force-refresh` sólo para operación consciente.
 
-- Lee `API_FOOTBALL_KEY`, `API_FOOTBALL_HOST`, `API_DAILY_LIMIT` y
-  `API_CRITICAL_RESERVE` desde `.env`.
-- Usa headers compatibles con API-Sports/RapidAPI:
-  `x-apisports-key`, `x-apisports-host` y `x-rapidapi-host`.
-- Consulta primero `api_cache` por `endpoint + params_hash`.
-- Registra cada intento en `api_usage`, incluyendo cache hits, status HTTP y
-  fecha de consumo.
-- Con `--force-refresh` borra la respuesta cacheada de esa consulta y vuelve a
-  pedirla en vivo.
-- Con `--dry-run` no consulta red y devuelve una respuesta vacía controlada.
-- Si falta `API_FOOTBALL_KEY`, el pipeline continúa con respuesta vacía para
-  permitir pruebas offline.
-- Reintenta errores transitorios `408`, `500`, `502`, `503` y `504`; un `429`
-  o el límite diario configurado detienen la consulta con error de cuota.
+La especificación completa vive en [API Policy](docs/API_POLICY.md). Consulta
+precios y términos actuales únicamente en los sitios oficiales:
 
-### Comunicación con SQLite
+- [API-Football pricing](https://www.api-football.com/pricing)
+- [API-Football terms](https://www.api-football.com/terms)
 
-La base vive por defecto en `data/db/quiniela.db`. `get_connection()` crea el
-directorio si hace falta, aplica el esquema idempotente, ejecuta migraciones
-ligeras de columnas nuevas y configura `PRAGMA busy_timeout = 30000` para
-tolerar mejor corridas automáticas cercanas entre sí.
+## Modelos y auditabilidad
 
-Las escrituras usan llaves únicas, `INSERT OR IGNORE`, `ON CONFLICT` y tablas de
-control para que los flujos puedan repetirse sin duplicar datos críticos. La
-tabla `automation_runs` reclama acciones por `run_key` y permite recuperar
-corridas atoradas; `notification_deliveries` funciona como outbox persistente
-para no perder ni repetir notificaciones.
+### Poisson para marcador exacto
 
-### Modos de obtención de datos
+El componente Poisson estima:
 
-`fetch-today` y la automatización diaria aceptan modos con distinto costo:
+- `lambda_home`;
+- `lambda_away`;
+- distribución de goles por equipo;
+- matriz de resultados exactos;
+- score y probabilidad más probable.
 
-- `full`: fixtures, estados, lineups, stats de equipo, eventos, stats de
-  jugadores, odds y stats de temporada cuando hay cuota suficiente.
-- `hourly`: refresh de fixtures, estados, lineups y odds; evita trabajo pesado
-  innecesario.
-- `pre_match`: refresh cercano al kickoff, odds, lineups y, si aplica, fallback
-  web de alineaciones.
-- `post_status`: sondeo liviano de estado/resultado después del partido.
-- `lineups`: sólo alineaciones.
+Las features combinan forma, ratings, goles recientes, localía y agregados de
+alineación. El marcador exacto sigue siendo la salida principal del producto.
 
-La validación de fixtures es estricta: se comparan equipos normalizados contra
-el calendario local y se ignoran partidos ajenos al Mundial. Si un candidato de
-API-Football coincide parcialmente pero no calza con el partido esperado, el
-pipeline reporta `retrieval_issues` en lugar de mezclar datos de otro fixture.
+### Logit para `1-X-2`
 
-## Instalación
+Un modelo Logit estima victoria local, empate y victoria visitante. Sus
+probabilidades se usan como señal complementaria y como referencia de
+calibración frente al componente Poisson.
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-copy .env.example .env
+### Evidencia de jugadores
+
+Los datos individuales se convierten en señales de:
+
+- ataque;
+- creación;
+- defensa;
+- portería;
+- disciplina;
+- disponibilidad;
+- titularidad y minutos recientes.
+
+Después se agregan por equipo:
+
+- fuerza ofensiva del once;
+- fuerza defensiva;
+- control de mediocampo;
+- calidad del portero;
+- impacto del banco;
+- penalización disciplinaria.
+
+La fuente de alineación queda registrada como oficial, estimada por noticias,
+reciente o inferida.
+
+### Odds-aware
+
+```mermaid
+flowchart LR
+    Raw[Odds por bookmaker]
+    Normalize[Normalización de mercado]
+    Devig[Eliminación de overround]
+    Median[Mediana por selección]
+    Renorm[Renormalización del mercado]
+    Consensus[Consenso persistido]
+    Internal[Poisson + Logit]
+    Adjusted[Predicción odds-aware]
+
+    Raw --> Normalize --> Devig --> Median --> Renorm --> Consensus
+    Consensus --> Adjusted
+    Internal --> Adjusted
 ```
 
-### Arranque rápido para un clon nuevo
-
-Para el escenario operativo normal, un usuario nuevo sólo necesita clonar el
-repo, crear el entorno, llenar `.env` y dejar instalada la tarea de Windows. El
-agente de IA puede seguir esta secuencia:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-Edita `.env` y configura al menos:
-
-```dotenv
-API_FOOTBALL_KEY=TU_API_KEY
-NOTIFICATIONS_ENABLED=true
-NTFY_ENABLED=true
-NTFY_TOPIC=TU_TOPIC_PRIVADO
-```
-
-Inicializa la base y verifica que los comandos locales funcionan:
-
-```powershell
-python scripts/03_init_db.py
-python scripts/22_rebuild_outputs.py
-python scripts/26_test_notifications.py --channel ntfy
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1 -DryRun
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_notification_task.ps1 -DryRun
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_notification_task.ps1
-```
-
-El instalador de Task Scheduler usa automáticamente
-`.\.venv\Scripts\python.exe` cuando existe. Si no encuentra `.venv`, usa el
-`python` disponible en `PATH` y lo muestra en `-DryRun`.
-
-La tarea `Quiniela Mundial 2026 Matchday` hace el refresh pesado de fixtures,
-odds, lineups, resultados, predicciones y HTML. La tarea separada
-`Quiniela Mundial 2026 Notifications` corre cada minuto y solo despacha la
-outbox de notificaciones, para que las push T-15/T-5 y alineaciones oficiales
-no dependan de que termine un refresh pesado.
-
-Variables de entorno:
-
-- `API_FOOTBALL_KEY`
-- `API_FOOTBALL_HOST`
-- `API_DAILY_LIMIT`
-- `API_CRITICAL_RESERVE`
-- `DB_PATH`
-- `LOCAL_TIMEZONE`
-- `WEB_LINEUP_FALLBACK_ENABLED`
-- `WEB_LINEUP_FALLBACK_MINUTES`
-- `WEB_LINEUP_MAX_ARTICLES`
-- `WEB_LINEUP_TIMEOUT_SECONDS`
-- `WEB_LINEUP_MIN_DIRECT_PLAYERS`
-- `NOTIFICATIONS_ENABLED`
-- `NTFY_ENABLED`
-- `NTFY_SERVER_URL`
-- `NTFY_TOPIC`
-- `DISCORD_ENABLED`
-- `DISCORD_WEBHOOK_URL`
-- `NOTIFICATION_TIMEOUT_SECONDS`
-
-Valores sugeridos:
-
-```env
-API_FOOTBALL_HOST=v3.football.api-sports.io
-API_DAILY_LIMIT=7500
-API_CRITICAL_RESERVE=25
-DB_PATH=data/db/quiniela.db
-LOCAL_TIMEZONE=America/Mexico_City
-```
-
-## Uso rápido
-
-### 1. Crear la base inicial
-
-```bash
-python scripts/01_ingest_calendar.py
-python scripts/02_ingest_rosters.py
-python scripts/03_init_db.py
-```
-
-### 2. Cargar histórico
-
-```bash
-python scripts/04_fetch_priority_history.py --teams "México,Sudáfrica,República de Corea,República Checa"
-```
-
-### 3. Refrescar datos del día
-
-```bash
-python scripts/05_fetch_today_data.py --date 2026-06-11
-python scripts/05_fetch_today_data.py --date 2026-06-11 --lineups-only
-python scripts/05_fetch_today_data.py --date 2026-06-11 --mode hourly
-python scripts/05_fetch_today_data.py --date 2026-06-11 --mode pre_match
-```
-
-El modo `full` es el predeterminado. Para ahorrar cuota durante el día, usa
-`hourly` o `pre_match`; para sondeo postpartido usa `post_status`.
-
-### 4. Entrenar el modelo por jugador
-
-```bash
-python scripts/13_train_player_model.py --min-matches 20
-```
-
-### 4.1 Entrenar el modelo Logit de resultado
-
-```bash
-python scripts/14_train_outcome_model.py --min-matches 40 --min-per-class 8
-```
-
-El artefacto `logit_outcome_v1.pkl` estima probabilidades de victoria local,
-empate y victoria visitante. Esas probabilidades recalibran la matriz de
-marcadores Poisson, pero el reporte conserva ambos pronósticos para permitir
-comparación. Con muestras menores a `120` partidos el modelo se marca como
-preliminar.
-
-### 4.2 Evidencia individual v2
-
-Las ventanas `T-60`, `T-30`, `T-15`, `T-5` y `T-1` guardan snapshots
-inmutables de features, probabilidades, alineaciones e impactos por jugador.
-Al finalizar el partido, el pipeline vincula esas inferencias con las
-estadísticas reales y comprueba si existen cinco partidos completos nuevos.
-
-```bash
-python scripts/16_capture_pre_match_snapshot.py --match-id MATCH_ID --window t-1
-python scripts/17_build_player_targets.py --match-id MATCH_ID
-python scripts/18_train_player_evidence.py --reconstruct-history
-python scripts/19_evaluate_model_release.py --release-id RELEASE_ID
-python scripts/20_activate_model_release.py --release-id RELEASE_ID
-```
-
-Un partido es elegible cuando tiene resultado, snapshot anterior al kickoff,
-alineaciones de ambos equipos y al menos once participantes con estadísticas
-finales por equipo. El entrenamiento requiere 30 partidos elegibles y cinco
-nuevos desde el último intento completado.
-
-Cada release conserva modelos, metadata, hash del dataset y reporte en
-`data/processed/model_artifacts/releases/<release_id>/`. Sólo se activa cuando
-el candidato con jugadores no empeora MAE, devianza, log-loss, Brier ni
-calibración frente al baseline sin jugadores, y además mejora al menos 2% la
-devianza de goles o el log-loss. Si no supera el gate, los artefactos v1
-continúan activos.
-
-### 5. Generar predicciones
-
-```bash
-python scripts/06_predict_match.py --date 2026-06-11
-python scripts/06_predict_match.py --home "México" --away "Sudáfrica"
-```
-
-### 6. Actualizar resultado oficial
-
-```bash
-python scripts/07_update_after_match.py --home "México" --away "Sudáfrica" --force-refresh
-```
-
-### 7. Generar reporte HTML
-
-```bash
-python scripts/22_rebuild_outputs.py
-```
-
-La reconstrucción genera dos HTML estables: `index.html` contiene el histórico
-completo del torneo y `today.html` muestra solamente la jornada actual. Cada
-partido conserva la última predicción válida antes del kickoff, su resultado,
-métricas de error y una timeline desplegable de revisiones prepartido.
-
-Comandos de mantenimiento:
-
-```bash
-python scripts/08_report_api_usage.py
-python scripts/09_export_public_bundle.py
-python scripts/10_import_public_bundle.py --bundle-path outputs/bundles/quiniela_public_bundle.zip
-python scripts/11_public_bundle_status.py
-python scripts/12_render_html_report.py --date 2026-06-11 --date 2026-06-12
-python scripts/23_evaluate_predictions.py
-python scripts/24_cleanup_obsolete_outputs.py --dry-run
-python scripts/24_cleanup_obsolete_outputs.py --apply
-python scripts/25_dispatch_notifications.py
-python scripts/27_run_notification_cycle.py
-python scripts/28_recover_automation_runs.py --stale-after-minutes 25 --apply
-python scripts/29_fetch_odds.py --date 2026-06-18
-python scripts/30_build_odds_consensus.py --date 2026-06-18
-python scripts/31_send_lineup_test_notifications.py --date 2026-06-18 --dry-run
-```
-
-Todos los scripts `scripts/XX_*.py` son wrappers del CLI Typer definido en
-`src/quiniela/cli.py`. También puedes ejecutar los comandos directamente con:
-
-```bash
-python -m quiniela.cli --help
-python -m quiniela.cli predict --date 2026-06-11
-```
-
-### 8. Automatizar la jornada en Windows
-
-```powershell
-# Revisar sin instalar
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1 -DryRun
-
-# Instalar
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_matchday_task.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_notification_task.ps1
-
-# Eliminar
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall_matchday_task.ps1
-```
-
-La tarea despierta cada minuto, pero sólo ejecuta acciones vencidas y las
-reclama de forma idempotente en `automation_runs`: actualización diaria,
-revisión horaria, ventanas `T-60/T-30/T-15/T-5/T-1` y sondeo postpartido cada
-15 minutos desde `T+105`. La descarga completa de eventos y estadísticas se
-realiza al detectar el resultado final.
-
-```bash
-python scripts/15_run_matchday.py --now 2026-06-13T12:59:00-06:00
-```
-
-### Notificaciones prepartido con ntfy y Discord
-
-La misma tarea por minuto puede enviar el pronostico en `T-15` y `T-5`.
-Tambien envia una push inmediata por seleccion cuando API-Football publica un
-`startXI` oficial completo de 11 titulares. No se instala otra tarea y estas
-entregas no consumen cuota adicional de API-Football fuera del refresh normal.
-
-Los dos canales estan desactivados por defecto. Primero genera localmente un
-topico ntfy dificil de adivinar:
-
-```powershell
-"quiniela-" + [guid]::NewGuid().ToString("N")
-```
-
-Configura `.env` sin copiar estos valores al repositorio:
-
-```dotenv
-NOTIFICATIONS_ENABLED=false
-NTFY_ENABLED=true
-NTFY_SERVER_URL=https://ntfy.sh
-NTFY_TOPIC=PEGA_AQUI_EL_TOPICO_ALEATORIO
-DISCORD_ENABLED=true
-DISCORD_WEBHOOK_URL=PEGA_AQUI_LA_URL_PRIVADA
-NOTIFICATION_TIMEOUT_SECONDS=8
-```
-
-Configuracion de ntfy:
-
-1. Instala ntfy en Android o iOS y suscribete exactamente al valor de
-   `NTFY_TOPIC`.
-2. En navegador abre `https://ntfy.sh/TU_TOPICO` y habilita notificaciones.
-3. Trata el topico como una contrasena: quien lo conozca puede publicar o
-   suscribirse si se usa el servidor anonimo.
-
-Configuracion de Discord:
-
-1. En el servidor privado abre `Server Settings > Integrations > Webhooks`.
-2. Crea un webhook para el canal privado y guarda su URL en `.env`.
-3. Configura el canal en `Notification Settings > All Messages` para recibir
-   push sin guardar menciones, user IDs ni role IDs.
-
-Prueba ambos destinos mientras la automatizacion global sigue apagada:
-
-```bash
-python scripts/26_test_notifications.py --channel all
-python scripts/26_test_notifications.py --channel ntfy
-python scripts/26_test_notifications.py --channel discord
-```
-
-Cuando ambas pruebas funcionen, cambia:
-
-```dotenv
-NOTIFICATIONS_ENABLED=true
-```
-
-El mensaje de pronostico incluye hora CDMX, Poisson, hibrido, probabilidades
-`1-X-2`, fuentes de alineacion, frescura y versiones del modelo. La push de
-alineacion oficial incluye rival, hora CDMX, XI oficial y mini pronostico del
-partido. No incluye enlaces publicos. Si la PC despierta tarde, solo se envia la
-ventana pendiente mas reciente. Los errores `408`, `429`, `5xx` y de red se
-reintentan antes del kickoff; un fallo de ntfy o Discord nunca detiene el
-pronostico.
-
-La outbox `notification_deliveries` registra estados e intentos sin guardar el
-topico ntfy ni la URL del webhook. El despacho manual de entregas pendientes es:
-
-```bash
-python scripts/25_dispatch_notifications.py
-```
-
-### Fallback web de alineaciones
-
-Si API-Football no entrega once titulares completos, desde `T-30` las
-ventanas prepartido consultan noticias recientes mediante RSS, buscan
-coincidencias contra la convocatoria local y completan los huecos con el
-ultimo once y el uso historico de los jugadores.
-
-- La alineacion oficial siempre tiene prioridad.
-- La estimacion se guarda aparte en `lineup_estimates`, con confianza,
-  consultas, enlaces y ventana de captura.
-- El HTML la etiqueta como estimada y muestra sus fuentes.
-- Los entrenamientos que exigen alineaciones confirmadas no usan estas filas.
-- El proceso es determinista y local; no llama modelos de IA en produccion.
-- Estas consultas web no consumen la cuota diaria de API-Football.
-
-Ejecucion manual:
-
-```bash
-python scripts/21_fetch_web_lineup_fallback.py --match-id MATCH_ID --force
-```
-
-Configuracion disponible en `.env`:
-
-```dotenv
-WEB_LINEUP_FALLBACK_ENABLED=true
-WEB_LINEUP_FALLBACK_MINUTES=30
-WEB_LINEUP_MAX_ARTICLES=6
-WEB_LINEUP_TIMEOUT_SECONDS=8
-WEB_LINEUP_MIN_DIRECT_PLAYERS=4
-```
-
-### Como funcionan Google News y Bing RSS en este proyecto
-
-No usamos una API paga de noticias ni scraping abierto del buscador completo.
-El flujo es acotado y auditable:
-
-1. Construimos consultas como `Qatar Switzerland predicted lineup 2026-06-13`.
-2. Consultamos el RSS de Google News y el RSS de Bing News.
-3. Tomamos pocos articulos recientes y deduplicamos por URL.
-4. Descargamos el HTML de cada articulo y extraemos texto visible.
-5. Buscamos nombres de jugadores junto con frases como `predicted lineup`,
-   `starting XI`, `team news` u `once inicial`.
-6. Armamos un once estimado con esos nombres y completamos huecos con el ultimo
-   once conocido y con los jugadores de mayor uso historico.
-7. Guardamos el resultado en `lineup_estimates` con confianza, enlaces,
-   consulta usada y ventana de captura.
-
-Este fallback no reemplaza a la alineacion oficial. Solo evita que nos
-quedemos sin senal util cuando la API publica tarde los titulares.
-
-### Relacion con Task Scheduler y la corrida horaria
-
-No hace falta agregar una tarea nueva ni ejecutar RSS en cada corrida horaria.
-
-- La corrida horaria sigue enfocada en fixtures, estados, odds y refresh general.
-- El fallback web corre solo en ventanas prepartido tardias: `T-30`, `T-15`,
-  `T-5` y `T-1`.
-- Si la PC despierta tarde, `run-matchday` ejecuta solo la ventana pendiente
-  mas cercana al kickoff para no repetir la misma busqueda varias veces.
-- Si la API ya tiene 11 titulares oficiales, no se consulta RSS.
-
-Con la tarea por minuto que ya instalamos, esto ya queda cubierto dentro del
-pipeline actual.
-
-### Odds y consenso de mercado
-
-El proyecto guarda odds en dos niveles:
-
-- `odds_snapshots`: payload bruto por fixture, útil para auditoría y
-  compatibilidad con el flujo inicial.
-- `odds_market_snapshots`: mercados normalizados por bookmaker, selección,
-  línea y probabilidad implícita.
-
-Después, `build-odds-consensus` elimina el overround por bookmaker, calcula la
-mediana por selección y renormaliza cada mercado. Ese consenso se usa de dos
-formas:
-
-- como ajuste de features (`odds_adjustment`) para selección local/visitante
-- como restricción suave de la matriz Poisson, usando mercados como ganador,
-  ambos anotan, over/under y marcador exacto cuando existen
-
-El resultado odds-aware se guarda en `odds_model_predictions` y aparece en CSV,
-JSON y HTML como referencia separada del Poisson puro y del híbrido Poisson +
-Logit.
-
-### Bundle público offline
-
-El flujo `public bundle` crea una copia portable para bootstrap offline. Incluye
-la base sanitizada `quiniela_public.sqlite`, `manifest.json` y, si existen,
-`processed/calendar.csv` y `processed/rosters.csv`.
-
-```bash
-python scripts/09_export_public_bundle.py
-python scripts/09_export_public_bundle.py --no-archive
-python scripts/10_import_public_bundle.py --bundle-path outputs/bundles/quiniela_public_bundle.zip
-python scripts/11_public_bundle_status.py
-```
-
-La exportación elimina `api_cache`, `api_usage` y `notification_deliveries`. No
-incluye `.env`, API keys, tópicos ntfy ni webhooks. Sí puede conservar partidos,
-jugadores, predicciones, resultados, alineaciones oficiales, estimaciones de
-alineación, métricas y releases del modelo, por lo que antes de compartirlo hay
-que revisar la licencia aplicable de los datos deportivos.
-
-## Archivos de salida
-
-Los outputs se reconstruyen desde SQLite y mantienen nombres estables:
-
-- `data/db/quiniela.db`
-- `data/processed/calendar.csv`
-- `data/processed/rosters.csv`
-- `data/processed/model_artifacts/poisson_player_v1.pkl`
-- `data/processed/model_artifacts/logit_outcome_v1.pkl`
-- `data/processed/model_artifacts/releases/<release_id>/`
-- `outputs/predictions/index.html`
-- `outputs/predictions/today.html`
-- `outputs/predictions/predictions_latest.csv`
-- `outputs/predictions/predictions_latest.json`
-- `outputs/predictions/predictions_history.csv`
-- `outputs/predictions/predictions_history.json`
-- `outputs/logs/api_usage.csv`
-- `outputs/logs/data_quality.md`
-- `outputs/logs/data_quality_report.md`
-- `outputs/logs/model_performance.md`
-- `outputs/logs/automation_status.md`
-- `outputs/bundles/public_bundle/`
-- `outputs/bundles/quiniela_public_bundle.zip`
-
-El HTML muestra:
-
-- horario en Ciudad de México
-- estadio
-- marcador pronosticado
-- resultado real
-- alineaciones confirmadas o inferidas
-- alineaciones oficiales o estimadas con fuentes cuando aplica
-- métricas de error para partidos finalizados
-- historial de revisiones prepartido
-- top impactos por jugador/equipo
-
-`predictions_latest` contiene una fila por partido: usa la predicción canónica
-prepartido cuando el encuentro ya comenzó y la versión más reciente para
-partidos futuros. `predictions_history` conserva todas las corridas, incluidas
-las posteriores al kickoff, pero estas últimas se marcan como no evaluables.
+La V1:
+
+- almacena snapshots normalizados;
+- calcula probabilidades justas por bookmaker;
+- obtiene consenso robusto;
+- registra freshness y coverage;
+- usa el mercado como ajuste auxiliar;
+- conserva Poisson, Logit y odds-aware por separado para comparación.
+
+El diseño completo está en
+[Odds-Aware Model Design](docs/ODDS_AWARE_MODEL_DESIGN.md).
+
+### Contrato auditable de predicción
+
+Las predicciones pueden conservar:
+
+- `competition_id` y `season_id`;
+- contexto y ventana de generación;
+- timestamp UTC y condición pre-kickoff;
+- snapshot asociado;
+- fuentes de alineación;
+- fuente y freshness de odds;
+- release/model version;
+- razones de degradación;
+- motivo de no evaluación;
+- probabilidades y componentes del ensemble.
+
+El contrato canónico está en [Data Contracts](docs/DATA_CONTRACTS.md).
 
 ## Aprendizaje continuo
 
-Al finalizar un partido el pipeline:
+```mermaid
+flowchart TD
+    Pre[Snapshot prepartido]
+    Final[Resultado y stats finales]
+    Targets[Player match targets]
+    Dataset[Dataset temporal y hash]
+    Candidate[Candidate release]
+    Metrics[MAE / Deviance / Log-loss / Brier / Calibration]
+    Gate{¿Supera gates?}
+    Active[Champion activo]
+    Rejected[Release rechazado]
+    Rollback[Restaurar release anterior]
 
-1. sincroniza resultado, eventos y estadísticas individuales
-2. selecciona la última predicción anterior al kickoff
-3. calcula MAE de goles, devianza Poisson, log-loss, Brier y calibración
-4. vincula inferencias de jugadores con participación, minutos y objetivos de
-   ataque, creación, defensa, portería y disciplina
-5. comprueba si hay cinco partidos completos nuevos para reentrenar
+    Pre --> Targets
+    Final --> Targets
+    Targets --> Dataset --> Candidate --> Metrics --> Gate
+    Gate -->|Sí| Active
+    Gate -->|No| Rejected
+    Active -->|Falla manifest| Rollback
+```
 
-Los modelos candidatos se validan temporalmente contra un baseline sin
-variables individuales. Sólo se activan si no empeoran ninguna métrica
-principal y mejoran al menos 2% la devianza de goles o el log-loss. El release
-anterior y los artefactos v1 permanecen disponibles para rollback.
+### Niveles
 
-## Cómo usarlo con agentes de IA
+1. **Actualización operacional:** resultados, ratings, cache y outputs.
+2. **Champion/challenger:** entrenamiento de evidencia con gates estrictos.
+3. **Evolución controlada:** ensemble, calibración y modelos por competencia.
 
-Este proyecto está pensado para trabajar bien con agentes de código como:
+### Elegibilidad y gates
 
-- Codex
-- GitHub Copilot
-- Claude Code
+Un partido de evidencia requiere snapshot previo, resultado, alineaciones
+compatibles y estadísticas suficientes. El candidato:
 
-### Patrón recomendado de trabajo
+- no debe empeorar métricas principales;
+- debe mejorar al menos 2% la devianza o el log-loss;
+- no sustituye automáticamente al champion si es rechazado;
+- conserva metadata, hash, modelos y reporte para auditoría.
 
-1. Pídele al agente que inspeccione la base y los archivos procesados.
-2. Pídele que refresque partidos o selecciones concretas.
-3. Pídele que entrene el modelo y compare predicciones contra resultados reales.
-4. Pídele que explique por qué un jugador o una alineación movió la predicción.
-5. Pídele que genere HTML, CSV o JSON para revisión humana.
+Cada release debe documentarse con
+[Model Card Template](docs/MODEL_CARD_TEMPLATE.md).
 
-### Ejemplos de tareas útiles para un agente
+## Operación matchday
 
-- “Actualiza los datos del 12 de junio y regenera el HTML”
-- “Entrena de nuevo el modelo por jugador si ya hay más partidos con lineups confirmadas”
-- “Explícame por qué cambió la predicción de Brasil vs Marruecos”
-- “Dime qué selecciones no tienen alineación confirmada”
-- “Muéstrame los tres jugadores con mayor impacto ofensivo por equipo”
+```mermaid
+sequenceDiagram
+    participant TS as Task Scheduler
+    participant CLI as run-matchday
+    participant Plan as Action planner
+    participant API as Data refresh
+    participant Pred as Predictor
+    participant Snap as Snapshot
+    participant Out as Outputs
+    participant Notify as Notification cycle
 
-### Qué necesita el agente
+    TS->>CLI: despertar cada minuto
+    CLI->>Plan: calcular acciones vencidas
+    Plan->>API: daily / hourly / pre_match / post_status
+    API->>Pred: datos actualizados
+    Pred->>Snap: guardar predicción y evidencia
+    Snap->>Out: reconstruir proyecciones
+    Out->>Notify: programar y despachar entregas
+```
 
-Para ser útil, el agente debe tener acceso a:
+### Acciones
 
-- el repo local
-- `.env` con tu API key
-- la base SQLite local
-- permiso para ejecutar scripts Python y, cuando aplique, consultar la API
+- `daily`: refresh amplio una vez por fecha.
+- `hourly`: actualización general por hora.
+- `pre_match`: ventanas `T-60`, `T-30`, `T-15`, `T-5`, `T-1`.
+- `post_match`: sondeo desde `T+105` hasta `T+360`.
 
-### Buenas prácticas con IA
+Cada acción usa un `run_key` y se reclama en `automation_runs`. Repetir el
+comando no debe duplicar trabajo ya completado.
 
-- usa prompts concretos con fecha, selección o partido
-- pide siempre trazabilidad, no sólo el score final
-- si el agente hace llamadas live, revisa el consumo del plan API
-- mantén `.env` fuera de Git
+### Task Scheduler
+
+Hay dos tareas:
+
+- **Matchday:** workflow pesado de datos, predicción y outputs.
+- **Notifications:** ciclo rápido de outbox y despacho.
+
+Los instaladores prefieren `.\.venv\Scripts\python.exe` y soportan `-DryRun`.
+
+## Notificaciones
+
+### Canales
+
+- **ntfy:** publicación HTTP a un topic privado.
+- **Discord:** webhook hacia un canal configurado.
+
+Ambos están desactivados por default.
+
+### Tipos
+
+- predicción de ventana prepartido;
+- alineación oficial detectada;
+- prueba aislada de canal o lineup.
+
+### Outbox
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> sending
+    pending --> waiting_prediction
+    waiting_prediction --> pending
+    sending --> sent
+    sending --> retry
+    sending --> failed
+    pending --> expired
+    waiting_prediction --> expired
+    retry --> sending
+    retry --> expired
+    failed --> retry: reintento manual vigente
+```
+
+La entrega registra:
+
+- clave de deduplicación;
+- hash de payload;
+- tipo, canal, competencia y temporada;
+- kickoff y expiración;
+- intentos y próximo retry;
+- error normalizado y status HTTP;
+- timestamps de envío.
+
+Los errores `408`, `429`, `5xx` y de red son retryable. Ningún retry debe
+cruzar el kickoff o su `expires_at`. Consulta el contrato completo en
+[Notification Contracts](docs/NOTIFICATION_CONTRACTS.md).
+
+## Multi-competencia
+
+### Contexto
+
+`CompetitionContext` concentra:
+
+- `competition_id`;
+- `season_id`;
+- namespace;
+- configuración YAML;
+- política de aliases;
+- fuentes y parámetros de API.
+
+Los comandos relevantes aceptan:
+
+```powershell
+--competition world_cup_2026
+--season world_cup_2026
+```
+
+`--competition` puede ser el nombre de un YAML en `configs/competitions/` o una
+ruta explícita. `--season` valida la temporada del archivo seleccionado.
+
+### Aislamiento
+
+```mermaid
+flowchart TB
+    Selector[--competition / --season]
+    Context[CompetitionContext]
+    DB[(SQLite con competition_id + season_id)]
+    WC[outputs/predictions/world-cup-2026]
+    Other[outputs/predictions/otro-namespace]
+    Aliases[Aliases raíz estables]
+
+    Selector --> Context --> DB
+    Context --> WC
+    Context --> Other
+    WC --> Aliases
+    Other -. no sobrescribe .-> Aliases
+```
+
+- Mundial 2026 es el default.
+- Sólo el default puede escribir aliases raíz.
+- Competencias no default escriben en su namespace.
+- Queries y entregas nuevas filtran competition/season.
+- Configs con API deshabilitada bloquean fetch live.
+- Parsers no implementados fallan de forma explícita.
+
+### Configuraciones incluidas
+
+| Config | Estado |
+| --- | --- |
+| `world_cup_2026.yaml` | Operativa y default. |
+| `champions_league_2026_2027.yaml` | Ejemplo; API deshabilitada. |
+| `liga_mx_apertura_2026.yaml` | Ejemplo; no productiva. |
+
+Para habilitar otra competencia sigue
+[Agent Tournament Migration](docs/AGENT_TOURNAMENT_MIGRATION.md) y
+[Multi-Tournament Design](docs/MULTI_TOURNAMENT_DESIGN.md).
 
 ## Base de datos
 
-Tablas principales:
+SQLite vive por default en `data/db/quiniela.db`. El schema es idempotente,
+aplica migraciones compatibles y configura `busy_timeout`.
 
+### Catálogo y torneo
+
+- `competitions`
+- `seasons`
+- `competition_participants`
 - `teams`
 - `players`
 - `matches`
+
+### API, datos históricos y live
+
 - `api_cache`
 - `api_usage`
 - `historical_matches`
@@ -854,6 +666,9 @@ Tablas principales:
 - `historical_player_stats`
 - `fixture_player_stats`
 - `player_season_stats`
+
+### Mercado y predicción
+
 - `odds_snapshots`
 - `odds_market_snapshots`
 - `odds_market_consensus`
@@ -862,8 +677,14 @@ Tablas principales:
 - `prediction_player_impacts`
 - `prediction_evaluations`
 - `actual_results`
+
+### Automatización y notificaciones
+
 - `automation_runs`
 - `notification_deliveries`
+
+### Evidencia y releases
+
 - `pre_match_snapshots`
 - `pre_match_player_snapshots`
 - `player_match_targets`
@@ -872,76 +693,451 @@ Tablas principales:
 - `model_training_runs`
 - `model_releases`
 
-Resumen por grupos:
+### Principios de persistencia
 
-- Catálogo local: `teams`, `players`, `matches`.
-- API/cache/cuota: `api_cache`, `api_usage`.
-- Datos históricos y live: `historical_matches`, `historical_lineups`,
-  `historical_team_stats`, `historical_player_stats`,
-  `fixture_player_stats`, `player_season_stats`.
-- Alineaciones estimadas: `lineup_estimates`.
-- Mercado: `odds_snapshots`, `odds_market_snapshots`,
-  `odds_market_consensus`, `odds_model_predictions`.
-- Predicción y evaluación: `predictions`, `prediction_player_impacts`,
-  `prediction_evaluations`, `actual_results`.
-- Automatización y notificaciones: `automation_runs`,
-  `notification_deliveries`.
-- Evidencia individual v2: `pre_match_snapshots`,
-  `pre_match_player_snapshots`, `player_match_targets`,
-  `player_evidence_evaluations`, `player_prediction_evaluations`,
-  `model_training_runs`, `model_releases`.
+- migraciones aditivas e idempotentes;
+- índices por match, fixture, season y estado;
+- `INSERT OR IGNORE` y `ON CONFLICT` donde aplica;
+- timestamps y source JSON para trazabilidad;
+- DB real fuera de Git;
+- DB temporal en tests.
 
-El esquema se crea y migra de forma idempotente al abrir conexión. Las columnas
-históricas agregadas después, como `prediction_context`, `window_label`,
-`generated_at_utc`, `is_pre_kickoff` y campos de notificación oficial, se
-rellenan con migraciones ligeras para mantener bases existentes utilizables.
+## Instalación y onboarding
 
-Herramientas recomendadas para inspección:
+### Requisitos
 
-- `DB Browser for SQLite`
-- `SQLiteStudio`
-- `VS Code` con extensión SQLite
+- Windows con PowerShell para la automatización oficial;
+- Python 3.11 o superior;
+- conexión a Internet sólo para operaciones live;
+- API key de API-Football para datos externos;
+- SQLite incluido con Python.
 
-Ejemplos:
+### Crear el entorno
 
-```bash
-sqlite3 data/db/quiniela.db ".tables"
-sqlite3 data/db/quiniela.db "select home_team, away_team, api_fixture_id from matches where date_cdmx='2026-06-11';"
-sqlite3 data/db/quiniela.db "select match_id, home_goals, away_goals from actual_results;"
+```powershell
+py -3.11 --version
+py -3.11 -m venv .venv
+Set-ExecutionPolicy -Scope Process Bypass
+.\.venv\Scripts\Activate.ps1
+python --version
+python -m pip install -r requirements.txt
+python -m pip install -e .
+python -m pip check
 ```
 
-## Límites, licencias y consideraciones
+Si el launcher `py` todavía no detecta una instalación por usuario:
 
-- La data deportiva puede variar por competencia y cobertura.
-- El proyecto depende de la calidad y disponibilidad de API-Football.
-- El proveedor indica que no se debe revender la data directamente.
-- El proveedor también indica que cualquier licencia o permiso de publicación de los datos debe ser gestionado por el usuario con los titulares correspondientes.
+```powershell
+& "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe" -m venv .venv
+```
 
-Antes de publicar una base enriquecida o artefactos derivados, revisa:
+### Configurar el entorno
 
-- https://www.api-football.com/pricing
-- https://www.api-football.com/terms
+```powershell
+Copy-Item .env.example .env
+```
 
-## Publicacion segura del repo
+Completa `.env` localmente. Nunca lo compartas ni lo pegues en un handoff.
 
-Antes de subir cambios a un repositorio externo:
+Variables principales:
 
-- no subas `.env`, API keys, tokens ni credenciales locales
-- no subas `data/db/*.db`, `api_cache`, `api_usage` ni dumps operativos
-- no subas outputs diarios ni bundles redistribuibles sin revisar antes licencia
-  y acuerdo de servicio
-- revisa `git status --short` y confirma que solo viajan codigo, tests y docs
-- si compartes una base portable, usa el flujo de `public bundle` y valida otra
-  vez la politica de redistribucion
+| Variable | Propósito |
+| --- | --- |
+| `API_FOOTBALL_KEY` | Credencial de API-Football. |
+| `API_DAILY_LIMIT` | Límite live configurado. |
+| `API_CRITICAL_RESERVE` | Cuota reservada para ventanas críticas. |
+| `DB_PATH` | Ruta de SQLite. |
+| `LOCAL_TIMEZONE` | Zona operativa. |
+| `WEB_LINEUP_FALLBACK_*` | Límites del fallback RSS. |
+| `NOTIFICATIONS_ENABLED` | Interruptor global de notificaciones. |
+| `NTFY_*` | Configuración del canal ntfy. |
+| `DISCORD_*` | Configuración del webhook Discord. |
 
-## Pruebas
+### Verificar instalación
 
-```bash
+```powershell
+python -m quiniela.cli --help
+python -m quiniela.cli doctor
+python -m quiniela.cli doctor --format json
 pytest -q
 ```
 
-La suite base es offline y valida parsers, carga histórica, cliente
-API-Football con cache/control de errores, reportes HTML, persistencia de
-bundle público, automatización de jornada, notificaciones, odds, outputs,
-componentes del modelo Poisson, modelo Logit y partes del flujo de evidencia
-por jugador.
+El doctor es read-only: no consume API, no repara la DB y no imprime secretos.
+
+### Inicializar
+
+```powershell
+python scripts\01_ingest_calendar.py
+python scripts\02_ingest_rosters.py
+python scripts\03_init_db.py
+python scripts\22_rebuild_outputs.py
+```
+
+## CLI y scripts
+
+Los scripts Python son wrappers del CLI Typer. Puedes usar:
+
+```powershell
+python scripts\05_fetch_today_data.py --help
+python -m quiniela.cli fetch-today --help
+```
+
+### Ingesta, datos y predicción
+
+| Script | Comando CLI | Propósito |
+| --- | --- | --- |
+| `01_ingest_calendar.py` | `ingest-calendar` | Procesar calendario local. |
+| `02_ingest_rosters.py` | `ingest-rosters` | Procesar convocatorias. |
+| `03_init_db.py` | `init-db` | Crear schema y sembrar datos. |
+| `04_fetch_priority_history.py` | `fetch-history` | Backfill histórico por equipos. |
+| `05_fetch_today_data.py` | `fetch-today` | Refresh por fecha y modo. |
+| `06_predict_match.py` | `predict` | Predecir fecha o partido. |
+| `07_update_after_match.py` | `update-after-match` | Sincronizar resultado y recalcular. |
+| `08_report_api_usage.py` | `report-api-usage` | Revisar consumo y cache. |
+
+### Publicación y outputs
+
+| Script | Comando CLI | Propósito |
+| --- | --- | --- |
+| `09_export_public_bundle.py` | `export-public-bundle` | Crear bundle sanitizado. |
+| `10_import_public_bundle.py` | `import-public-bundle` | Importar bundle offline. |
+| `11_public_bundle_status.py` | `public-bundle-status` | Revisar estado del bundle. |
+| `12_render_html_report.py` | `render-html-report` | Renderizar HTML para fechas. |
+| `22_rebuild_outputs.py` | `rebuild-outputs` | Reconstruir outputs estables. |
+| `23_evaluate_predictions.py` | `evaluate-predictions` | Evaluar predicciones finalizadas. |
+| `24_cleanup_obsolete_outputs.py` | `cleanup-obsolete-outputs` | Limpiar con dry-run/apply. |
+
+### Modelos y evidencia
+
+| Script | Comando CLI | Propósito |
+| --- | --- | --- |
+| `13_train_player_model.py` | `train-player-model` | Entrenar modelo de jugador v1. |
+| `14_train_outcome_model.py` | `train-outcome-model` | Entrenar Logit `1-X-2`. |
+| `16_capture_pre_match_snapshot.py` | `capture-pre-match-snapshot` | Guardar snapshot. |
+| `17_build_player_targets.py` | `build-player-targets` | Construir targets finales. |
+| `18_train_player_evidence.py` | `train-player-evidence` | Entrenar candidate release. |
+| `19_evaluate_model_release.py` | `evaluate-model-release` | Inspeccionar release. |
+| `20_activate_model_release.py` | `activate-model-release` | Activar candidate aprobado. |
+
+### Automatización, odds y notificaciones
+
+| Script | Comando CLI | Propósito |
+| --- | --- | --- |
+| `15_run_matchday.py` | `run-matchday` | Ejecutar jornada idempotente. |
+| `21_fetch_web_lineup_fallback.py` | `fetch-web-lineup-fallback` | Refrescar once estimado. |
+| `25_dispatch_notifications.py` | `dispatch-notifications` | Despachar outbox. |
+| `26_test_notifications.py` | `test-notifications` | Probar canales configurados. |
+| `27_run_notification_cycle.py` | `run-notification-cycle` | Programar y despachar. |
+| `28_recover_automation_runs.py` | `recover-automation-runs` | Recuperar runs stale. |
+| `29_fetch_odds.py` | `fetch-odds` | Obtener odds por fecha. |
+| `30_build_odds_consensus.py` | `build-odds-consensus` | Construir consenso. |
+| `31_send_lineup_test_notifications.py` | `send-lineup-test-notifications` | Probar push de lineup. |
+
+### Comandos operativos adicionales
+
+Estos comandos no tienen wrapper numérico dedicado:
+
+- `doctor`
+- `notifications-status`
+- `retry-failed-notifications`
+- `dry-run-notifications`
+- `explain-notification`
+
+## Workflows operativos
+
+### Bootstrap offline
+
+```powershell
+python scripts\01_ingest_calendar.py
+python scripts\02_ingest_rosters.py
+python scripts\03_init_db.py
+python scripts\06_predict_match.py --date 2026-06-11
+python scripts\22_rebuild_outputs.py
+```
+
+### Refresh seguro
+
+```powershell
+python scripts\05_fetch_today_data.py --date 2026-06-11 --dry-run
+python scripts\05_fetch_today_data.py --date 2026-06-11 --mode hourly
+python scripts\05_fetch_today_data.py --date 2026-06-11 --mode pre_match
+```
+
+Evita `--force-refresh` sin revisar cuota y necesidad.
+
+### Matchday manual
+
+```powershell
+python scripts\15_run_matchday.py
+python scripts\15_run_matchday.py --now 2026-06-13T12:59:00-06:00
+python -m quiniela.cli notifications-status
+```
+
+### Instalar automatización
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_wake_scheduler.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_wake_scheduler.ps1
+```
+
+El instalador elimina el polling cada minuto. Un planner diario y de inicio de
+sesion crea tareas one-shot agrupadas por timestamp para T-60, T-30, T-15, T-5,
+T-1 y los sondeos postpartido T+105..T+360 cada 15 minutos.
+
+Todas usan `WakeToRun`, `StartWhenAvailable` y `pythonw.exe`, sin consola ni
+cambio de foco. El planner conserva un horizonte movil de tres dias y escribe
+`outputs/logs/wake_schedule.json`. Los wake timers se habilitan para corriente
+alterna; el equipo debe permanecer conectado para una operacion confiable.
+Despues de cada tarea, Windows vuelve a aplicar su politica normal de
+suspension y el proyecto nunca fuerza el reposo si el usuario esta trabajando.
+
+Para ejecutar manualmente un ciclo visible en el monitor `DELL P2219H`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_scheduled_python.ps1 -PythonPath .\.venv\Scripts\python.exe -ScriptPath .\scripts\15_run_matchday.py -MonitorName "DELL P2219H"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_scheduled_python.ps1 -PythonPath .\.venv\Scripts\python.exe -ScriptPath .\scripts\27_run_notification_cycle.py -MonitorName "DELL P2219H"
+```
+
+Las tareas usan logon interactivo: se ejecutan mientras la sesion del usuario
+que las instalo permanezca iniciada, aunque la pantalla este bloqueada. Si el
+usuario cierra sesion, Windows no mantiene disponible ese escritorio
+interactivo y las tareas esperan al siguiente inicio de sesion.
+
+Para eliminar la tarea matchday:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall_wake_scheduler.ps1
+```
+
+### Diagnóstico
+
+```powershell
+python -m quiniela.cli doctor
+python -m quiniela.cli doctor --format markdown
+python -m quiniela.cli notifications-status
+python -m quiniela.cli dry-run-notifications
+python -m quiniela.cli retry-failed-notifications --dry-run
+```
+
+Consulta:
+
+- [Runbook de operación](docs/RUNBOOK_OPERACION.md)
+- [Runbook de incidentes](docs/RUNBOOK_INCIDENTES.md)
+
+## Outputs y bundle público
+
+### Outputs
+
+El sistema genera:
+
+- `predictions_latest.csv/json`;
+- `predictions_history.csv/json`;
+- `index.html`;
+- `today.html`;
+- reportes de calidad, performance y automatización;
+- bundles sanitizados.
+
+El default conserva aliases en `outputs/predictions/` y escribe también en
+`outputs/predictions/world-cup-2026/`. Otras competencias sólo usan su namespace.
+
+### Política de repositorio
+
+- `outputs/` completo es local y regenerable.
+- `data/db/` y model artifacts son locales.
+- `.env` y `.venv` nunca se versionan.
+- no uses `git add -f outputs/`;
+- demos y bundles se distribuyen por separado después de revisión humana.
+
+### Bundle público
+
+El export:
+
+- copia la base necesaria para uso offline;
+- elimina `api_cache`, `api_usage` y `notification_deliveries`;
+- no incluye `.env` ni secretos;
+- puede conservar partidos, jugadores, alineaciones y predicciones.
+
+Sanitizado no significa automáticamente redistribuible. Revisa licencias antes
+de compartirlo.
+
+## Testing y quality gates
+
+### Comandos oficiales
+
+```powershell
+pytest -q
+ruff check .
+mypy src\quiniela
+pre-commit run --all-files
+```
+
+### Estrategia
+
+- tests puros para dominio;
+- fakes para casos de uso;
+- SQLite temporal para adapters;
+- fixtures sanitizados para providers;
+- workflows offline para matchday, outputs y notificaciones;
+- guardrails AST para imports de capas;
+- coverage informativo sin `fail-under` global.
+
+La suite no hace llamadas API reales ni envía notificaciones.
+
+Consulta [Testing Strategy](docs/TESTING_STRATEGY.md).
+
+## Agentes de IA
+
+La V1 está preparada para trabajo agéntico verificable.
+
+### Fuente de verdad
+
+Orden de autoridad:
+
+1. instrucciones actuales del usuario;
+2. archivos y estado real del repositorio;
+3. tests y salida de comandos;
+4. handoffs y documentos;
+5. memoria externa como contexto advisory.
+
+### Flujo recomendado
+
+1. Leer backlog, dependencia y handoff anterior.
+2. Inspeccionar archivos y tests indicados.
+3. Ejecutar baseline enfocado.
+4. Hacer cambios acotados.
+5. Ejecutar tests enfocados y suite amplia.
+6. Registrar decisiones, errores, riesgos y rollback.
+7. Crear o actualizar el handoff.
+
+### Seguridad
+
+Un agente no debe:
+
+- leer o copiar `.env` sin necesidad y autorización;
+- imprimir API keys, topics o webhooks;
+- ejecutar backfills live o envíos reales sin aprobación;
+- borrar DB, outputs o artefactos;
+- asumir que memoria conversacional supera al repositorio.
+
+La metodología completa está en
+[Solidification and Harness Engineering Guide](docs/SOLIDIFICATION_AND_HARNESS_ENGINEERING_GUIDE.md).
+
+## Migración a otros torneos
+
+### Flujo resumido
+
+1. Crear YAML de competencia y temporada.
+2. Implementar o seleccionar parsers compatibles.
+3. Preparar datos locales.
+4. Inicializar scope en DB.
+5. Ejecutar backfill con aprobación de cuota.
+6. Generar predicciones y outputs namespaced.
+7. Entrenar/evaluar modelo por competencia.
+8. Probar notificaciones en dry-run.
+9. Revisar licencias del bundle.
+10. Cerrar cada etapa con handoff.
+
+### Ejemplo offline
+
+```powershell
+python -m quiniela.cli doctor `
+  --competition champions_league_2026_2027 `
+  --season champions_league_2026_2027
+```
+
+La config de Champions League tiene API deshabilitada y parsers no
+implementados. Es una plantilla de migración, no un entorno productivo.
+
+## Contribuciones
+
+### Antes de cambiar código
+
+- identifica el contrato y la capa responsable;
+- revisa tests de la superficie;
+- evita refactors no relacionados;
+- protege compatibilidad de CLI, scripts, DB y outputs;
+- define rollback si cambias persistencia, modelos u operación.
+
+### Durante el cambio
+
+- dominio nuevo debe ser puro;
+- aplicación depende de puertos;
+- adapters contienen SQLite, HTTP y filesystem;
+- usa migraciones aditivas;
+- filtra por competition/season;
+- no mezcles operaciones live con tests;
+- agrega abstracciones sólo cuando reducen complejidad real.
+
+### Antes de cerrar
+
+```powershell
+ruff check .
+mypy src\quiniela
+pytest -q
+git diff --check
+git status --short
+```
+
+Actualiza:
+
+- contratos o runbooks afectados;
+- tests;
+- decision log si la decisión es transversal;
+- handoff si el trabajo forma parte de una task agéntica.
+
+### Nuevas dependencias
+
+Una dependencia debe:
+
+- resolver una necesidad concreta;
+- ser compatible con Python 3.11;
+- tener licencia revisable;
+- poder instalarse de forma reproducible;
+- no sustituir una API estándar suficiente;
+- quedar documentada en requirements y setup.
+
+## Seguridad, datos y licencias
+
+- Nunca publiques `.env`, tokens, API keys, topics o webhooks.
+- No publiques DB operativa, caché, telemetría de cuota ni dumps.
+- Los outputs derivados pueden contener datos deportivos licenciados.
+- El proveedor no concede automáticamente derechos de redistribución.
+- Revisa términos del proveedor y de cualquier fuente adicional.
+- Usa el bundle sanitizado sólo después de una revisión humana.
+- Los ejemplos de configuración no contienen secretos.
+
+## Documentación técnica
+
+### Arquitectura y contratos
+
+- [Architecture Audit](docs/ARCHITECTURE_AUDIT.md)
+- [Architecture Target](docs/ARCHITECTURE_TARGET.md)
+- [Hexagonal Migration Plan](docs/HEXAGONAL_MIGRATION_PLAN.md)
+- [Data Contracts](docs/DATA_CONTRACTS.md)
+- [Decision Log](docs/DECISION_LOG.md)
+
+### Modelos, datos y operación
+
+- [API Policy](docs/API_POLICY.md)
+- [Odds-Aware Model Design](docs/ODDS_AWARE_MODEL_DESIGN.md)
+- [Multi-Tournament Design](docs/MULTI_TOURNAMENT_DESIGN.md)
+- [Model Card Template](docs/MODEL_CARD_TEMPLATE.md)
+- [Notification Contracts](docs/NOTIFICATION_CONTRACTS.md)
+- [Testing Strategy](docs/TESTING_STRATEGY.md)
+- [Coding Standards](docs/CODING_STANDARDS.md)
+
+### Runbooks y agentes
+
+- [Runbook de operación](docs/RUNBOOK_OPERACION.md)
+- [Runbook de incidentes](docs/RUNBOOK_INCIDENTES.md)
+- [Agent Tournament Migration](docs/AGENT_TOURNAMENT_MIGRATION.md)
+- [Solidification V1 Final Report](docs/SOLIDIFICATION_V1_FINAL_REPORT.md)
+- [Solidification and Harness Engineering Guide](docs/SOLIDIFICATION_AND_HARNESS_ENGINEERING_GUIDE.md)
+- [Handoff Template](docs/handoffs/HANDOFF_TEMPLATE.md)
+
+## Cierre V1
+
+La V1 no pretende ocultar el legacy: lo rodea con contratos, tests, adapters,
+operación segura y evidencia. El resultado es un sistema que puede seguir
+evolucionando sin perder la compatibilidad del MVP ni la capacidad de explicar
+qué ocurrió en cada predicción, cada release y cada task de ingeniería.

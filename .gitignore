@@ -2,6 +2,9 @@
 __pycache__/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.pre-commit-cache/
+.coverage
 *.pyc
 *.pyo
 *.pyd
@@ -10,12 +13,8 @@ __pycache__/
 .env
 data/processed/*.csv
 data/processed/model_artifacts/
-outputs/predictions/*.csv
-outputs/predictions/*.json
-outputs/predictions/*.html
-outputs/logs/*.csv
-outputs/logs/*.md
-outputs/bundles/
+data/backups/
+outputs/
 data/db/*.db
 data/db/*.db*
 data/db/*-journal
@@ -23,3 +22,7 @@ scripts/__pycache__/
 src/quiniela/__pycache__/
 tests/__pycache__/
 build/
+*.egg-info/
+CODEX_PLAN_HANDOFF_PRONOSTICADOR.md
+TASKS_CODEX_SOLIDIFICACION_HEXAGONAL_V1.md
+docs/handoffs/TASK-*.md

@@ -1,0 +1,43 @@
+# Documentation example only. It must not be wired into live ingestion until
+# TASK-031+ add DB namespacing and competition-specific data backfill.
+competition:
+  slug: uefa_champions_league
+  name: UEFA Champions League
+  sport: football
+  organizer: UEFA
+  competition_type: clubs
+  default_timezone: Europe/Zurich
+
+season:
+  slug: champions_league_2026_2027
+  name: UEFA Champions League 2026-2027
+  start_date: 2026-07-01
+  end_date: 2027-06-30
+  timezone: Europe/Zurich
+  status: example
+
+rules:
+  profile: uefa_champions_league_league_knockout
+  points_win: 3
+  points_draw: 1
+  points_loss: 0
+  neutral_venue_policy: final_only
+  extra_time_policy: knockout_only
+  penalties_policy: knockout_only
+
+data_sources:
+  calendar:
+    parser: api_football_fixtures
+    input: data/raw/examples/champions_league_2026_2027_fixtures.json
+  rosters:
+    parser: api_football_squads
+    input: data/raw/examples/champions_league_2026_2027_squads.json
+
+api_football:
+  enabled: false
+  league_id: 2
+  season: 2026
+
+outputs:
+  namespace: champions-league-2026-2027
+  stable_aliases: false
