@@ -211,8 +211,9 @@ def export_public_bundle(
     public_db_path = output_dir / PUBLIC_DB_NAME
     shutil.copy2(source_db_path, public_db_path)
 
-    connection = sqlite3.connect(public_db_path)
-    connection.row_factory = sqlite3.Row
+    # Open the copied database through the normal schema initializer so
+    # legacy exports receive scope columns before we trim to one competition.
+    connection = get_connection(public_db_path)
     _scope_public_database(connection, context)
     with connection:
         connection.execute("DELETE FROM api_cache")

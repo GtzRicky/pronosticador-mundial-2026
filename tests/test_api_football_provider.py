@@ -66,6 +66,13 @@ class FakeClient:
         return {"response": [{"season": 2026}], "results": 1}
 
 
+def test_api_football_provider_is_reexported_from_package() -> None:
+    from quiniela.adapters.outbound.api_football import APIFootballProvider as PackageProvider
+
+    assert PackageProvider is APIFootballProvider
+    assert PackageProvider(client=FakeClient()).requests_remaining() == 42
+
+
 def test_api_football_provider_wraps_fixtures_payload_without_raw_dict() -> None:
     client = FakeClient()
     provider = APIFootballProvider(client=client)
