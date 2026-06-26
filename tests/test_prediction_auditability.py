@@ -8,8 +8,9 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from quiniela.db import get_connection, insert_prediction_rows
+from quiniela.db import get_connection, insert_pre_match_snapshot, insert_prediction_rows
 import quiniela.output_manager as outputs
+import quiniela.predictor as predictor_module
 
 
 TZ = ZoneInfo("America/Mexico_City")
@@ -121,6 +122,70 @@ def test_post_kickoff_predictions_are_not_evaluable_with_valid_degradation_json(
     assert json.loads(row["audit_degradation_reasons_json"]) == [
         "post_kickoff_prediction"
     ]
+
+
+def test_audit_snapshot_lookup_uses_isoformat_and_returns_latest_snapshot_id(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    connection = get_connection(tmp_path / "audit-snapshot.sqlite")
+    _seed_match(connection)
+    snapshot_id, created = insert_pre_match_snapshot(
+        connection,
+        {
+            "competition_id": "fifa_world_cup",
+            "season_id": "world_cup_2026",
+            "match_id": "match-audit",
+            "fixture_id": "100",
+            "window_label": "t-1",
+            "source_kind": "live",
+            "kickoff_at": "2026-06-13T13:00:00-06:00",
+            "captured_at": "2026-06-13T12:59:00-06:00",
+            "features_json": "{}",
+            "prediction_json": "{}",
+            "home_lineup_source": "official",
+            "away_lineup_source": "official",
+            "model_version": "poisson-test",
+            "outcome_model_version": "logit-test",
+            "data_hash": "snapshot-audit",
+        },
+        [],
+    )
+
+    assert created is True
+    captured: dict[str, str | None] = {}
+    original = predictor_module.get_latest_pre_match_snapshot
+
+    def tracked_get_latest_pre_match_snapshot(connection, match_id, before_kickoff=None):
+        captured["before_kickoff"] = before_kickoff
+        return original(connection, match_id, before_kickoff=before_kickoff)
+
+    monkeypatch.setattr(
+        predictor_module,
+        "get_latest_pre_match_snapshot",
+        tracked_get_latest_pre_match_snapshot,
+    )
+    predictor = predictor_module.Predictor.__new__(predictor_module.Predictor)
+    predictor.connection = connection
+    kickoff = pd.Timestamp("2026-06-13T13:00:00-06:00")
+
+    audit_fields = predictor._audit_fields(
+        row={
+            "match_id": "match-audit",
+            "api_fixture_id": 100,
+            "home_lineup_source": "official",
+            "away_lineup_source": "official",
+        },
+        kickoff=kickoff,
+        generated_at="2026-06-13T18:00:00+00:00",
+        is_pre_kickoff=1,
+        odds_adjusted={"model_version": "odds-v1"},
+        odds_consensus={"consensus_available": True},
+        data_freshness_at="2026-06-13T17:55:00+00:00",
+    )
+
+    assert captured["before_kickoff"] == kickoff.isoformat()
+    assert audit_fields["audit_snapshot_id"] == snapshot_id
 
 
 def test_auditability_fields_are_preserved_in_stable_exports(

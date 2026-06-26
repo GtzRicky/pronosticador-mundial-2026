@@ -60,13 +60,16 @@ class SQLiteSnapshotRepository:
                 self.connection.executemany(
                     """
                     INSERT OR IGNORE INTO pre_match_player_snapshots (
+                        competition_id, season_id,
                         snapshot_id, team_norm, api_player_id, player_name, player_norm,
                         lineup_role, role_bucket, attack_impact, defense_impact,
                         discipline_impact, availability_impact, net_impact, features_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
+                            snapshot.get("competition_id", "fifa_world_cup"),
+                            snapshot.get("season_id", "world_cup_2026"),
                             snapshot_id,
                             player["team_norm"],
                             player.get("api_player_id"),

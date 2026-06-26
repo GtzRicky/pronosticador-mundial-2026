@@ -67,6 +67,7 @@ def test_operational_tables_receive_default_scope_columns(tmp_path: Path) -> Non
         "predictions",
         "notification_deliveries",
         "pre_match_snapshots",
+        "pre_match_player_snapshots",
         "model_training_runs",
         "model_releases",
     }

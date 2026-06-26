@@ -76,3 +76,31 @@ def test_snapshot_wrappers_delegate_to_repository(tmp_path: Path) -> None:
     latest = get_latest_pre_match_snapshot(connection, "match-1", "2026-06-13T13:00:00-06:00")
     assert latest["id"] == latest_id
     assert latest["id"] != first_id
+
+
+def test_snapshot_repository_scopes_player_rows_to_snapshot_competition(tmp_path: Path) -> None:
+    connection = get_connection(tmp_path / "snapshots-scoped.sqlite")
+    repository = SQLiteSnapshotRepository(connection)
+
+    snapshot_id, created = repository.insert_pre_match_snapshot(
+        {
+            **_snapshot("t-60", "2026-06-13T11:00:00-06:00", "scoped"),
+            "competition_id": "uefa_champions_league",
+            "season_id": "champions_league_2026_2027",
+        },
+        [_player()],
+    )
+
+    assert created is True
+    row = connection.execute(
+        """
+        SELECT competition_id, season_id
+        FROM pre_match_player_snapshots
+        WHERE snapshot_id = ?
+        """,
+        (snapshot_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "competition_id": "uefa_champions_league",
+        "season_id": "champions_league_2026_2027",
+    }

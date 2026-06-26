@@ -297,7 +297,7 @@ class Predictor:
         return {
             "audit_snapshot_id": self._latest_snapshot_id(
                 str(row["match_id"]),
-                str(kickoff),
+                kickoff.isoformat(),
             ),
             "audit_lineup_sources_json": json.dumps(
                 {
