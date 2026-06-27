@@ -68,6 +68,13 @@ def test_render_predictions_html_shows_predicted_and_pending_actual() -> None:
             "outcome_model_version": "logit_outcome_v1",
             "data_freshness_at": "2026-06-11T12:59:00-06:00",
             "generated_at": "2026-06-11T10:00:00",
+            "competition_id": "fifa_world_cup",
+            "season_id": "world_cup_2026",
+            "audit_snapshot_id": 42,
+            "audit_lineup_sources_json": '{"home":"official","away":"web_estimated"}',
+            "audit_odds_source_json": '{"consensus_available":true}',
+            "audit_degradation_reasons_json": '["lineup_source_missing"]',
+            "not_evaluable_reason": None,
             "actual_home_goals": None,
             "actual_away_goals": None,
         }
@@ -106,6 +113,10 @@ def test_render_predictions_html_shows_predicted_and_pending_actual() -> None:
     assert "Híbrido Logit + Poisson" in html
     assert "62.0%" in html
     assert "logit_outcome_v1" in html
+    assert "Auditoria del pronostico" in html
+    assert "world_cup_2026" in html
+    assert "lineup_source_missing" in html
+    assert "Snapshot: 42" in html
     assert "Pendiente" in html
     assert "Jugador 1" in html
     assert "Player 12" in html
@@ -148,6 +159,7 @@ def test_render_predictions_html_shows_market_dashboard() -> None:
             "draw_probability": 0.25,
             "away_win_probability": 0.19,
             "outcome_model_version": "logit_v1",
+            "odds_model_version": "odds_v1",
             "data_freshness_at": "2026-06-18T18:30:00-06:00",
             "generated_at": "2026-06-18T18:30:00-06:00",
             "actual_home_goals": None,
@@ -186,6 +198,7 @@ def test_render_predictions_html_shows_market_dashboard() -> None:
     assert "Mercados y apuestas" in html
     assert "Formula: Poisson + fortaleza del modelo" in html
     assert "Marcador odds-aware" in html
+    assert "Odds: odds_v1" in html
     assert "momio 2.05" in html
     assert "Ambos anotan: si" in html
     assert "Tarjetas 4.5 over" in html

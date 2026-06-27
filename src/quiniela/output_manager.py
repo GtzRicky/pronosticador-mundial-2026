@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import tempfile
 import time
 from typing import Any
 import uuid
@@ -17,10 +18,14 @@ from quiniela.config import get_settings
 from quiniela.db import fetch_dataframe, get_connection
 from quiniela.html_report import (
     _attach_odds_consensus,
+    _fill_snapshot_impacts,
     _load_lineups_by_fixture,
     _load_prediction_impacts,
-    _fill_snapshot_impacts,
     render_predictions_html,
+)
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
 )
 from quiniela.outcome_model import load_outcome_model_artifact
 
@@ -62,6 +67,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _atomic_write_dataframe(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     last_error: OSError | None = None
     for _ in range(3):
         temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
@@ -79,6 +85,70 @@ def _atomic_write_dataframe(frame: pd.DataFrame, path: Path) -> None:
             time.sleep(0.1)
     if last_error:
         raise last_error
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _prediction_output_paths(
+    filename: str,
+    competition_context: CompetitionContext,
+) -> list[Path]:
+    settings = get_settings()
+    paths = [settings.predictions_dir / competition_context.namespace / filename]
+    if competition_context.stable_aliases:
+        paths.insert(0, settings.predictions_dir / filename)
+    return paths
+
+
+def _write_prediction_dataframe(
+    frame: pd.DataFrame,
+    filename: str,
+    competition_context: CompetitionContext,
+) -> None:
+    for path in _prediction_output_paths(filename, competition_context):
+        _atomic_write_dataframe(frame, path)
+
+
+def _write_prediction_text(
+    filename: str,
+    content: str,
+    competition_context: CompetitionContext,
+) -> None:
+    for path in _prediction_output_paths(filename, competition_context):
+        _atomic_write_text(path, content)
+
+
+def _log_output_path(
+    settings: Any,
+    competition_context: CompetitionContext,
+    filename: str,
+) -> Path:
+    if competition_context.is_default:
+        return settings.logs_dir / filename
+    return settings.logs_dir / competition_context.namespace / filename
 
 
 def _score_parts(value: Any) -> tuple[int | None, int | None]:
@@ -167,9 +237,11 @@ def _evaluation_metrics(row: sqlite3.Row) -> dict[str, Any]:
 def _prediction_rows_for_evaluation(
     connection: sqlite3.Connection,
     match_ids: list[str] | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> list[sqlite3.Row]:
-    where = ""
-    params: list[Any] = []
+    context = competition_context or resolve_competition_context()
+    where = "AND p.competition_id = ? AND p.season_id = ?"
+    params: list[Any] = [context.competition_id, context.season_id]
     if match_ids:
         placeholders = ",".join("?" for _ in match_ids)
         where = f"AND p.match_id IN ({placeholders})"
@@ -202,10 +274,15 @@ def _prediction_rows_for_evaluation(
 def evaluate_predictions(
     connection: sqlite3.Connection | None = None,
     match_ids: list[str] | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
     connection = connection or get_connection(settings.db_path)
-    rows = _prediction_rows_for_evaluation(connection, match_ids)
+    rows = _prediction_rows_for_evaluation(
+        connection,
+        match_ids,
+        competition_context=competition_context,
+    )
     canonical_ids: dict[str, int] = {}
     for row in rows:
         canonical_ids[str(row["match_id"])] = int(row["id"])
@@ -264,7 +341,10 @@ def evaluate_predictions(
     }
 
 
-def _history_frame(connection: sqlite3.Connection) -> pd.DataFrame:
+def _history_frame(
+    connection: sqlite3.Connection,
+    competition_context: CompetitionContext,
+) -> pd.DataFrame:
     frame = fetch_dataframe(
         connection,
         """
@@ -275,6 +355,8 @@ def _history_frame(connection: sqlite3.Connection) -> pd.DataFrame:
         )
         SELECT
             p.id AS prediction_id,
+            p.competition_id,
+            p.season_id,
             p.match_id,
             m.date_cdmx,
             m.time_cdmx,
@@ -296,6 +378,23 @@ def _history_frame(connection: sqlite3.Connection) -> pd.DataFrame:
             p.generated_at_utc,
             p.data_freshness_at,
             p.is_pre_kickoff,
+            p.audit_snapshot_id,
+            p.audit_lineup_sources_json,
+            p.audit_odds_source_json,
+            p.audit_degradation_reasons_json,
+            p.not_evaluable_reason,
+            (
+                SELECT release_id FROM model_releases
+                WHERE status = 'active'
+                ORDER BY activated_at DESC, id DESC
+                LIMIT 1
+            ) AS evidence_release_id,
+            (
+                SELECT preliminary FROM model_releases
+                WHERE status = 'active'
+                ORDER BY activated_at DESC, id DESC
+                LIMIT 1
+            ) AS evidence_release_preliminary,
             CASE WHEN c.prediction_id = p.id THEN 1 ELSE 0 END AS is_canonical,
             CASE
                 WHEN json_valid(p.source_json)
@@ -334,8 +433,11 @@ def _history_frame(connection: sqlite3.Connection) -> pd.DataFrame:
         LEFT JOIN actual_results ar ON ar.match_id = p.match_id
         LEFT JOIN prediction_evaluations pe ON pe.prediction_id = p.id
         LEFT JOIN canonical c ON c.match_id = p.match_id
+        WHERE p.competition_id = ?
+          AND p.season_id = ?
         ORDER BY m.datetime_cdmx, julianday(p.generated_at_utc), p.id
         """,
+        (competition_context.competition_id, competition_context.season_id),
     )
     return frame
 
@@ -383,6 +485,7 @@ def _html_rows(
     connection: sqlite3.Connection,
     latest: pd.DataFrame,
     timelines: dict[str, list[dict[str, Any]]],
+    competition_context: CompetitionContext,
 ) -> list[dict[str, Any]]:
     if latest.empty:
         return []
@@ -396,8 +499,14 @@ def _html_rows(
                group_name, stadium, stage, status, api_fixture_id
         FROM matches
         WHERE match_id IN ({placeholders})
+          AND competition_id = ?
+          AND season_id = ?
         """,
-        match_ids,
+        [
+            *match_ids,
+            competition_context.competition_id,
+            competition_context.season_id,
+        ],
     ).set_index("match_id")
     rows: list[dict[str, Any]] = []
     for prediction in latest.to_dict(orient="records"):
@@ -408,7 +517,11 @@ def _html_rows(
     return sorted(rows, key=lambda row: (row["datetime_cdmx"], row["home_team"]))
 
 
-def _write_data_quality(connection: sqlite3.Connection, path: Path) -> None:
+def _write_data_quality(
+    connection: sqlite3.Connection,
+    path: Path,
+    competition_context: CompetitionContext,
+) -> None:
     row = connection.execute(
         """
         SELECT
@@ -417,16 +530,31 @@ def _write_data_quality(connection: sqlite3.Connection, path: Path) -> None:
             SUM(CASE WHEN ar.match_id IS NOT NULL THEN 1 ELSE 0 END) AS results
         FROM matches m
         LEFT JOIN actual_results ar ON ar.match_id = m.match_id
-        """
+        WHERE m.competition_id = ?
+          AND m.season_id = ?
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()
     unresolved = connection.execute(
-        "SELECT COUNT(*) FROM players WHERE api_player_id IS NULL"
+        """
+        SELECT COUNT(*) FROM players
+        WHERE api_player_id IS NULL
+          AND competition_id = ?
+          AND season_id = ?
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()[0]
     complete_lineups = connection.execute(
         """
-        SELECT COUNT(*) FROM historical_lineups
-        WHERE json_array_length(json_extract(source_json, '$.startXI')) >= 11
-        """
+        SELECT COUNT(*)
+        FROM historical_lineups hl
+        INNER JOIN matches m
+            ON CAST(m.api_fixture_id AS TEXT) = hl.fixture_id
+        WHERE json_array_length(json_extract(hl.source_json, '$.startXI')) >= 11
+          AND m.competition_id = ?
+          AND m.season_id = ?
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()[0]
     text = "\n".join(
         [
@@ -442,7 +570,11 @@ def _write_data_quality(connection: sqlite3.Connection, path: Path) -> None:
     _atomic_write_text(path, text)
 
 
-def _write_model_performance(connection: sqlite3.Connection, path: Path) -> None:
+def _write_model_performance(
+    connection: sqlite3.Connection,
+    path: Path,
+    competition_context: CompetitionContext,
+) -> None:
     aggregate = connection.execute(
         """
         SELECT COUNT(*) AS matches,
@@ -452,17 +584,24 @@ def _write_model_performance(connection: sqlite3.Connection, path: Path) -> None
                AVG(brier_score) AS brier_score,
                AVG(calibration_error) AS calibration_error,
                AVG(outcome_correct) AS accuracy
-        FROM prediction_evaluations
-        WHERE is_canonical = 1
-        """
+        FROM prediction_evaluations pe
+        INNER JOIN predictions p ON p.id = pe.prediction_id
+        WHERE pe.is_canonical = 1
+          AND p.competition_id = ?
+          AND p.season_id = ?
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()
     release = connection.execute(
         """
         SELECT release_id, preliminary, activated_at
         FROM model_releases
         WHERE status = 'active'
+          AND competition_id = ?
+          AND season_id = ?
         ORDER BY activated_at DESC, id DESC LIMIT 1
-        """
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()
     player_evaluations = connection.execute(
         """
@@ -516,7 +655,25 @@ def _write_model_performance(connection: sqlite3.Connection, path: Path) -> None
     _atomic_write_text(path, "\n".join(lines))
 
 
-def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None:
+def _write_automation_status(
+    connection: sqlite3.Connection,
+    path: Path,
+    competition_context: CompetitionContext,
+) -> None:
+    settings = get_settings()
+    logs_dir = (
+        settings.logs_dir
+        if competition_context.is_default
+        else settings.logs_dir / competition_context.namespace
+    )
+    watchdog_health = _read_json_file(logs_dir / "notification_health.json")
+    if not watchdog_health:
+        watchdog_health = _read_json_file(
+            Path(tempfile.gettempdir())
+            / "quiniela_notification_watchdog"
+            / "notification_health.json"
+        )
+    scheduler_skips = _tail_jsonl(settings.logs_dir / "scheduler_skips.jsonl", 5)
     runs = connection.execute(
         """
         SELECT run_key, action, status, scheduled_for, finished_at, details_json
@@ -539,19 +696,25 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
         LEFT JOIN actual_results ar ON ar.match_id = m.match_id
         WHERE ar.match_id IS NULL
           AND m.status NOT IN ('PST', 'CANC', 'ABD', 'AWD', 'WO')
-        """
+          AND m.competition_id = ?
+          AND m.season_id = ?
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()
     freshness = connection.execute(
         """
         SELECT MAX(value) AS freshness
         FROM (
-            SELECT MAX(generated_at_utc) AS value FROM predictions
+            SELECT MAX(generated_at_utc) AS value
+            FROM predictions
+            WHERE competition_id = ? AND season_id = ?
             UNION ALL
             SELECT MAX(updated_at) AS value FROM actual_results
             UNION ALL
             SELECT MAX(fetched_at) AS value FROM historical_lineups
         )
-        """
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()
     notification_counts = connection.execute(
         """
@@ -561,15 +724,21 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
             SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
         FROM notification_deliveries
-        """
+        WHERE competition_id = ?
+          AND season_id = ?
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchone()
     recent_notifications = connection.execute(
         """
         SELECT match_id, window_label, channel, status, error_code, notification_type, team_norm
         FROM notification_deliveries
+        WHERE competition_id = ?
+          AND season_id = ?
         ORDER BY id DESC
         LIMIT 12
-        """
+        """,
+        (competition_context.competition_id, competition_context.season_id),
     ).fetchall()
     lines = [
         "# Automation Status",
@@ -580,6 +749,10 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
         f"- Notifications pending: {int(notification_counts['pending'] or 0)}",
         f"- Notifications sent: {int(notification_counts['sent'] or 0)}",
         f"- Notifications failed: {int(notification_counts['failed'] or 0)}",
+        f"- Notification watchdog last OK: {watchdog_health.get('last_success_at') or 'n/a'}",
+        f"- Notification dispatch last OK: {watchdog_health.get('last_dispatch_ok_at') or 'n/a'}",
+        f"- Notification watchdog open due: {watchdog_health.get('open_due', 'n/a')}",
+        f"- Notification watchdog expired open: {watchdog_health.get('expired_open', 'n/a')}",
         "",
         "## Recent runs",
     ]
@@ -628,6 +801,15 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
             failed_issues.append("- " + " | ".join(parts))
     lines.extend(["", "## Recent retrieval failures"])
     lines.extend(failed_issues or ["- No retrieval failures recorded."])
+    lines.extend(["", "## Recent scheduler skips"])
+    if scheduler_skips:
+        for row in scheduler_skips:
+            lines.append(
+                f"- `{row.get('script', 'unknown')}`: {row.get('reason', 'unknown')} "
+                f"at {row.get('at', 'n/a')}"
+            )
+    else:
+        lines.append("- No scheduler skips recorded.")
     lines.extend(["", "## Recent notifications"])
     lines.extend(
         (
@@ -650,47 +832,62 @@ def _write_automation_status(connection: sqlite3.Connection, path: Path) -> None
 def write_automation_status(
     connection: sqlite3.Connection,
     path: Path | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> Path:
-    output_path = path or (get_settings().logs_dir / "automation_status.md")
-    _write_automation_status(connection, output_path)
+    context = competition_context or resolve_competition_context()
+    output_path = path or _log_output_path(
+        get_settings(),
+        context,
+        "automation_status.md",
+    )
+    _write_automation_status(connection, output_path, context)
     return output_path
 
 
 def rebuild_outputs(
     connection: sqlite3.Connection | None = None,
     now: datetime | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
     connection = connection or get_connection(settings.db_path)
     local_tz = ZoneInfo(settings.local_timezone)
     local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
     generated_at_cdmx = f"{local_now.strftime('%Y-%m-%d %H:%M:%S')} CDMX"
-    evaluation = evaluate_predictions(connection)
+    evaluation = evaluate_predictions(
+        connection,
+        competition_context=context,
+    )
     from quiniela.player_evidence import evaluate_player_predictions
 
     player_evaluation = evaluate_player_predictions(connection)
-    history = _history_frame(connection)
+    history = _history_frame(connection, context)
     latest = _latest_frame(history, local_now)
     timelines = _timeline_by_match(history)
 
-    _atomic_write_dataframe(
+    _write_prediction_dataframe(
         latest,
-        settings.predictions_dir / "predictions_latest.csv",
+        "predictions_latest.csv",
+        context,
     )
-    _atomic_write_text(
-        settings.predictions_dir / "predictions_latest.json",
+    _write_prediction_text(
+        "predictions_latest.json",
         _json_records(latest),
+        context,
     )
-    _atomic_write_dataframe(
+    _write_prediction_dataframe(
         history,
-        settings.predictions_dir / "predictions_history.csv",
+        "predictions_history.csv",
+        context,
     )
-    _atomic_write_text(
-        settings.predictions_dir / "predictions_history.json",
+    _write_prediction_text(
+        "predictions_history.json",
         _json_records(history),
+        context,
     )
 
-    all_rows = _html_rows(connection, latest, timelines)
+    all_rows = _html_rows(connection, latest, timelines, context)
     _attach_odds_consensus(connection, all_rows)
     today_rows = [
         row for row in all_rows if str(row["date_cdmx"]) == local_now.date().isoformat()
@@ -715,50 +912,74 @@ def rebuild_outputs(
         prediction_ids=prediction_ids,
     )
     _fill_snapshot_impacts(connection, all_rows, impacts)
-    _atomic_write_text(
-        settings.predictions_dir / "index.html",
+    _write_prediction_text(
+        "index.html",
         render_predictions_html(
             all_rows,
             lineups,
             impacts,
             generated_at=local_now,
         ),
+        context,
     )
-    _atomic_write_text(
-        settings.predictions_dir / "today.html",
+    _write_prediction_text(
+        "today.html",
         render_predictions_html(
             today_rows,
             lineups,
             impacts,
             generated_at=local_now,
         ),
+        context,
     )
-    _write_data_quality(connection, settings.logs_dir / "data_quality.md")
-    _write_model_performance(connection, settings.logs_dir / "model_performance.md")
+    _write_data_quality(
+        connection,
+        _log_output_path(settings, context, "data_quality.md"),
+        context,
+    )
+    _write_model_performance(
+        connection,
+        _log_output_path(settings, context, "model_performance.md"),
+        context,
+    )
     write_automation_status(
         connection,
-        settings.logs_dir / "automation_status.md",
+        _log_output_path(settings, context, "automation_status.md"),
+        competition_context=context,
     )
     return {
         "history_rows": len(history),
         "latest_rows": len(latest),
         "today_rows": len(today_rows),
         "generated_at_cdmx": generated_at_cdmx,
+        "competition_id": context.competition_id,
+        "season_id": context.season_id,
+        "namespace": context.namespace,
+        "stable_aliases": context.stable_aliases,
         "evaluation": evaluation,
         "player_evaluation": player_evaluation,
         "files": sorted(STABLE_PREDICTION_FILES | STABLE_LOG_FILES),
     }
 
 
-def obsolete_output_files() -> list[Path]:
+def obsolete_output_files(
+    competition_context: CompetitionContext | None = None,
+) -> list[Path]:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
     files = []
-    for path in settings.predictions_dir.iterdir():
+    predictions_dir = (
+        settings.predictions_dir
+        if context.is_default
+        else settings.predictions_dir / context.namespace
+    )
+    logs_dir = settings.logs_dir if context.is_default else settings.logs_dir / context.namespace
+    for path in predictions_dir.iterdir() if predictions_dir.exists() else []:
         if not path.is_file() or path.name in STABLE_PREDICTION_FILES:
             continue
         if path.suffix.lower() in {".html", ".csv", ".json"}:
             files.append(path)
-    for path in settings.logs_dir.iterdir():
+    for path in logs_dir.iterdir() if logs_dir.exists() else []:
         if not path.is_file() or path.name in STABLE_LOG_FILES:
             continue
         if path.suffix.lower() in {".md", ".csv", ".json"}:
@@ -766,8 +987,12 @@ def obsolete_output_files() -> list[Path]:
     return sorted(files)
 
 
-def cleanup_obsolete_outputs(apply: bool = False) -> dict[str, Any]:
-    files = obsolete_output_files()
+def cleanup_obsolete_outputs(
+    apply: bool = False,
+    competition_context: CompetitionContext | None = None,
+) -> dict[str, Any]:
+    context = competition_context or resolve_competition_context()
+    files = obsolete_output_files(context)
     if apply:
         for path in files:
             path.unlink()
@@ -775,4 +1000,6 @@ def cleanup_obsolete_outputs(apply: bool = False) -> dict[str, Any]:
         "apply": apply,
         "count": len(files),
         "files": [str(path) for path in files],
+        "competition_id": context.competition_id,
+        "season_id": context.season_id,
     }

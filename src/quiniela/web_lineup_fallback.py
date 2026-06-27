@@ -16,6 +16,10 @@ from zoneinfo import ZoneInfo
 import requests
 
 from quiniela.config import get_settings
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.db import fetch_dataframe, get_connection, insert_lineup_estimate
 from quiniela.name_maps import (
     normalize_team_name,
@@ -423,8 +427,10 @@ def refresh_web_lineup_fallback(
     now: datetime | None = None,
     force: bool = False,
     client: NewsSearchClient | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
     connection = connection or get_connection(settings.db_path)
     if not settings.web_lineup_fallback_enabled and not force:
         return {"status": "disabled", "match_id": match_id}
@@ -433,9 +439,12 @@ def refresh_web_lineup_fallback(
         """
         SELECT match_id, datetime_cdmx, home_team, away_team,
                home_team_norm, away_team_norm, api_fixture_id
-        FROM matches WHERE match_id = ?
+        FROM matches
+        WHERE match_id = ?
+          AND competition_id = ?
+          AND season_id = ?
         """,
-        (match_id,),
+        (match_id, context.competition_id, context.season_id),
     ).fetchone()
     if match is None or match["api_fixture_id"] is None:
         return {"status": "match_or_fixture_missing", "match_id": match_id}

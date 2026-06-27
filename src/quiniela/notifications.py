@@ -5,15 +5,24 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
+import os
+from pathlib import Path
 import sqlite3
+import tempfile
+import time
 from typing import Any
 from urllib.parse import quote
+import uuid
 from zoneinfo import ZoneInfo
 
 import requests
 
 from quiniela.config import Settings, get_settings
 from quiniela.db import get_connection
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.name_maps import normalize_team_name, normalize_text
 
 
@@ -24,6 +33,10 @@ TERMINAL_MATCH_STATUSES = {"FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"
 PREDICTION_WINDOW_NOTIFICATION = "prediction_window"
 OFFICIAL_LINEUP_NOTIFICATION = "official_lineup"
 OFFICIAL_LINEUP_EXPIRATION_GRACE_MINUTES = 120
+NOTIFICATION_TEMPLATE_VERSION = "notification_v1"
+DEFAULT_MAX_ATTEMPTS = len(RETRY_DELAYS_MINUTES) + 1
+WATCHDOG_ALERT_DEDUPE_MINUTES = 15
+WATCHDOG_STALE_AFTER_MINUTES = 6
 
 
 @dataclass(frozen=True)
@@ -44,6 +57,115 @@ def _as_datetime(value: str, timezone_name: str) -> datetime:
 
 def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _payload_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _append_jsonl(path: Any, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+
+def _read_json_file(path: Any) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_json_file(path: Any, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    last_error: OSError | None = None
+    for _ in range(3):
+        temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
+            time.sleep(0.1)
+    if last_error:
+        raise last_error
+
+
+def _write_watchdog_observability(
+    *,
+    health_path: Path,
+    runs_path: Path,
+    health: dict[str, Any],
+    run_row: dict[str, Any],
+) -> dict[str, str]:
+    try:
+        _write_json_file(health_path, health)
+        _append_jsonl(runs_path, run_row)
+        return {}
+    except OSError as exc:
+        fallback_dir = Path(tempfile.gettempdir()) / "quiniela_notification_watchdog"
+        fallback_health = fallback_dir / health_path.name
+        fallback_runs = fallback_dir / runs_path.name
+        try:
+            _write_json_file(fallback_health, health)
+            _append_jsonl(fallback_runs, run_row)
+            return {
+                "log_error": str(exc),
+                "log_fallback": str(fallback_dir),
+            }
+        except OSError as fallback_exc:
+            return {
+                "log_error": str(exc),
+                "log_fallback_error": str(fallback_exc),
+            }
+
+
+def _notification_dedupe_key(
+    *,
+    notification_type: str,
+    match_id: str,
+    kickoff_at: str,
+    window_label: str,
+    channel: str,
+    team_norm: str | None = None,
+) -> str:
+    parts = [notification_type, match_id, kickoff_at, window_label, channel]
+    if team_norm:
+        parts.append(team_norm)
+    return ":".join(parts)
+
+
+def _channel_priority(notification_type: str, window_label: str) -> str:
+    if notification_type == OFFICIAL_LINEUP_NOTIFICATION:
+        return "4"
+    return "5" if window_label == "t-5" else "4"
+
+
+def _expires_at(notification_type: str, kickoff: datetime) -> str:
+    if notification_type == OFFICIAL_LINEUP_NOTIFICATION:
+        return _utc_iso(kickoff + timedelta(minutes=OFFICIAL_LINEUP_EXPIRATION_GRACE_MINUTES))
+    return _utc_iso(kickoff)
+
+
+def _delivery_deadline(row: sqlite3.Row, settings: Settings) -> datetime:
+    notification_type = str(
+        row["notification_type"] or PREDICTION_WINDOW_NOTIFICATION
+    )
+    if notification_type == OFFICIAL_LINEUP_NOTIFICATION and row["expires_at"]:
+        return _as_datetime(str(row["expires_at"]), settings.local_timezone)
+    return _as_datetime(str(row["kickoff_at"]), settings.local_timezone)
 
 
 def _retry_after_seconds(value: str | None, now: datetime) -> int | None:
@@ -211,8 +333,10 @@ def queue_official_lineup_notifications(
     lineups_payload: dict[str, Any],
     now: datetime | None = None,
     settings: Settings | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
     if not settings.notifications_enabled:
         return {"enabled": False, "scheduled": 0, "superseded": 0, "errors": []}
 
@@ -234,6 +358,15 @@ def queue_official_lineup_notifications(
             continue
         window_label = f"official:{team_norm}:{lineup_hash[:12]}"
         for channel in channels:
+            dedupe_key = _notification_dedupe_key(
+                notification_type=OFFICIAL_LINEUP_NOTIFICATION,
+                match_id=match_id,
+                kickoff_at=kickoff_at,
+                window_label=window_label,
+                channel=channel,
+                team_norm=team_norm,
+            )
+            kickoff = _as_datetime(kickoff_at, settings.local_timezone)
             with connection:
                 superseded += connection.execute(
                     """
@@ -245,6 +378,8 @@ def queue_official_lineup_notifications(
                       AND match_id = ?
                       AND channel = ?
                       AND team_norm = ?
+                      AND competition_id = ?
+                      AND season_id = ?
                       AND status IN ('pending', 'waiting_prediction', 'retry', 'sending')
                       AND lineup_hash <> ?
                     """,
@@ -254,18 +389,24 @@ def queue_official_lineup_notifications(
                         match_id,
                         channel,
                         team_norm,
+                        context.competition_id,
+                        context.season_id,
                         lineup_hash,
                     ),
                 ).rowcount
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO notification_deliveries (
+                        competition_id, season_id,
                         match_id, kickoff_at, window_label, channel,
-                        notification_type, team_norm, lineup_hash, scheduled_for,
-                        status, next_attempt_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                        notification_type, team_norm, lineup_hash, dedupe_key,
+                        max_attempts, template_version, expires_at, channel_priority,
+                        scheduled_for, status, next_attempt_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """,
                     (
+                        context.competition_id,
+                        context.season_id,
                         match_id,
                         kickoff_at,
                         window_label,
@@ -273,6 +414,11 @@ def queue_official_lineup_notifications(
                         OFFICIAL_LINEUP_NOTIFICATION,
                         team_norm,
                         lineup_hash,
+                        dedupe_key,
+                        DEFAULT_MAX_ATTEMPTS,
+                        NOTIFICATION_TEMPLATE_VERSION,
+                        _expires_at(OFFICIAL_LINEUP_NOTIFICATION, kickoff),
+                        _channel_priority(OFFICIAL_LINEUP_NOTIFICATION, window_label),
                         now_iso,
                         now_iso,
                     ),
@@ -291,8 +437,10 @@ def schedule_due_notifications(
     connection: sqlite3.Connection,
     now: datetime | None = None,
     settings: Settings | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
     if not settings.notifications_enabled:
         return {"enabled": False, "scheduled": 0, "superseded": 0, "errors": []}
 
@@ -308,9 +456,11 @@ def schedule_due_notifications(
         SELECT match_id, datetime_cdmx, status
         FROM matches
         WHERE julianday(datetime_cdmx) > julianday(?)
+          AND competition_id = ?
+          AND season_id = ?
         ORDER BY julianday(datetime_cdmx)
         """,
-        (now_iso,),
+        (now_iso, context.competition_id, context.season_id),
     ).fetchall()
     scheduled = 0
     superseded = 0
@@ -340,9 +490,17 @@ def schedule_due_notifications(
                     updated_at = ?
                 WHERE match_id = ?
                   AND kickoff_at <> ?
+                  AND competition_id = ?
+                  AND season_id = ?
                   AND status IN ('pending', 'waiting_prediction', 'retry', 'sending')
                 """,
-                (now_iso, str(match["match_id"]), kickoff_at),
+                (
+                    now_iso,
+                    str(match["match_id"]),
+                    kickoff_at,
+                    context.competition_id,
+                    context.season_id,
+                ),
             )
 
         open_rows = connection.execute(
@@ -352,9 +510,17 @@ def schedule_due_notifications(
             WHERE match_id = ?
               AND kickoff_at = ?
               AND notification_type = ?
+              AND competition_id = ?
+              AND season_id = ?
               AND status IN ('pending', 'waiting_prediction', 'retry', 'sending')
             """,
-            (str(match["match_id"]), kickoff_at, PREDICTION_WINDOW_NOTIFICATION),
+            (
+                str(match["match_id"]),
+                kickoff_at,
+                PREDICTION_WINDOW_NOTIFICATION,
+                context.competition_id,
+                context.season_id,
+            ),
         ).fetchall()
         older_ids = [
             int(row["id"])
@@ -377,20 +543,37 @@ def schedule_due_notifications(
             superseded += len(older_ids)
 
         for channel in channels:
+            dedupe_key = _notification_dedupe_key(
+                notification_type=PREDICTION_WINDOW_NOTIFICATION,
+                match_id=str(match["match_id"]),
+                kickoff_at=kickoff_at,
+                window_label=window_label,
+                channel=channel,
+            )
             with connection:
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO notification_deliveries (
+                        competition_id, season_id,
                         match_id, kickoff_at, window_label, channel,
-                        notification_type, scheduled_for, status, next_attempt_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                        notification_type, dedupe_key, max_attempts,
+                        template_version, expires_at, channel_priority,
+                        scheduled_for, status, next_attempt_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """,
                     (
+                        context.competition_id,
+                        context.season_id,
                         str(match["match_id"]),
                         kickoff_at,
                         window_label,
                         channel,
                         PREDICTION_WINDOW_NOTIFICATION,
+                        dedupe_key,
+                        DEFAULT_MAX_ATTEMPTS,
+                        NOTIFICATION_TEMPLATE_VERSION,
+                        _expires_at(PREDICTION_WINDOW_NOTIFICATION, kickoff),
+                        _channel_priority(PREDICTION_WINDOW_NOTIFICATION, window_label),
                         scheduled_for,
                         now_iso,
                     ),
@@ -655,12 +838,15 @@ def _synthetic_starters(
     connection: sqlite3.Connection,
     team_norm: str,
     team_name: str,
+    competition_context: CompetitionContext,
 ) -> list[str]:
     rows = connection.execute(
         """
         SELECT player, position_group
         FROM players
         WHERE team_norm = ?
+          AND competition_id = ?
+          AND season_id = ?
           AND COALESCE(is_active, 1) = 1
         ORDER BY
           CASE position_group
@@ -673,7 +859,11 @@ def _synthetic_starters(
           player
         LIMIT 11
         """,
-        (team_norm,),
+        (
+            team_norm,
+            competition_context.competition_id,
+            competition_context.season_id,
+        ),
     ).fetchall()
     starters = [str(row["player"]) for row in rows if row["player"]]
     while len(starters) < 11:
@@ -688,8 +878,10 @@ def send_isolated_lineup_test_notifications(
     settings: Settings | None = None,
     session: requests.Session | None = None,
     send: bool = False,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
     connection = connection or get_connection(settings.db_path)
     now = datetime.now(ZoneInfo(settings.local_timezone))
     if not settings.ntfy_enabled or not settings.ntfy_topic:
@@ -706,9 +898,11 @@ def send_isolated_lineup_test_notifications(
                time_cdmx, api_fixture_id
         FROM matches
         WHERE date_cdmx = ?
+          AND competition_id = ?
+          AND season_id = ?
         ORDER BY datetime_cdmx, home_team
         """,
-        (date_str,),
+        (date_str, context.competition_id, context.season_id),
     ).fetchall()
     adapter = NtfyAdapter(settings, session=session)
     sent = 0
@@ -753,7 +947,12 @@ def send_isolated_lineup_test_notifications(
             else "Fixture API pendiente"
         )
         for team_name, team_norm, opponent in teams:
-            starters = _synthetic_starters(connection, team_norm, team_name)
+            starters = _synthetic_starters(
+                connection,
+                team_norm,
+                team_name,
+                context,
+            )
             payload = {
                 "title": f"[PRUEBA AISLADA] Alineacion oficial: {team_name}",
                 "message": "\n".join(
@@ -975,8 +1174,10 @@ def dispatch_notifications(
     now: datetime | None = None,
     settings: Settings | None = None,
     sessions: dict[str, requests.Session] | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
     connection = connection or get_connection(settings.db_path)
     if not settings.notifications_enabled:
         return {"enabled": False, "sent": 0, "retry": 0, "failed": 0, "expired": 0}
@@ -991,7 +1192,7 @@ def dispatch_notifications(
         local_now - timedelta(minutes=OFFICIAL_LINEUP_EXPIRATION_GRACE_MINUTES)
     )
     with connection:
-        connection.execute(
+        stale_recovered_cursor = connection.execute(
             """
             UPDATE notification_deliveries
             SET status = 'retry',
@@ -1000,8 +1201,16 @@ def dispatch_notifications(
                 updated_at = ?
             WHERE status = 'sending'
               AND julianday(updated_at) <= julianday(?)
+              AND competition_id = ?
+              AND season_id = ?
             """,
-            (now_iso, now_iso, stale_sending),
+            (
+                now_iso,
+                now_iso,
+                stale_sending,
+                context.competition_id,
+                context.season_id,
+            ),
         )
         expired_cursor = connection.execute(
             """
@@ -1010,6 +1219,8 @@ def dispatch_notifications(
                 error_code = 'kickoff_reached',
                 updated_at = ?
             WHERE status IN ('pending', 'waiting_prediction', 'retry', 'sending')
+              AND competition_id = ?
+              AND season_id = ?
               AND (
                   (
                       COALESCE(notification_type, ?) = ?
@@ -1023,6 +1234,8 @@ def dispatch_notifications(
             """,
             (
                 now_iso,
+                context.competition_id,
+                context.season_id,
                 PREDICTION_WINDOW_NOTIFICATION,
                 OFFICIAL_LINEUP_NOTIFICATION,
                 official_expiry_before,
@@ -1031,12 +1244,15 @@ def dispatch_notifications(
                 now_iso,
             ),
         )
+    stale_sending_recovered = int(stale_recovered_cursor.rowcount)
     expired = int(expired_cursor.rowcount)
     rows = connection.execute(
         """
         SELECT *
         FROM notification_deliveries
         WHERE status IN ('pending', 'waiting_prediction', 'retry')
+          AND competition_id = ?
+          AND season_id = ?
           AND julianday(next_attempt_at) <= julianday(?)
           AND (
               (
@@ -1051,6 +1267,8 @@ def dispatch_notifications(
         ORDER BY julianday(scheduled_for), id
         """,
         (
+            context.competition_id,
+            context.season_id,
             now_iso,
             PREDICTION_WINDOW_NOTIFICATION,
             OFFICIAL_LINEUP_NOTIFICATION,
@@ -1123,7 +1341,7 @@ def dispatch_notifications(
         if prediction is None:
             next_attempt = min(
                 local_now + timedelta(minutes=1),
-                _as_datetime(str(row["kickoff_at"]), settings.local_timezone),
+                _delivery_deadline(row, settings),
             )
             with connection:
                 connection.execute(
@@ -1153,6 +1371,7 @@ def dispatch_notifications(
                     UPDATE notification_deliveries
                     SET prediction_id = ?,
                         payload_json = ?,
+                        payload_hash = ?,
                         status = 'sent',
                         attempt_count = ?,
                         last_attempt_at = ?,
@@ -1165,6 +1384,7 @@ def dispatch_notifications(
                     (
                         prediction_id,
                         json.dumps(payload, ensure_ascii=False),
+                        _payload_hash(payload),
                         attempt_count,
                         now_iso,
                         now_iso,
@@ -1182,10 +1402,14 @@ def dispatch_notifications(
             if result.retry_after_seconds is not None:
                 delay_seconds = max(delay_seconds, result.retry_after_seconds)
             next_attempt = local_now + timedelta(seconds=delay_seconds)
-            kickoff = _as_datetime(str(row["kickoff_at"]), settings.local_timezone)
-            if next_attempt >= kickoff:
+            deadline = _delivery_deadline(row, settings)
+            if next_attempt >= deadline:
                 status = "expired"
-                error_code = "retry_after_kickoff"
+                error_code = (
+                    "retry_after_expiration"
+                    if notification_type == OFFICIAL_LINEUP_NOTIFICATION
+                    else "retry_after_kickoff"
+                )
                 expired += 1
             else:
                 status = "retry"
@@ -1202,23 +1426,27 @@ def dispatch_notifications(
                 UPDATE notification_deliveries
                 SET prediction_id = ?,
                     payload_json = ?,
+                    payload_hash = ?,
                     status = ?,
                     attempt_count = ?,
                     next_attempt_at = ?,
                     last_attempt_at = ?,
                     last_http_status = ?,
                     error_code = ?,
+                    last_error_message = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     prediction_id,
                     json.dumps(payload, ensure_ascii=False),
+                    _payload_hash(payload),
                     status,
                     attempt_count,
                     _utc_iso(next_attempt),
                     now_iso,
                     result.status_code,
+                    error_code,
                     error_code,
                     now_iso,
                     int(row["id"]),
@@ -1231,7 +1459,216 @@ def dispatch_notifications(
         "retry": retried,
         "failed": failed,
         "expired": expired,
+        "stale_sending_recovered": stale_sending_recovered,
         "configuration_errors": configuration_errors,
+    }
+
+
+def notification_status(
+    connection: sqlite3.Connection | None = None,
+    *,
+    settings: Settings | None = None,
+    include_recent: int = 10,
+    competition_context: CompetitionContext | None = None,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
+    connection = connection or get_connection(settings.db_path)
+    rows = connection.execute(
+        """
+        SELECT status, channel, COALESCE(notification_type, ?) AS notification_type, COUNT(*) AS total
+        FROM notification_deliveries
+        WHERE competition_id = ?
+          AND season_id = ?
+        GROUP BY status, channel, COALESCE(notification_type, ?)
+        ORDER BY status, channel, notification_type
+        """,
+        (
+            PREDICTION_WINDOW_NOTIFICATION,
+            context.competition_id,
+            context.season_id,
+            PREDICTION_WINDOW_NOTIFICATION,
+        ),
+    ).fetchall()
+    recent = connection.execute(
+        """
+        SELECT id, match_id, kickoff_at, window_label, channel,
+               COALESCE(notification_type, ?) AS notification_type,
+               status, attempt_count, next_attempt_at, error_code,
+               dedupe_key, payload_hash, expires_at
+        FROM notification_deliveries
+        WHERE competition_id = ?
+          AND season_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (
+            PREDICTION_WINDOW_NOTIFICATION,
+            context.competition_id,
+            context.season_id,
+            include_recent,
+        ),
+    ).fetchall()
+    configured_channels, configuration_errors = _configured_channels(settings)
+    return {
+        "enabled": settings.notifications_enabled,
+        "configured_channels": configured_channels,
+        "configuration_errors": configuration_errors,
+        "competition_id": context.competition_id,
+        "season_id": context.season_id,
+        "counts": [dict(row) for row in rows],
+        "recent": [dict(row) for row in recent],
+    }
+
+
+def retry_failed_notifications(
+    connection: sqlite3.Connection | None = None,
+    *,
+    now: datetime | None = None,
+    settings: Settings | None = None,
+    apply: bool = False,
+    competition_context: CompetitionContext | None = None,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
+    connection = connection or get_connection(settings.db_path)
+    local_tz = ZoneInfo(settings.local_timezone)
+    local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
+    now_iso = _utc_iso(local_now)
+    candidates = connection.execute(
+        """
+        SELECT id, match_id, channel, notification_type, kickoff_at, expires_at, error_code
+        FROM notification_deliveries
+        WHERE status = 'failed'
+          AND competition_id = ?
+          AND season_id = ?
+          AND julianday(COALESCE(expires_at, kickoff_at)) > julianday(?)
+        ORDER BY id
+        """,
+        (context.competition_id, context.season_id, now_iso),
+    ).fetchall()
+    if apply and candidates:
+        ids = [int(row["id"]) for row in candidates]
+        placeholders = ",".join("?" for _ in ids)
+        with connection:
+            connection.execute(
+                f"""
+                UPDATE notification_deliveries
+                SET status = 'retry',
+                    next_attempt_at = ?,
+                    error_code = 'manual_retry_requested',
+                    last_error_message = NULL,
+                    updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (now_iso, now_iso, *ids),
+            )
+    return {
+        "apply": apply,
+        "matched": len(candidates),
+        "updated": len(candidates) if apply else 0,
+        "candidates": [dict(row) for row in candidates],
+    }
+
+
+def dry_run_notifications(
+    connection: sqlite3.Connection | None = None,
+    *,
+    now: datetime | None = None,
+    settings: Settings | None = None,
+    competition_context: CompetitionContext | None = None,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
+    connection = connection or get_connection(settings.db_path)
+    local_tz = ZoneInfo(settings.local_timezone)
+    local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
+    now_iso = _utc_iso(local_now)
+    configured_channels, configuration_errors = _configured_channels(settings)
+    due_rows = connection.execute(
+        """
+        SELECT id, match_id, window_label, channel,
+               COALESCE(notification_type, ?) AS notification_type,
+               status, attempt_count, next_attempt_at, expires_at, error_code
+        FROM notification_deliveries
+        WHERE status IN ('pending', 'waiting_prediction', 'retry')
+          AND competition_id = ?
+          AND season_id = ?
+          AND julianday(next_attempt_at) <= julianday(?)
+        ORDER BY julianday(scheduled_for), id
+        """,
+        (
+            PREDICTION_WINDOW_NOTIFICATION,
+            context.competition_id,
+            context.season_id,
+            now_iso,
+        ),
+    ).fetchall()
+    return {
+        "enabled": settings.notifications_enabled,
+        "now": now_iso,
+        "configured_channels": configured_channels,
+        "configuration_errors": configuration_errors,
+        "competition_id": context.competition_id,
+        "season_id": context.season_id,
+        "due_count": len(due_rows),
+        "would_send": [
+            dict(row)
+            for row in due_rows
+            if str(row["channel"]) in set(configured_channels)
+        ],
+        "skipped": [
+            dict(row)
+            for row in due_rows
+            if str(row["channel"]) not in set(configured_channels)
+        ],
+    }
+
+
+def explain_notification(
+    notification_id: int,
+    connection: sqlite3.Connection | None = None,
+    *,
+    settings: Settings | None = None,
+    competition_context: CompetitionContext | None = None,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
+    connection = connection or get_connection(settings.db_path)
+    row = connection.execute(
+        """
+        SELECT *
+        FROM notification_deliveries
+        WHERE id = ?
+          AND competition_id = ?
+          AND season_id = ?
+        """,
+        (notification_id, context.competition_id, context.season_id),
+    ).fetchone()
+    if row is None:
+        return {"found": False, "id": notification_id}
+    payload = {}
+    if row["payload_json"]:
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            payload = {"unparseable": True}
+    return {
+        "found": True,
+        "delivery": {
+            key: row[key]
+            for key in row.keys()
+            if key not in {"payload_json"}
+        },
+        "payload_summary": {
+            "title": payload.get("title"),
+            "window_label": payload.get("window_label"),
+            "notification_type": payload.get("notification_type"),
+            "has_message": bool(payload.get("message")),
+            "message_preview": str(payload.get("message") or "")[:240],
+        },
+        "secrets_included": False,
+        "local_timezone": settings.local_timezone,
     }
 
 
@@ -1239,23 +1676,303 @@ def run_notification_cycle(
     connection: sqlite3.Connection,
     now: datetime | None = None,
     settings: Settings | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
     schedule = schedule_due_notifications(
         connection,
         now=now,
         settings=settings,
+        competition_context=context,
     )
     delivery = dispatch_notifications(
         connection,
         now=now,
         settings=settings,
+        competition_context=context,
     )
     if settings.notifications_enabled:
         from quiniela.output_manager import write_automation_status
 
-        write_automation_status(connection)
+        write_automation_status(connection, competition_context=context)
     return {"schedule": schedule, "delivery": delivery}
+
+
+def _open_due_count(
+    connection: sqlite3.Connection,
+    *,
+    now_iso: str,
+    context: CompetitionContext,
+) -> int:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM notification_deliveries
+        WHERE status IN ('pending', 'waiting_prediction', 'retry')
+          AND competition_id = ?
+          AND season_id = ?
+          AND julianday(next_attempt_at) <= julianday(?)
+        """,
+        (context.competition_id, context.season_id, now_iso),
+    ).fetchone()
+    return int(row["total"] or 0)
+
+
+def _expired_open_count(
+    connection: sqlite3.Connection,
+    *,
+    now_iso: str,
+    context: CompetitionContext,
+) -> int:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM notification_deliveries
+        WHERE status IN ('pending', 'waiting_prediction', 'retry', 'sending')
+          AND competition_id = ?
+          AND season_id = ?
+          AND julianday(COALESCE(expires_at, kickoff_at)) <= julianday(?)
+        """,
+        (context.competition_id, context.season_id, now_iso),
+    ).fetchone()
+    return int(row["total"] or 0)
+
+
+def _send_watchdog_alerts(
+    *,
+    settings: Settings,
+    previous_health: dict[str, Any],
+    alerts: list[dict[str, Any]],
+    local_now: datetime,
+    session: requests.Session | None = None,
+) -> tuple[int, dict[str, Any]]:
+    alert_state = dict(previous_health.get("alert_state") or {})
+    if not alerts or not settings.ntfy_enabled or not settings.ntfy_topic:
+        return 0, alert_state
+    sent = 0
+    now_iso = _utc_iso(local_now)
+    dedupe_seconds = WATCHDOG_ALERT_DEDUPE_MINUTES * 60
+    adapter = NtfyAdapter(settings, session=session)
+    for alert in alerts:
+        key = str(alert["key"])
+        previous = alert_state.get(key)
+        if previous:
+            previous_at = _as_datetime(str(previous), settings.local_timezone)
+            if (local_now.astimezone(timezone.utc) - previous_at.astimezone(timezone.utc)).total_seconds() < dedupe_seconds:
+                continue
+        payload = {
+            "title": f"Quiniela watchdog: {alert['title']}",
+            "message": str(alert["message"]),
+            "window_label": "watchdog",
+            "notification_type": "watchdog_alert",
+            "priority": "4",
+        }
+        result = adapter.send(payload, local_now)
+        if result.success:
+            alert_state[key] = now_iso
+            sent += 1
+    return sent, alert_state
+
+
+def run_notification_watchdog(
+    connection: sqlite3.Connection | None = None,
+    now: datetime | None = None,
+    settings: Settings | None = None,
+    sessions: dict[str, requests.Session] | None = None,
+    competition_context: CompetitionContext | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    context = competition_context or resolve_competition_context()
+    local_tz = ZoneInfo(settings.local_timezone)
+    local_now = now.astimezone(local_tz) if now else datetime.now(local_tz)
+    now_iso = _utc_iso(local_now)
+    started = time.monotonic()
+    logs_dir = (
+        settings.logs_dir
+        if context.is_default
+        else settings.logs_dir / context.namespace
+    )
+    runs_path = logs_dir / "notification_watchdog_runs.jsonl"
+    health_path = logs_dir / "notification_health.json"
+    previous_health = _read_json_file(health_path)
+    if connection is None:
+        try:
+            connection = get_connection(settings.db_path)
+        except sqlite3.OperationalError as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            result = {
+                "dry_run": dry_run,
+                "scheduled": 0,
+                "recovered_failed": 0,
+                "sent": 0,
+                "retry": 0,
+                "failed": 1,
+                "expired": 0,
+                "open_due": 0,
+                "alerts_sent": 0,
+                "duration_ms": duration_ms,
+                "error": str(exc),
+            }
+            health = {
+                "last_success_at": previous_health.get("last_success_at"),
+                "last_dispatch_ok_at": previous_health.get("last_dispatch_ok_at"),
+                "last_error_at": now_iso,
+                "last_error": str(exc),
+                "competition_id": context.competition_id,
+                "season_id": context.season_id,
+                "open_due": previous_health.get("open_due", 0),
+                "expired_open": previous_health.get("expired_open", 0),
+                "last_result": result,
+                "alert_state": previous_health.get("alert_state", {}),
+            }
+            log_result = _write_watchdog_observability(
+                health_path=health_path,
+                runs_path=runs_path,
+                health=health,
+                run_row={
+                    "at": now_iso,
+                    "competition_id": context.competition_id,
+                    "season_id": context.season_id,
+                    **result,
+                },
+            )
+            result.update(log_result)
+            return result
+
+    if dry_run:
+        dry = dry_run_notifications(
+            connection,
+            now=local_now,
+            settings=settings,
+            competition_context=context,
+        )
+        return {
+            "dry_run": True,
+            "scheduled": 0,
+            "recovered_failed": 0,
+            "sent": 0,
+            "retry": 0,
+            "failed": 0,
+            "expired": 0,
+            "open_due": int(dry["due_count"]),
+            "alerts_sent": 0,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "would_send": dry["would_send"],
+            "skipped": dry["skipped"],
+        }
+
+    schedule = schedule_due_notifications(
+        connection,
+        now=local_now,
+        settings=settings,
+        competition_context=context,
+    )
+    recovered = retry_failed_notifications(
+        connection,
+        now=local_now,
+        settings=settings,
+        apply=True,
+        competition_context=context,
+    )
+    delivery = dispatch_notifications(
+        connection,
+        now=local_now,
+        settings=settings,
+        sessions=sessions,
+        competition_context=context,
+    )
+    open_due = _open_due_count(connection, now_iso=now_iso, context=context)
+    expired_open = _expired_open_count(connection, now_iso=now_iso, context=context)
+    previous_ok = previous_health.get("last_success_at")
+    stale_watchdog = False
+    if previous_ok:
+        previous_ok_at = _as_datetime(str(previous_ok), settings.local_timezone)
+        stale_watchdog = (
+            local_now.astimezone(timezone.utc) - previous_ok_at.astimezone(timezone.utc)
+        ) > timedelta(minutes=WATCHDOG_STALE_AFTER_MINUTES)
+    attempted = int(delivery.get("sent", 0)) + int(delivery.get("retry", 0)) + int(delivery.get("failed", 0))
+    alerts: list[dict[str, Any]] = []
+    if expired_open:
+        alerts.append(
+            {
+                "key": "expired_open",
+                "title": "notificaciones vencidas abiertas",
+                "message": f"Hay {expired_open} entregas abiertas vencidas.",
+            }
+        )
+    if stale_watchdog:
+        alerts.append(
+            {
+                "key": "watchdog_stale",
+                "title": "watchdog atrasado",
+                "message": f"Ultimo watchdog OK: {previous_ok}",
+            }
+        )
+    if attempted and int(delivery.get("sent", 0)) == 0 and (
+        int(delivery.get("failed", 0)) + int(delivery.get("retry", 0))
+    ) > 0:
+        alerts.append(
+            {
+                "key": "delivery_no_success",
+                "title": "sin entregas exitosas",
+                "message": "El ultimo dispatch intento enviar, pero ningun canal confirmo exito.",
+            }
+        )
+    if int(delivery.get("stale_sending_recovered", 0)):
+        alerts.append(
+            {
+                "key": "stale_sending_recovered",
+                "title": "sending recuperado",
+                "message": f"Se recuperaron {delivery['stale_sending_recovered']} entregas en sending.",
+            }
+        )
+    alerts_sent, alert_state = _send_watchdog_alerts(
+        settings=settings,
+        previous_health=previous_health,
+        alerts=alerts,
+        local_now=local_now,
+        session=(sessions or {}).get("ntfy_ops"),
+    )
+    duration_ms = int((time.monotonic() - started) * 1000)
+    result = {
+        "dry_run": False,
+        "scheduled": int(schedule.get("scheduled", 0)),
+        "recovered_failed": int(recovered.get("updated", 0)),
+        "sent": int(delivery.get("sent", 0)),
+        "retry": int(delivery.get("retry", 0)),
+        "failed": int(delivery.get("failed", 0)),
+        "expired": int(delivery.get("expired", 0)),
+        "open_due": open_due,
+        "alerts_sent": alerts_sent,
+        "duration_ms": duration_ms,
+        "configuration_errors": delivery.get("configuration_errors", []),
+    }
+    health = {
+        "last_success_at": now_iso,
+        "last_dispatch_ok_at": now_iso if result["failed"] == 0 else previous_health.get("last_dispatch_ok_at"),
+        "competition_id": context.competition_id,
+        "season_id": context.season_id,
+        "open_due": open_due,
+        "expired_open": expired_open,
+        "pending_alerts": alerts,
+        "last_result": result,
+        "alert_state": alert_state,
+    }
+    log_result = _write_watchdog_observability(
+        health_path=health_path,
+        runs_path=runs_path,
+        health=health,
+        run_row={
+            "at": now_iso,
+            "competition_id": context.competition_id,
+            "season_id": context.season_id,
+            **result,
+        },
+    )
+    result.update(log_result)
+    return result
 
 
 def test_notifications(

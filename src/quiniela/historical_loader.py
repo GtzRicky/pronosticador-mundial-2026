@@ -20,6 +20,10 @@ from quiniela.db import (
     upsert_team_api_id,
 )
 from quiniela.logging_utils import get_logger
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 from quiniela.name_maps import (
     TEAM_NAME_MAP,
     UnknownTeamNameError,
@@ -320,7 +324,9 @@ def _store_fixture_children(
     include_stats_events: bool = True,
     match_id: str | None = None,
     kickoff_at: str | None = None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, int]:
+    context = competition_context or resolve_competition_context()
     counts = {
         "lineups": 0,
         "fixture_player_stats": 0,
@@ -356,6 +362,7 @@ def _store_fixture_children(
                 match_id=match_id,
                 kickoff_at=kickoff_at,
                 lineups_payload=lineups_payload,
+                competition_context=context,
             )
             counts["official_lineup_notifications"] += int(
                 notification_result.get("scheduled", 0)
@@ -432,7 +439,11 @@ def _store_fixture_children(
             odds_payload = client.get_odds(fixture_id)
             from quiniela.odds_loader import build_odds_consensus, store_odds_payload
 
-            normalized_odds = store_odds_payload(client.connection, odds_payload)
+            normalized_odds = store_odds_payload(
+                client.connection,
+                odds_payload,
+                competition_context=context,
+            )
             for odd_row in odds_payload.get("response", []):
                 bookmakers = odd_row.get("bookmakers", [])
                 if bookmakers:
@@ -452,6 +463,7 @@ def _store_fixture_children(
             consensus = build_odds_consensus(
                 client.connection,
                 fixture_id=fixture_id,
+                competition_context=context,
             )
             counts["odds_market_snapshots"] = normalized_odds.get("inserted", 0)
             counts["odds_market_consensus"] = consensus.get("consensus_rows", 0)
@@ -540,8 +552,14 @@ def backfill_team_history(
     max_matches_per_team: int = 8,
     dry_run: bool = False,
     force_refresh: bool = False,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
+    if not dry_run and not context.config.api_football.enabled:
+        raise ValueError(
+            f"API-Football is disabled for competition {context.selector!r}"
+        )
     client = APIFootballClient(settings=settings, dry_run=dry_run, force_refresh=force_refresh)
     today = datetime.now().date()
     date_from = (today - timedelta(days=months * 30)).isoformat()
@@ -612,6 +630,7 @@ def backfill_team_history(
             collect_odds=collect_odds,
             resolution_entries=resolution_entries,
             include_stats_events=True,
+            competition_context=context,
         )
         report["lineups_stored"] += counts["lineups"]
         report["fixture_player_stats_stored"] += counts["fixture_player_stats"]
@@ -621,7 +640,10 @@ def backfill_team_history(
 
     from quiniela.output_manager import rebuild_outputs
 
-    rebuild_outputs(connection=client.connection)
+    rebuild_outputs(
+        connection=client.connection,
+        competition_context=context,
+    )
     return report
 
 
@@ -631,6 +653,7 @@ def fetch_today_data(
     dry_run: bool = False,
     force_refresh: bool = False,
     fetch_mode: str = "full",
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     valid_modes = {"full", "hourly", "pre_match", "post_status", "lineups"}
     if lineups_only:
@@ -639,6 +662,11 @@ def fetch_today_data(
         raise ValueError(f"fetch_mode debe ser uno de: {', '.join(sorted(valid_modes))}")
 
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
+    if not dry_run and not context.config.api_football.enabled:
+        raise ValueError(
+            f"API-Football is disabled for competition {context.selector!r}"
+        )
     client = APIFootballClient(settings=settings, dry_run=dry_run, force_refresh=force_refresh)
     target_date = pd.Timestamp(date_str).date()
     api_dates = [
@@ -649,7 +677,12 @@ def fetch_today_data(
     seen_fixture_ids: set[str] = set()
     cdmx_tz = ZoneInfo(settings.local_timezone)
     for api_date in api_dates:
-        payload = client.get_fixtures(date=api_date)
+        fixture_params: dict[str, Any] = {"date": api_date}
+        if context.config.api_football.league_id is not None:
+            fixture_params["league"] = context.config.api_football.league_id
+        if context.config.api_football.season is not None:
+            fixture_params["season"] = context.config.api_football.season
+        payload = client.get_fixtures(**fixture_params)
         for fixture in payload.get("response", []):
             fixture_id = str(fixture.get("fixture", {}).get("id"))
             if not fixture_id or fixture_id == "None" or fixture_id in seen_fixture_ids:
@@ -666,8 +699,10 @@ def fetch_today_data(
         SELECT match_id, home_team, away_team
         FROM matches
         WHERE date_cdmx = ?
+          AND competition_id = ?
+          AND season_id = ?
         """,
-        (date_str,),
+        (date_str, context.competition_id, context.season_id),
     )
     scheduled_pairs: dict[tuple[str, str], str] = {}
     scheduled_team_expectations: dict[str, list[tuple[tuple[str, str], str]]] = defaultdict(list)
@@ -821,6 +856,8 @@ def fetch_today_data(
                     time_cdmx = ?,
                     datetime_cdmx = ?
                 WHERE match_id = ?
+                  AND competition_id = ?
+                  AND season_id = ?
                 """,
                 (
                     fixture.get("fixture", {}).get("id"),
@@ -829,6 +866,8 @@ def fetch_today_data(
                     kickoff_cdmx.strftime("%H:%M"),
                     kickoff_cdmx.isoformat(),
                     match_id,
+                    context.competition_id,
+                    context.season_id,
                 ),
             )
             if fetch_mode == "post_status":
@@ -846,6 +885,7 @@ def fetch_today_data(
                 include_stats_events=include_stats_events,
                 match_id=match_id,
                 kickoff_at=kickoff_cdmx.isoformat(),
+                competition_context=context,
             )
             updated["lineups"] += counts["lineups"]
             updated["fixture_player_stats"] += counts["fixture_player_stats"]
@@ -878,14 +918,19 @@ def fetch_today_data(
 
     from quiniela.output_manager import rebuild_outputs
 
-    rebuild_outputs(connection=client.connection)
+    rebuild_outputs(
+        connection=client.connection,
+        competition_context=context,
+    )
     return dict(updated)
 
 
 def sync_finished_results_for_date(
     date_str: str,
     connection=None,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
+    context = competition_context or resolve_competition_context()
     if connection is None:
         settings = get_settings()
         connection = get_connection(settings.db_path)
@@ -904,11 +949,13 @@ def sync_finished_results_for_date(
         LEFT JOIN actual_results ar
             ON ar.match_id = m.match_id
         WHERE m.date_cdmx = ?
+          AND m.competition_id = ?
+          AND m.season_id = ?
           AND hm.status IN ('FT', 'AET', 'PEN')
           AND hm.home_goals IS NOT NULL
           AND hm.away_goals IS NOT NULL
         """,
-        (date_str,),
+        (date_str, context.competition_id, context.season_id),
     )
     if finished_df.empty:
         return {"updated": 0, "match_ids": [], "new_match_ids": []}
@@ -953,8 +1000,14 @@ def update_after_match(
     away_team: str,
     dry_run: bool = False,
     force_refresh: bool = False,
+    competition_context: CompetitionContext | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
+    if not dry_run and not context.config.api_football.enabled:
+        raise ValueError(
+            f"API-Football is disabled for competition {context.selector!r}"
+        )
     client = APIFootballClient(settings=settings, dry_run=dry_run, force_refresh=force_refresh)
     connection = client.connection
     match_df = fetch_dataframe(
@@ -962,8 +1015,12 @@ def update_after_match(
         """
         SELECT match_id, api_fixture_id, home_team, away_team, home_team_norm, away_team_norm
         FROM matches
-        WHERE (home_team_norm = ? AND away_team_norm = ?)
-           OR (home_team = ? AND away_team = ?)
+        WHERE (
+                (home_team_norm = ? AND away_team_norm = ?)
+                OR (home_team = ? AND away_team = ?)
+              )
+          AND competition_id = ?
+          AND season_id = ?
         ORDER BY datetime_cdmx DESC
         LIMIT 1
         """,
@@ -972,6 +1029,8 @@ def update_after_match(
             normalize_team_name(away_team),
             home_team,
             away_team,
+            context.competition_id,
+            context.season_id,
         ),
     )
     if match_df.empty:

@@ -11,6 +11,10 @@ import zipfile
 
 from quiniela.config import get_settings
 from quiniela.db import fetch_dataframe, get_connection
+from quiniela.infrastructure.competition_config import (
+    CompetitionContext,
+    resolve_competition_context,
+)
 
 
 PUBLIC_DB_NAME = "quiniela_public.sqlite"
@@ -29,6 +33,9 @@ class BundleSummary:
 
 def _table_counts(connection: sqlite3.Connection) -> dict[str, int]:
     tables = [
+        "competitions",
+        "seasons",
+        "competition_participants",
         "teams",
         "players",
         "matches",
@@ -64,7 +71,10 @@ def _table_counts(connection: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
-def _public_manifest(connection: sqlite3.Connection) -> dict[str, object]:
+def _public_manifest(
+    connection: sqlite3.Connection,
+    competition_context: CompetitionContext,
+) -> dict[str, object]:
     settings = get_settings()
     counts = _table_counts(connection)
     return {
@@ -81,23 +91,130 @@ def _public_manifest(connection: sqlite3.Connection) -> dict[str, object]:
             "Review third-party data licensing before redistributing derived or raw sports data.",
         ],
         "local_timezone": settings.local_timezone,
+        "competition_id": competition_context.competition_id,
+        "season_id": competition_context.season_id,
+        "namespace": competition_context.namespace,
     }
+
+
+def _scope_public_database(
+    connection: sqlite3.Connection,
+    competition_context: CompetitionContext,
+) -> None:
+    existing_tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "matches" not in existing_tables:
+        return
+    competition_id = competition_context.competition_id
+    season_id = competition_context.season_id
+    with connection:
+        if {"prediction_player_impacts", "predictions"} <= existing_tables:
+            connection.execute(
+            """
+            DELETE FROM prediction_player_impacts
+            WHERE prediction_id NOT IN (
+                SELECT id FROM predictions
+                WHERE competition_id = ? AND season_id = ?
+            )
+            """,
+            (competition_id, season_id),
+        )
+        if {"prediction_evaluations", "predictions"} <= existing_tables:
+            connection.execute(
+            """
+            DELETE FROM prediction_evaluations
+            WHERE prediction_id NOT IN (
+                SELECT id FROM predictions
+                WHERE competition_id = ? AND season_id = ?
+            )
+            """,
+            (competition_id, season_id),
+        )
+        if "actual_results" in existing_tables:
+            connection.execute(
+            """
+            DELETE FROM actual_results
+            WHERE match_id NOT IN (
+                SELECT match_id FROM matches
+                WHERE competition_id = ? AND season_id = ?
+            )
+            """,
+            (competition_id, season_id),
+        )
+        if {"pre_match_player_snapshots", "pre_match_snapshots"} <= existing_tables:
+            connection.execute(
+            """
+            DELETE FROM pre_match_player_snapshots
+            WHERE snapshot_id NOT IN (
+                SELECT id FROM pre_match_snapshots
+                WHERE competition_id = ? AND season_id = ?
+            )
+            """,
+            (competition_id, season_id),
+        )
+        for table in (
+            "players",
+            "matches",
+            "odds_market_snapshots",
+            "odds_market_consensus",
+            "predictions",
+            "notification_deliveries",
+            "pre_match_snapshots",
+            "model_training_runs",
+            "model_releases",
+        ):
+            if table in existing_tables:
+                connection.execute(
+                f"""
+                DELETE FROM {table}
+                WHERE competition_id <> ? OR season_id <> ?
+                """,
+                (competition_id, season_id),
+            )
+        if "competition_participants" in existing_tables:
+            connection.execute(
+                "DELETE FROM competition_participants WHERE season_id <> ?",
+                (season_id,),
+            )
+        if "seasons" in existing_tables:
+            connection.execute(
+                "DELETE FROM seasons WHERE season_id <> ?",
+                (season_id,),
+            )
+        if "competitions" in existing_tables:
+            connection.execute(
+                "DELETE FROM competitions WHERE competition_id <> ?",
+                (competition_id,),
+            )
 
 
 def export_public_bundle(
     output_dir: Path | None = None,
     source_db_path: Path | None = None,
     include_archive: bool = True,
+    competition_context: CompetitionContext | None = None,
 ) -> BundleSummary:
     settings = get_settings()
-    output_dir = output_dir or (settings.bundles_dir / "public_bundle")
+    context = competition_context or resolve_competition_context()
+    output_dir = output_dir or (
+        settings.bundles_dir / "public_bundle"
+        if context.is_default
+        else settings.bundles_dir / context.namespace / "public_bundle"
+    )
     source_db_path = source_db_path or settings.db_path
     output_dir.mkdir(parents=True, exist_ok=True)
 
     public_db_path = output_dir / PUBLIC_DB_NAME
     shutil.copy2(source_db_path, public_db_path)
 
-    connection = sqlite3.connect(public_db_path)
+    # Open the copied database through the normal schema initializer so
+    # legacy exports receive scope columns before we trim to one competition.
+    connection = get_connection(public_db_path)
+    _scope_public_database(connection, context)
     with connection:
         connection.execute("DELETE FROM api_cache")
         connection.execute("DELETE FROM api_usage")
@@ -116,20 +233,27 @@ def export_public_bundle(
     processed_dir.mkdir(parents=True, exist_ok=True)
     copied_files: list[Path] = []
     for file_name in ("calendar.csv", "rosters.csv"):
-        source = settings.processed_dir / file_name
+        source = context.processed_path(settings, file_name)
         if source.exists():
             destination = processed_dir / file_name
             shutil.copy2(source, destination)
             copied_files.append(destination)
 
-    manifest = _public_manifest(connection)
+    manifest = _public_manifest(connection, context)
     manifest_path = output_dir / MANIFEST_NAME
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     connection.close()
 
     archive_path: Path | None = None
     if include_archive:
-        archive_base = settings.bundles_dir / "quiniela_public_bundle"
+        archive_base = (
+            settings.bundles_dir / "quiniela_public_bundle"
+            if context.is_default
+            else settings.bundles_dir
+            / context.namespace
+            / f"quiniela_public_bundle_{context.namespace}"
+        )
+        archive_base.parent.mkdir(parents=True, exist_ok=True)
         archive_path = Path(shutil.make_archive(str(archive_base), "zip", root_dir=output_dir))
 
     sanitized_connection = sqlite3.connect(public_db_path)
@@ -145,8 +269,13 @@ def export_public_bundle(
     )
 
 
-def import_public_bundle(bundle_path: Path, destination_db_path: Path | None = None) -> BundleSummary:
+def import_public_bundle(
+    bundle_path: Path,
+    destination_db_path: Path | None = None,
+    competition_context: CompetitionContext | None = None,
+) -> BundleSummary:
     settings = get_settings()
+    context = competition_context or resolve_competition_context()
     destination_db_path = destination_db_path or settings.db_path
 
     if bundle_path.is_file() and bundle_path.suffix.lower() == ".zip":
@@ -171,7 +300,7 @@ def import_public_bundle(bundle_path: Path, destination_db_path: Path | None = N
     for file_name in ("calendar.csv", "rosters.csv"):
         source = bundle_dir / "processed" / file_name
         if source.exists():
-            destination = settings.processed_dir / file_name
+            destination = context.processed_path(settings, file_name)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
             copied_files.append(destination)
@@ -189,19 +318,28 @@ def import_public_bundle(bundle_path: Path, destination_db_path: Path | None = N
     )
 
 
-def public_bundle_status(db_path: Path | None = None) -> dict[str, object]:
+def public_bundle_status(
+    db_path: Path | None = None,
+    competition_context: CompetitionContext | None = None,
+) -> dict[str, object]:
+    context = competition_context or resolve_competition_context()
     connection = get_connection(db_path)
     counts = _table_counts(connection)
-    world_cup_df = fetch_dataframe(
+    matches_df = fetch_dataframe(
         connection,
         """
         SELECT match_id, date_cdmx, home_team, away_team, api_fixture_id
         FROM matches
-        WHERE date_cdmx IN ('2026-06-11', '2026-06-12')
+        WHERE competition_id = ?
+          AND season_id = ?
         ORDER BY datetime_cdmx
         """,
+        (context.competition_id, context.season_id),
     )
     return {
+        "competition_id": context.competition_id,
+        "season_id": context.season_id,
+        "namespace": context.namespace,
         "table_counts": counts,
-        "world_cup_matches": world_cup_df.to_dict(orient="records"),
+        "matches": matches_df.to_dict(orient="records"),
     }
